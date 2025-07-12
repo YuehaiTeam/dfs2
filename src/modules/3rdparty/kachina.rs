@@ -1,0 +1,405 @@
+use bytes::Bytes;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use crate::config::AppConfig;
+use crate::modules::flow::runner::{FlowRunner, RunFlowParams};
+use crate::app_state::REQWEST_CLIENT;
+
+/// KachinaInstaller 解析结果
+#[derive(Debug)]
+pub struct KachinaMetadata {
+    pub index: Value,
+    pub metadata: Value,
+    pub installer_end: u32,
+}
+
+/// 错误码常量定义
+const E_RESOURCE_NOT_FOUND: &str = "E_RESOURCE_NOT_FOUND";
+const E_VERSION_NOT_FOUND: &str = "E_VERSION_NOT_FOUND";
+const E_PATH_NOT_FOUND: &str = "E_PATH_NOT_FOUND";
+const E_FLOW_EXECUTION_FAILED: &str = "E_FLOW_EXECUTION_FAILED";
+const E_DOWNLOAD_FAILED: &str = "E_DOWNLOAD_FAILED";
+const E_READ_RESPONSE_FAILED: &str = "E_READ_RESPONSE_FAILED";
+const E_READ_BYTES_FAILED: &str = "E_READ_BYTES_FAILED";
+
+/// 解析文件头部信息，查找 KachinaInstaller 标识符并提取索引信息
+///
+/// # Arguments
+/// * `data` - 文件的前256字节数据
+///
+/// # Returns
+/// 返回 Result<serde_json::Value, String>，成功时包含解析后的头部信息
+pub fn parse_file_header(data: &[u8]) -> Result<Value, String> {
+    // 将字节数据转换为字符串进行搜索
+    let data_str = String::from_utf8_lossy(data);
+    
+    // 查找 KachinaInstaller 标识符
+    let header_marker = "!KachinaInstaller!";
+    let header_offset = match data_str.find(header_marker) {
+        Some(offset) => offset,
+        None => {
+            return Ok(json!({
+                "type": "unknown",
+                "message": "Not a KachinaInstaller file"
+            }));
+        }
+    };
+
+    let index_offset = header_offset + header_marker.len();
+    
+    // 确保有足够的字节来读取索引信息（至少需要20字节：5个uint32）
+    if index_offset + 20 > data.len() {
+        return Err("Insufficient data to read index information".to_string());
+    }
+
+    // 读取索引信息（大端序）
+    let index_start = u32::from_be_bytes([
+        data[index_offset],
+        data[index_offset + 1], 
+        data[index_offset + 2],
+        data[index_offset + 3]
+    ]);
+    
+    let config_sz = u32::from_be_bytes([
+        data[index_offset + 4],
+        data[index_offset + 5],
+        data[index_offset + 6], 
+        data[index_offset + 7]
+    ]);
+    
+    let theme_sz = u32::from_be_bytes([
+        data[index_offset + 8],
+        data[index_offset + 9],
+        data[index_offset + 10],
+        data[index_offset + 11]
+    ]);
+    
+    let index_sz = u32::from_be_bytes([
+        data[index_offset + 12],
+        data[index_offset + 13],
+        data[index_offset + 14],
+        data[index_offset + 15]
+    ]);
+    
+    let metadata_sz = u32::from_be_bytes([
+        data[index_offset + 16],
+        data[index_offset + 17],
+        data[index_offset + 18],
+        data[index_offset + 19]
+    ]);
+
+    let data_end = index_start + index_sz + config_sz + theme_sz + metadata_sz;
+
+    Ok(json!({
+        "type": "kachina_installer",
+        "header_offset": header_offset,
+        "index_offset": index_offset,
+        "index_start": index_start,
+        "config_size": config_sz,
+        "theme_size": theme_sz,
+        "index_size": index_sz,
+        "metadata_size": metadata_sz,
+        "data_end": data_end,
+        "installer_end": index_start + config_sz + theme_sz
+    }))
+}
+
+/// 获取文件指定范围的内容
+///
+/// # Arguments
+/// * `config` - 应用配置
+/// * `runner` - Flow运行器
+/// * `resid` - 资源ID
+/// * `version` - 版本（可选，默认使用latest）
+/// * `ranges` - 字节范围，格式如 Some(vec![(0, 255)])
+///
+/// # Returns
+/// 返回 Result<Bytes, String>，成功时包含文件字节数据，失败时包含错误信息
+pub async fn fetch_file_range(
+    config: &Arc<RwLock<AppConfig>>,
+    runner: &FlowRunner,
+    resid: &str,
+    version: Option<&str>,
+    ranges: Option<Vec<(u32, u32)>>,
+) -> Result<Bytes, String> {
+    // 读锁访问配置
+    let config_guard = config.read().await;
+
+    // 检查资源是否存在
+    let resource_config = match config_guard.get_resource(resid) {
+        Some(rc) => rc,
+        None => {
+            return Err(E_RESOURCE_NOT_FOUND.to_string());
+        }
+    };
+
+    // 确定版本
+    let target_version = version.unwrap_or(&resource_config.latest);
+
+    // 检查版本是否存在
+    if !resource_config.versions.contains_key(target_version) {
+        return Err(E_VERSION_NOT_FOUND.to_string());
+    }
+
+    // 获取版本对应的路径
+    let path = match config_guard.get_version_path(resid, target_version, None) {
+        Some(p) => p,
+        None => {
+            return Err(E_PATH_NOT_FOUND.to_string());
+        }
+    };
+
+    // 使用 FlowRunner 获取文件的下载 URL
+    let flow_list = &resource_config.flow;
+    let params = RunFlowParams {
+        path: path.clone(),
+        ranges: ranges.clone(),
+        extras: serde_json::json!({}),
+        session_id: None,
+    };
+
+    let cdn_url = match runner.run_flow(flow_list, &params).await {
+        Ok(url) => url,
+        Err(e) => {
+            return Err(format!("{}: {}", E_FLOW_EXECUTION_FAILED, e));
+        }
+    };
+
+    // 构建 Range 头部
+    let range_header = if let Some(ranges) = &ranges {
+        if ranges.len() == 1 {
+            format!("bytes={}-{}", ranges[0].0, ranges[0].1)
+        } else {
+            let range_parts: Vec<String> = ranges
+                .iter()
+                .map(|(start, end)| format!("{}-{}", start, end))
+                .collect();
+            format!("bytes={}", range_parts.join(","))
+        }
+    } else {
+        // 如果没有指定范围，则获取整个文件
+        "".to_string()
+    };
+
+    // 使用全局 HTTP 客户端下载文件
+    let mut request = REQWEST_CLIENT.get(&cdn_url);
+
+    if !range_header.is_empty() {
+        request = request.header("Range", &range_header);
+    }
+
+    let response = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            return Err(format!("{}: {}", E_DOWNLOAD_FAILED, e));
+        }
+    };
+
+    if !response.status().is_success()
+        && response.status() != axum::http::StatusCode::PARTIAL_CONTENT
+        && response.status() != axum::http::StatusCode::RANGE_NOT_SATISFIABLE
+    {
+        return Err(format!("{}: {}", E_READ_RESPONSE_FAILED, response.status()));
+    }
+
+    match response.bytes().await {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => Err(format!("{}: {}", E_READ_BYTES_FAILED, e)),
+    }
+}
+
+/// 解析 KachinaInstaller 索引数据
+///
+/// # Arguments
+/// * `index_data` - 索引区的字节数据
+/// * `index_start` - 索引区的起始偏移量
+///
+/// # Returns
+/// 返回解析后的段数据
+pub fn parse_index_data(index_data: &[u8], index_start: u32) -> Value {
+    let mut segments = json!({});
+    let mut offset = 0;
+
+    while offset < index_data.len() {
+        // 查找段标识符 "!IN\0"
+        if offset + 4 > index_data.len() {
+            break;
+        }
+
+        let magic = &index_data[offset..offset + 4];
+        if magic != b"!IN\0" {
+            offset += 1;
+            continue;
+        }
+
+        // 找到段，开始解析
+        offset += 4; // 跳过魔术字节
+
+        if offset + 2 > index_data.len() {
+            break;
+        }
+
+        // 读取名称长度 (大端序)
+        let name_len = u16::from_be_bytes([index_data[offset], index_data[offset + 1]]) as usize;
+        offset += 2;
+
+        if offset + name_len > index_data.len() {
+            break;
+        }
+
+        // 读取名称
+        let name = String::from_utf8_lossy(&index_data[offset..offset + name_len]).to_string();
+        offset += name_len;
+
+        if offset + 4 > index_data.len() {
+            break;
+        }
+
+        // 读取数据大小 (大端序)
+        let size = u32::from_be_bytes([
+            index_data[offset],
+            index_data[offset + 1],
+            index_data[offset + 2],
+            index_data[offset + 3],
+        ]) as usize;
+        offset += 4;
+
+        if offset + size > index_data.len() {
+            break;
+        }
+
+        // 读取数据
+        let data = &index_data[offset..offset + size];
+        offset += size;
+
+        match name.as_str() {
+            "\0CONFIG" => {
+                if let Ok(config_str) = String::from_utf8(data.to_vec()) {
+                    if let Ok(config_json) = serde_json::from_str::<Value>(&config_str) {
+                        segments["config"] = config_json;
+                    }
+                }
+            }
+            "\0META" => {
+                if let Ok(meta_str) = String::from_utf8(data.to_vec()) {
+                    if let Ok(meta_json) = serde_json::from_str::<Value>(&meta_str) {
+                        segments["metadata"] = meta_json;
+                    }
+                }
+            }
+            "\0THEME" => {
+                if let Ok(theme_str) = String::from_utf8(data.to_vec()) {
+                    segments["theme"] = json!(theme_str);
+                }
+            }
+            "\0INDEX" => {
+                let mut index_map = json!({});
+                let mut idx_offset = 0;
+
+                while idx_offset < data.len() {
+                    if idx_offset + 1 > data.len() {
+                        break;
+                    }
+
+                    let file_name_len = data[idx_offset] as usize;
+                    idx_offset += 1;
+
+                    if idx_offset + file_name_len > data.len() {
+                        break;
+                    }
+
+                    let file_name = String::from_utf8_lossy(&data[idx_offset..idx_offset + file_name_len]).to_string();
+                    idx_offset += file_name_len;
+
+                    if idx_offset + 8 > data.len() {
+                        break;
+                    }
+
+                    let file_size = u32::from_be_bytes([
+                        data[idx_offset],
+                        data[idx_offset + 1],
+                        data[idx_offset + 2],
+                        data[idx_offset + 3],
+                    ]);
+                    idx_offset += 4;
+
+                    let file_offset = u32::from_be_bytes([
+                        data[idx_offset],
+                        data[idx_offset + 1],
+                        data[idx_offset + 2],
+                        data[idx_offset + 3],
+                    ]);
+                    idx_offset += 4;
+
+                    index_map[&file_name] = json!({
+                        "name": file_name,
+                        "offset": index_start + file_offset,
+                        "raw_offset": 0,
+                        "size": file_size
+                    });
+                }
+                segments["index"] = index_map;
+            }
+            _ => {
+                // 未知段，忽略
+            }
+        }
+    }
+
+    segments
+}
+
+/// 解析 KachinaInstaller 文件的元数据
+///
+/// # Arguments
+/// * `config` - 应用配置
+/// * `runner` - Flow运行器
+/// * `resid` - 资源ID
+/// * `version` - 版本（可选，默认使用latest）
+///
+/// # Returns
+/// 返回 Result<Option<KachinaMetadata>, String>，成功时返回解析结果，None表示不是KachinaInstaller文件
+pub async fn parse_kachina_metadata(
+    config: &Arc<RwLock<AppConfig>>,
+    runner: &FlowRunner,
+    resid: &str,
+    version: Option<&str>,
+) -> Result<Option<KachinaMetadata>, String> {
+    // 获取文件的前256字节
+    let header_bytes = fetch_file_range(config, runner, resid, version, Some(vec![(0, 255)])).await?;
+    
+    // 解析文件头部信息
+    let parsed_header = parse_file_header(&header_bytes)?;
+    
+    // 检查是否为 KachinaInstaller 文件
+    if parsed_header["type"] != "kachina_installer" {
+        return Ok(None);
+    }
+
+    let index_start = parsed_header["index_start"].as_u64().unwrap() as u32;
+    let config_sz = parsed_header["config_size"].as_u64().unwrap() as u32;
+    let theme_sz = parsed_header["theme_size"].as_u64().unwrap() as u32;
+    let index_sz = parsed_header["index_size"].as_u64().unwrap() as u32;
+    let metadata_sz = parsed_header["metadata_size"].as_u64().unwrap() as u32;
+    let data_end = index_start + index_sz + config_sz + theme_sz + metadata_sz;
+
+    // 下载索引数据
+    let index_data = fetch_file_range(
+        config,
+        runner,
+        resid,
+        version,
+        Some(vec![(index_start, data_end - 1)]),
+    ).await?;
+
+    // 解析索引数据
+    let segments = parse_index_data(&index_data, index_start);
+    
+    Ok(Some(KachinaMetadata {
+        index: segments.get("index").unwrap_or(&json!({})).clone(),
+        metadata: segments.get("metadata").unwrap_or(&json!({})).clone(),
+        installer_end: index_start + config_sz + theme_sz,
+    }))
+}
