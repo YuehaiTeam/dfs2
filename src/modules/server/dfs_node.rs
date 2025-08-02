@@ -2,6 +2,7 @@ use anyhow::Result;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::error;
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -52,8 +53,14 @@ impl DfsNodeSigner {
         }
 
         // Create HMAC-SHA256 signature
-        let mut mac = Hmac::<Sha256>::new_from_slice(sign_token.as_bytes())
-            .expect("HMAC can take key of any size");
+        let mac = Hmac::<Sha256>::new_from_slice(sign_token.as_bytes());
+        let mut mac = match mac {
+            Ok(mac) => mac,
+            Err(e) => {
+                error!("Failed to create HMAC: {}", e);
+                return format!("error_hmac_creation");
+            }
+        };
         mac.update(message.as_bytes());
         let result = mac.finalize();
         let hmac_bytes = result.into_bytes();
@@ -77,7 +84,11 @@ impl DfsNodeSigner {
     fn get_expire_time(&self, expire_seconds: u32) -> u32 {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .map_err(|e| {
+                error!("System time error: {}", e);
+                e
+            })
+            .unwrap_or_else(|_| std::time::Duration::from_secs(0))
             .as_secs() as u32;
         now + expire_seconds
     }
@@ -166,7 +177,7 @@ mod tests {
         let sign_token = "test_token";
 
         let signature = DfsNodeSigner::create_signature(uuid, path, expire_time, sign_token, None);
-        
+
         // The signature should start with uuid + expire_time
         assert!(signature.starts_with("1234567890123456789012345678901212345678"));
     }
@@ -179,8 +190,9 @@ mod tests {
         let sign_token = "test_token";
         let ranges = vec![(0, 255), (256, 511)];
 
-        let signature = DfsNodeSigner::create_signature(uuid, path, expire_time, sign_token, Some(&ranges));
-        
+        let signature =
+            DfsNodeSigner::create_signature(uuid, path, expire_time, sign_token, Some(&ranges));
+
         // The signature should end with the ranges
         assert!(signature.ends_with("0-255256-511"));
     }
@@ -189,7 +201,7 @@ mod tests {
     fn test_from_url() {
         let url = "http://example.com:secret_token@dfs.example.com:8080/path?expire_seconds=7200";
         let signer = DfsNodeSigner::from_url(url).unwrap();
-        
+
         assert_eq!(signer.base_url, "http://dfs.example.com:8080/path");
         assert_eq!(signer.signature_token, Some("secret_token".to_string()));
         assert_eq!(signer.expire_seconds, 7200);

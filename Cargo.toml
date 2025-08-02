@@ -20,8 +20,12 @@ uuid = { version = "1.7", features = ["v4"] }
 dotenv = "0.15"
 lazy_static = "1.4"
 anyhow = "1.0.98"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 hmac = "0.12"
 sha2 = "0.10"
+md5 = "0.7"
 hex = "0.4"
 time = { version = "0.3", features = ["formatting"] }
 base64 = "0.22"
@@ -40,3 +44,10 @@ size = "0.5.0"
 chrono = { version = "0.4.41", features = ["serde"] }
 rand = "0.9.1"
 bytes = "1.10.1"
+maxminddb = { version = "0.26", features = ["mmap"] }
+prometheus = "0.13"
+axum-prometheus = "0.7"
+utoipa = { version = "5.3", features = ["axum_extras", "chrono", "uuid"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+utoipa-swagger-ui = { version = "8.1", features = ["axum"] }
+async-trait = "0.1"

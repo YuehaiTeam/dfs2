@@ -2,6 +2,7 @@ use anyhow::Result;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use tracing::error;
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -149,7 +150,14 @@ impl S3Signer {
     }
 
     fn sign(&self, key: &[u8], msg: &[u8]) -> Vec<u8> {
-        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+        let mac = Hmac::<Sha256>::new_from_slice(key);
+        let mut mac = match mac {
+            Ok(mac) => mac,
+            Err(e) => {
+                error!("Failed to create HMAC for S3 signing: {}", e);
+                return vec![]; // Return empty vec on error
+            }
+        };
         mac.update(msg);
         mac.finalize().into_bytes().to_vec()
     }

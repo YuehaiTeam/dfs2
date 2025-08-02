@@ -6,8 +6,7 @@ use size::Size;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FlowsList(pub Vec<FlowItem>);
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
 pub enum FlowMode {
     #[serde(rename = "and")]
     AND,
@@ -15,7 +14,6 @@ pub enum FlowMode {
     #[default]
     OR,
 }
-
 
 #[derive(Debug, Clone)]
 pub enum FlowUse {
@@ -99,8 +97,7 @@ impl Serialize for FlowUse {
     }
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum FlowComp {
     #[default]
     Eq,
@@ -175,10 +172,12 @@ impl Serialize for FlowComp {
 #[derive(Debug, Clone)]
 pub enum FlowCond {
     CnIp(bool),
+    IpVersion(u8), // 4 for IPv4, 6 for IPv6
     Cidr(cidr::IpCidr),
     Extras(String),
     Size(FlowComp, Size),
     BwDaily(FlowComp, Size),
+    ServerBwDaily(FlowComp, Size), // 服务器级别的日流量限制
     Time(FlowComp, chrono::NaiveTime),
 }
 impl<'de> Deserialize<'de> for FlowCond {
@@ -194,6 +193,13 @@ impl<'de> Deserialize<'de> for FlowCond {
             "cnip" => {
                 let value = parts[1].parse::<bool>().map_err(serde::de::Error::custom)?;
                 Ok(FlowCond::CnIp(value))
+            }
+            "ipversion" => {
+                let version = parts[1].parse::<u8>().map_err(serde::de::Error::custom)?;
+                if version != 4 && version != 6 {
+                    return Err(serde::de::Error::custom("IP version must be 4 or 6"));
+                }
+                Ok(FlowCond::IpVersion(version))
             }
             "cidr" => {
                 let cidr = parts[1]
@@ -215,6 +221,11 @@ impl<'de> Deserialize<'de> for FlowCond {
                 let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
                 Ok(FlowCond::BwDaily(comp, size))
             }
+            "server_bw_daily" => {
+                let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
+                let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
+                Ok(FlowCond::ServerBwDaily(comp, size))
+            }
             "time" => {
                 let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
                 let time = chrono::NaiveTime::parse_from_str(parts[2], "%H:%M:%S")
@@ -226,6 +237,110 @@ impl<'de> Deserialize<'de> for FlowCond {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flow_comp_from_str() {
+        assert_eq!(FlowComp::from_str("==").unwrap(), FlowComp::Eq);
+        assert_eq!(FlowComp::from_str("!=").unwrap(), FlowComp::Ne);
+        assert_eq!(FlowComp::from_str(">").unwrap(), FlowComp::Gt);
+        assert_eq!(FlowComp::from_str(">=").unwrap(), FlowComp::Ge);
+        assert_eq!(FlowComp::from_str("<").unwrap(), FlowComp::Lt);
+        assert_eq!(FlowComp::from_str("<=").unwrap(), FlowComp::Le);
+
+        assert!(FlowComp::from_str("invalid").is_err());
+    }
+
+    #[test]
+    fn test_flow_comp_display() {
+        assert_eq!(format!("{}", FlowComp::Eq), "==");
+        assert_eq!(format!("{}", FlowComp::Ne), "!=");
+        assert_eq!(format!("{}", FlowComp::Gt), ">");
+        assert_eq!(format!("{}", FlowComp::Ge), ">=");
+        assert_eq!(format!("{}", FlowComp::Lt), "<");
+        assert_eq!(format!("{}", FlowComp::Le), "<=");
+    }
+
+    #[test]
+    fn test_flow_use_deserialize() {
+        let use_clear: FlowUse = serde_yaml::from_str("clear").unwrap();
+        assert!(matches!(use_clear, FlowUse::Clear));
+
+        let use_poolize: FlowUse = serde_yaml::from_str("poolize").unwrap();
+        assert!(matches!(use_poolize, FlowUse::Poolize));
+
+        let use_server: FlowUse = serde_yaml::from_str("server test_server 10").unwrap();
+        assert!(
+            matches!(use_server, FlowUse::Server { ref id, weight } if id == "test_server" && weight == 10)
+        );
+
+        let use_plugin: FlowUse = serde_yaml::from_str("plugin test_plugin some_data").unwrap();
+        assert!(
+            matches!(use_plugin, FlowUse::Plugin { ref id, ref indirect } if id == "test_plugin" && indirect == "some_data")
+        );
+    }
+
+    #[test]
+    fn test_flow_cond_deserialize() {
+        // 测试CnIp条件
+        let cond: FlowCond = serde_yaml::from_str("cnip true").unwrap();
+        assert!(matches!(cond, FlowCond::CnIp(true)));
+
+        // 测试IpVersion条件
+        let cond: FlowCond = serde_yaml::from_str("ipversion 4").unwrap();
+        assert!(matches!(cond, FlowCond::IpVersion(4)));
+
+        let cond: FlowCond = serde_yaml::from_str("ipversion 6").unwrap();
+        assert!(matches!(cond, FlowCond::IpVersion(6)));
+
+        // 测试无效的IP版本
+        let result: Result<FlowCond, _> = serde_yaml::from_str("ipversion 5");
+        assert!(result.is_err());
+
+        // 测试CIDR条件
+        let cond: FlowCond = serde_yaml::from_str("cidr 192.168.1.0/24").unwrap();
+        assert!(matches!(cond, FlowCond::Cidr(_)));
+
+        // 测试Extras条件
+        let cond: FlowCond = serde_yaml::from_str("extras debug").unwrap();
+        assert!(matches!(cond, FlowCond::Extras(ref key) if key == "debug"));
+
+        // 测试Size条件
+        let cond: FlowCond = serde_yaml::from_str("size > 10MB").unwrap();
+        assert!(matches!(cond, FlowCond::Size(FlowComp::Gt, _)));
+
+        // 测试Time条件
+        let cond: FlowCond = serde_yaml::from_str("time >= 09:00:00").unwrap();
+        assert!(matches!(cond, FlowCond::Time(FlowComp::Ge, _)));
+    }
+
+    #[test]
+    fn test_flow_cond_serialize() {
+        let cond = FlowCond::CnIp(true);
+        let yaml = serde_yaml::to_string(&cond).unwrap();
+        assert!(yaml.contains("cnip true"));
+
+        let cond = FlowCond::IpVersion(4);
+        let yaml = serde_yaml::to_string(&cond).unwrap();
+        assert!(yaml.contains("ipversion 4"));
+
+        let cond = FlowCond::Extras("debug".to_string());
+        let yaml = serde_yaml::to_string(&cond).unwrap();
+        assert!(yaml.contains("extras debug"));
+    }
+
+    #[test]
+    fn test_flow_item_default() {
+        let item = FlowItem::default();
+        assert_eq!(item.mode, FlowMode::OR);
+        assert_eq!(item.r#break, false);
+        assert!(item.r#use.is_empty());
+        assert!(item.rules.is_empty());
+    }
+}
+
 impl Serialize for FlowCond {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -233,6 +348,9 @@ impl Serialize for FlowCond {
     {
         match self {
             FlowCond::CnIp(value) => serializer.serialize_str(&format!("cnip {}", value)),
+            FlowCond::IpVersion(version) => {
+                serializer.serialize_str(&format!("ipversion {}", version))
+            }
             FlowCond::Cidr(cidr) => serializer.serialize_str(&format!("cidr {}", cidr)),
             FlowCond::Extras(extras) => serializer.serialize_str(&format!("extras {}", extras)),
             FlowCond::Size(comp, size) => {
@@ -241,6 +359,9 @@ impl Serialize for FlowCond {
             FlowCond::BwDaily(comp, size) => {
                 serializer.serialize_str(&format!("bw_daily {} {}", comp, size))
             }
+            FlowCond::ServerBwDaily(comp, size) => {
+                serializer.serialize_str(&format!("server_bw_daily {} {}", comp, size))
+            }
             FlowCond::Time(comp, time) => {
                 serializer.serialize_str(&format!("time {} {}", comp, time))
             }
@@ -248,7 +369,7 @@ impl Serialize for FlowCond {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct FlowItem {
     #[serde(default)]
     pub mode: FlowMode,

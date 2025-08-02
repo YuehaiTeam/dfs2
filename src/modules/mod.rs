@@ -1,4 +1,5 @@
 pub mod flow;
+pub mod geolocation;
 pub mod qjs;
 pub mod server;
 

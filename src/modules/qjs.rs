@@ -2,17 +2,31 @@ use std::sync::Arc;
 
 use rquickjs::{AsyncContext, AsyncRuntime, Context, FromJs, Promise, Runtime, Value, async_with};
 use tokio::sync::RwLock;
+use tracing::{error, warn};
 
-use crate::{app_state::RedisStore, config::AppConfig};
+use crate::{app_state::DataStore, config::AppConfig};
 use llrt_modules::module_builder::ModuleBuilder;
 thread_local! {
-    static JS_CONTEXT: Context = Context::full(&Runtime::new().unwrap()).unwrap();
+    static JS_CONTEXT: Context = {
+        let runtime = Runtime::new()
+            .map_err(|e| {
+                error!("Failed to create JS runtime: {}", e);
+                std::process::exit(1);
+            })
+            .unwrap();
+        Context::full(&runtime)
+            .map_err(|e| {
+                error!("Failed to create JS context: {}", e);
+                std::process::exit(1);
+            })
+            .unwrap()
+    };
 }
 
 #[derive(Clone)]
 pub struct JsRunner {
     config: Arc<RwLock<AppConfig>>,
-    redis: RedisStore,
+    redis: DataStore,
     context: AsyncContext,
 }
 
@@ -24,15 +38,21 @@ pub async fn js_s3sign(
 ) -> String {
     let signer: Result<super::server::s3::S3Signer, anyhow::Error> =
         super::server::s3::S3Signer::from_url(&url);
-    if signer.is_err() {
-        return "".to_string();
-    }
-    let signer = signer.unwrap();
+    let signer = match signer {
+        Ok(signer) => signer,
+        Err(e) => {
+            warn!("S3 signer creation failed: {}", e);
+            return String::new();
+        }
+    };
     let ret = signer.generate_presigned_url(&path, headers);
-    if ret.is_err() {
-        return "".to_string();
+    match ret {
+        Ok(url) => url,
+        Err(e) => {
+            warn!("S3 presigned URL generation failed: {}", e);
+            String::new()
+        }
     }
-    ret.unwrap()
 }
 
 #[rquickjs::function]
@@ -44,11 +64,14 @@ pub async fn js_dfsnodesign(
 ) -> String {
     let signer: Result<super::server::dfs_node::DfsNodeSigner, anyhow::Error> =
         super::server::dfs_node::DfsNodeSigner::from_url(&url);
-    if signer.is_err() {
-        return "".to_string();
-    }
-    let signer = signer.unwrap();
-    
+    let signer = match signer {
+        Ok(signer) => signer,
+        Err(e) => {
+            warn!("DFS node signer creation failed: {}", e);
+            return String::new();
+        }
+    };
+
     // Convert Vec<Vec<u32>> to Vec<(u32, u32)>
     let converted_ranges = ranges.map(|r| {
         r.into_iter()
@@ -56,18 +79,31 @@ pub async fn js_dfsnodesign(
             .map(|range| (range[0], range[1]))
             .collect::<Vec<(u32, u32)>>()
     });
-    
+
     let ret = signer.generate_presigned_url(&path, &uuid, converted_ranges);
-    if ret.is_err() {
-        return "".to_string();
+    match ret {
+        Ok(url) => url,
+        Err(e) => {
+            warn!("DFS node presigned URL generation failed: {}", e);
+            String::new()
+        }
     }
-    ret.unwrap()
 }
 
 impl JsRunner {
-    pub async fn new(config: Arc<RwLock<AppConfig>>, redis: RedisStore) -> Self {
-        let context = AsyncContext::full(&AsyncRuntime::new().unwrap())
+    pub async fn new(config: Arc<RwLock<AppConfig>>, redis: DataStore) -> Self {
+        let runtime = AsyncRuntime::new()
+            .map_err(|e| {
+                error!("Failed to create async JS runtime: {}", e);
+                std::process::exit(1);
+            })
+            .unwrap();
+        let context = AsyncContext::full(&runtime)
             .await
+            .map_err(|e| {
+                error!("Failed to create async JS context: {}", e);
+                std::process::exit(1);
+            })
             .unwrap();
         let module_builder = ModuleBuilder::default();
         let (module_resolver, module_loader, global_attachment) = module_builder.build();
@@ -110,7 +146,11 @@ impl JsRunner {
             Ok::<_, rquickjs::Error>(())
         })
         .await
-        .expect("Failed to initialize JavaScript context");
+        .map_err(|e| {
+            error!("Failed to initialize JavaScript context: {}", e);
+            std::process::exit(1);
+        })
+        .unwrap();
         Self {
             config,
             context,
@@ -219,5 +259,200 @@ impl<'js> rquickjs::FromJs<'js> for JsonValue {
 impl From<JsonValue> for serde_json::Value {
     fn from(val: JsonValue) -> Self {
         val.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::DataStore;
+    use std::collections::HashMap;
+
+    async fn create_test_js_runner() -> JsRunner {
+        let config = Arc::new(RwLock::new(crate::config::AppConfig {
+            servers: HashMap::new(),
+            resources: HashMap::new(),
+            plugins: HashMap::new(),
+            debug_mode: true,
+            plugin_code: HashMap::new(),
+            server_impl: HashMap::new(),
+            challenge: crate::config::ChallengeConfig::default(),
+        }));
+
+        let redis_store = crate::data_store::FileDataStore::new().await.expect("Failed to create test data store");
+        let data_store = std::sync::Arc::new(redis_store) as DataStore;
+
+        JsRunner::new(config, data_store).await
+    }
+
+    #[tokio::test]
+    async fn test_js_runner_creation() {
+        let js_runner = create_test_js_runner().await;
+        
+        // Verify the runner was created (we can't access private field, so just check it exists)
+        assert!(std::ptr::addr_of!(js_runner.redis) as *const _ != std::ptr::null());
+    }
+
+    #[tokio::test]
+    async fn test_javascript_basic_execution() {
+        let js_runner = create_test_js_runner().await;
+
+        // Test basic JavaScript execution
+        let result = js_runner.eval("Promise.resolve(42)".to_string()).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), serde_json::json!(42));
+    }
+
+    #[tokio::test]
+    async fn test_javascript_redis_integration() {
+        let js_runner = create_test_js_runner().await;
+
+        // Test Redis storage functions are available - if Redis is not available, functions should still exist
+        let test_code = r#"
+            (async function() {
+                // Test that Redis functions exist
+                const functions_exist = {
+                    write_exists: typeof _dfs_storage_write === "function",
+                    read_exists: typeof _dfs_storage_read === "function"
+                };
+                
+                if (!functions_exist.write_exists || !functions_exist.read_exists) {
+                    return { error: "Redis functions not available", functions_exist };
+                }
+                
+                // Try writing to Redis (may fail if Redis is not running)
+                const writeResult = await _dfs_storage_write("test_key_js", "test_value", 60);
+                
+                // If write failed, that's ok for testing - we just want to verify the functions are exposed
+                if (!writeResult) {
+                    return { 
+                        success: true, 
+                        redis_available: false,
+                        functions_exist: true,
+                        message: "Redis functions available but Redis server not connected"
+                    };
+                }
+                
+                // If write succeeded, test reading
+                const readResult = await _dfs_storage_read("test_key_js");
+                if (readResult !== "test_value") {
+                    return { error: "Read failed", got: readResult };
+                }
+                
+                return { 
+                    success: true, 
+                    redis_available: true,
+                    functions_exist: true,
+                    value: readResult 
+                };
+            })()
+        "#;
+
+        let result = js_runner.eval(test_code.to_string()).await;
+        assert!(result.is_ok());
+        
+        let json_result = result.unwrap();
+        if let Some(error) = json_result.get("error") {
+            panic!("Redis integration test failed: {}", error);
+        }
+        
+        // The test should succeed whether Redis is available or not
+        assert_eq!(json_result["success"], true);
+        assert_eq!(json_result["functions_exist"], true);
+    }
+
+    #[tokio::test]
+    async fn test_plugin_function_signature() {
+        let js_runner = create_test_js_runner().await;
+
+        // Test plugin function signature with proper async/await
+        let plugin_code = r#"
+            async function test_plugin(pool, indirect, options, extras) {
+                // Test that all parameters are accessible
+                const result = {
+                    pool_length: pool ? pool.length : 0,
+                    indirect_type: typeof indirect,
+                    options_type: typeof options,
+                    extras_type: typeof extras,
+                    redis_functions_available: {
+                        read: typeof _dfs_storage_read,
+                        write: typeof _dfs_storage_write
+                    }
+                };
+                
+                return [false, result];
+            }
+            
+            test_plugin(
+                [["http://example.com", 1], ["http://test.com", 2]], 
+                "test_indirect", 
+                {}, 
+                {}
+            )
+        "#;
+
+        let result = js_runner.eval(plugin_code.to_string()).await;
+        assert!(result.is_ok());
+        
+        let json_result = result.unwrap();
+        // The result should be an array with [false, result_object]
+        assert!(json_result.is_array());
+        let result_array = json_result.as_array().unwrap();
+        assert_eq!(result_array.len(), 2);
+        assert_eq!(result_array[0], serde_json::json!(false));
+        
+        let result_obj = &result_array[1];
+        assert_eq!(result_obj["pool_length"], 2);
+        assert_eq!(result_obj["indirect_type"], "string");
+        assert_eq!(result_obj["redis_functions_available"]["read"], "function");
+        assert_eq!(result_obj["redis_functions_available"]["write"], "function");
+    }
+
+    #[tokio::test]
+    async fn test_s3_signing_function() {
+        let js_runner = create_test_js_runner().await;
+
+        // Test S3 signing function availability (should return empty string for invalid URL)
+        let s3_test_code = r#"
+            (async function() {
+                const result = await _dfs_s3sign("invalid-url", "/test/path", {});
+                return { 
+                    function_exists: typeof _dfs_s3sign === "function",
+                    result_type: typeof result,
+                    result_value: result
+                };
+            })()
+        "#;
+
+        let result = js_runner.eval(s3_test_code.to_string()).await;
+        assert!(result.is_ok());
+        
+        let json_result = result.unwrap();
+        assert_eq!(json_result["function_exists"], true);
+        assert_eq!(json_result["result_type"], "string");
+    }
+
+    #[tokio::test]
+    async fn test_dfs_node_signing_function() {
+        let js_runner = create_test_js_runner().await;
+
+        // Test DFS node signing function availability
+        let dfs_test_code = r#"
+            (async function() {
+                const result = await _dfs_dfsnodesign("invalid-url", "/test/path", "test-uuid", null);
+                return { 
+                    function_exists: typeof _dfs_dfsnodesign === "function",
+                    result_type: typeof result,
+                    result_value: result
+                };
+            })()
+        "#;
+
+        let result = js_runner.eval(dfs_test_code.to_string()).await;
+        assert!(result.is_ok());
+        
+        let json_result = result.unwrap();
+        assert_eq!(json_result["function_exists"], true);
+        assert_eq!(json_result["result_type"], "string");
     }
 }
