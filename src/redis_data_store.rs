@@ -473,7 +473,7 @@ impl DataStoreBackend for RedisDataStore {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| e.to_string())?;
         
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let cache_key = self.redis_key("bw_daily", &format!("{}:{}", session_id, today));
         
         // 使用 INCRBY 原子性增加计数，并设置24小时过期时间
@@ -492,7 +492,7 @@ impl DataStoreBackend for RedisDataStore {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| e.to_string())?;
         
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let cache_key = self.redis_key("server_bw_daily", &format!("{}:{}", server_id, today));
         
         // 使用 INCRBY 原子性增加计数，并设置24小时过期时间
@@ -511,7 +511,7 @@ impl DataStoreBackend for RedisDataStore {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| e.to_string())?;
         
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let cache_key = self.redis_key("bw_daily", &format!("{}:{}", session_id, today));
         
         let result: Option<String> = conn.get(&cache_key).await.map_err(|e| e.to_string())?;

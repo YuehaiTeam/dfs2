@@ -177,7 +177,7 @@ pub enum FlowCond {
     Extras(String),
     Size(FlowComp, Size),
     BwDaily(FlowComp, Size),
-    ServerBwDaily(FlowComp, Size), // 服务器级别的日流量限制
+    ServerBwDaily(String, FlowComp, Size), // 服务器级别的日流量限制，必须指定server_id
     Time(FlowComp, chrono::NaiveTime),
 }
 impl<'de> Deserialize<'de> for FlowCond {
@@ -222,9 +222,15 @@ impl<'de> Deserialize<'de> for FlowCond {
                 Ok(FlowCond::BwDaily(comp, size))
             }
             "server_bw_daily" => {
-                let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
-                let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
-                Ok(FlowCond::ServerBwDaily(comp, size))
+                if parts.len() != 4 {
+                    return Err(serde::de::Error::custom(
+                        "server_bw_daily requires format: server_bw_daily {server_id} {comp} {size}"
+                    ));
+                }
+                let server_id = parts[1].to_string();
+                let comp = FlowComp::from_str(parts[2]).map_err(serde::de::Error::custom)?;
+                let size = Size::from_str(parts[3]).map_err(serde::de::Error::custom)?;
+                Ok(FlowCond::ServerBwDaily(server_id, comp, size))
             }
             "time" => {
                 let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
@@ -359,8 +365,8 @@ impl Serialize for FlowCond {
             FlowCond::BwDaily(comp, size) => {
                 serializer.serialize_str(&format!("bw_daily {} {}", comp, size))
             }
-            FlowCond::ServerBwDaily(comp, size) => {
-                serializer.serialize_str(&format!("server_bw_daily {} {}", comp, size))
+            FlowCond::ServerBwDaily(server_id, comp, size) => {
+                serializer.serialize_str(&format!("server_bw_daily {} {} {}", server_id, comp, size))
             }
             FlowCond::Time(comp, time) => {
                 serializer.serialize_str(&format!("time {} {}", comp, time))

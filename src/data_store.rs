@@ -513,7 +513,7 @@ impl DataStoreBackend for FileDataStore {
     }
     
     async fn update_daily_bandwidth(&self, session_id: &str, bytes: u64) -> Result<(), String> {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let key = format!("bw_daily:{}:{}", session_id, today);
         
         // 读取当前使用量
@@ -525,7 +525,7 @@ impl DataStoreBackend for FileDataStore {
     }
     
     async fn update_server_daily_bandwidth(&self, server_id: &str, bytes: u64) -> Result<(), String> {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let key = format!("server_bw_daily:{}:{}", server_id, today);
         
         // 读取当前使用量
@@ -537,7 +537,7 @@ impl DataStoreBackend for FileDataStore {
     }
     
     async fn get_daily_bandwidth(&self, session_id: &str) -> Result<u64, String> {
-        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let key = format!("bw_daily:{}:{}", session_id, today);
         
         // 读取当前使用量，如果不存在返回0

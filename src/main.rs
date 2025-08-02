@@ -12,9 +12,11 @@ mod modules;
 mod redis_data_store;
 mod responses;
 mod routes;
+mod validation;
 
 use app_state::create_data_store;
 use axum::{Router, routing::get, http::Request, middleware::{self, Next}, response::Response, extract::ConnectInfo, body::Body};
+use clap::Parser;
 use config::AppConfig;
 use docs::{create_docs_router, is_openapi_docs_enabled};
 use metrics::Metrics;
@@ -25,6 +27,16 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use validation::ConfigValidator;
+
+/// DFS2 - Distributed File System Server
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    /// Validate configuration and plugins only, then exit
+    #[arg(long, help = "Validate configuration and plugins, then exit without starting the server")]
+    validate_only: bool,
+}
 
 fn init_tracing() -> DfsResult<()> {
     // 设置默认日志级别
@@ -62,11 +74,18 @@ async fn real_ip_middleware(
 #[tokio::main]
 async fn main() -> DfsResult<()> {
     dotenv().ok();
+    
+    // 解析命令行参数
+    let args = Args::parse();
 
     // 初始化日志系统
     init_tracing()?;
 
-    info!("Starting DFS2 server...");
+    if args.validate_only {
+        info!("运行配置验证模式...");
+    } else {
+        info!("Starting DFS2 server...");
+    }
 
     // 加载配置
     let config = match AppConfig::load().await {
@@ -91,6 +110,21 @@ async fn main() -> DfsResult<()> {
             return Err(DfsError::internal_error(format!("Data store initialization failed: {}", e)));
         }
     };
+
+    // 如果是验证模式，执行验证后退出
+    if args.validate_only {
+        let config_guard = config.read().await;
+        match ConfigValidator::validate_full(&config_guard, &data_store).await {
+            Ok(report) => {
+                report.print_report();
+                std::process::exit(if report.is_valid() { 0 } else { 1 });
+            }
+            Err(e) => {
+                error!("配置验证失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
 
     // 创建JavaScript运行时
     let jsrunner = modules::qjs::JsRunner::new(config.clone(), data_store.clone()).await;

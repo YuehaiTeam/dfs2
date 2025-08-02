@@ -163,6 +163,10 @@ pub struct ServerConfig {
     pub id: String,
     pub url: String,
     pub r#type: String,
+    /// 可选的健康检查路径，用于验证服务器连接性
+    /// 如果未设置，则跳过该服务器的连接性检查
+    #[serde(default)]
+    pub health_check_path: Option<String>,
 }
 impl<'js> IntoJs<'js> for ServerConfig {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
@@ -170,6 +174,7 @@ impl<'js> IntoJs<'js> for ServerConfig {
         obj.set("id", self.id)?;
         obj.set("url", self.url)?;
         obj.set("type", self.r#type)?;
+        obj.set("health_check_path", self.health_check_path)?;
         Ok(obj.into())
     }
 }
@@ -434,6 +439,7 @@ mod tests {
                 url: "https://access:secret@s3.example.com?region=us-east-1&bucket=test"
                     .to_string(),
                 r#type: "s3".to_string(),
+                health_check_path: None,
             },
         );
         servers.insert(
@@ -442,6 +448,7 @@ mod tests {
                 id: "direct_server".to_string(),
                 url: "https://cdn.example.com".to_string(),
                 r#type: "direct".to_string(),
+                health_check_path: None,
             },
         );
 
@@ -541,6 +548,7 @@ mod tests {
             id: "test".to_string(),
             url: "https://example.com".to_string(),
             r#type: "direct".to_string(),
+            health_check_path: None,
         };
 
         let yaml = serde_yaml::to_string(&server).unwrap();

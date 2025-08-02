@@ -143,7 +143,7 @@ impl FlowRunner {
             FlowCond::BwDaily(comp, limit) => {
                 // 带宽限制检查：需要从Redis获取今日使用量
                 if let Some(session_id) = &params.session_id {
-                    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                     let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
                         if !prefix.is_empty() {
                             format!("{}:bw_daily:{}:{}", prefix, session_id, today)
@@ -179,32 +179,30 @@ impl FlowRunner {
                     FlowComp::Le => true, // 0总是小于等于任何数
                 }
             }
-            FlowCond::ServerBwDaily(comp, limit) => {
-                // 服务器级别的带宽限制检查：需要从params中获取选中的server_id
-                if let Some(server_id) = &params.selected_server_id {
-                    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-                    let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
-                        if !prefix.is_empty() {
-                            format!("{}:server_bw_daily:{}:{}", prefix, server_id, today)
-                        } else {
-                            format!("server_bw_daily:{}:{}", server_id, today)
-                        }
+            FlowCond::ServerBwDaily(server_id, comp, limit) => {
+                // 服务器级别的带宽限制检查：使用指定的server_id
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
+                    if !prefix.is_empty() {
+                        format!("{}:server_bw_daily:{}:{}", prefix, server_id, today)
                     } else {
                         format!("server_bw_daily:{}:{}", server_id, today)
-                    };
+                    }
+                } else {
+                    format!("server_bw_daily:{}:{}", server_id, today)
+                };
 
-                    if let Ok(Some(usage_str)) = self.redis.get_string(&cache_key).await {
-                        if let Ok(current_usage) = usage_str.parse::<u64>() {
-                            let limit_bytes = limit.bytes() as u64;
-                            return match comp {
-                                FlowComp::Eq => current_usage == limit_bytes,
-                                FlowComp::Ne => current_usage != limit_bytes,
-                                FlowComp::Gt => current_usage > limit_bytes,
-                                FlowComp::Ge => current_usage >= limit_bytes,
-                                FlowComp::Lt => current_usage < limit_bytes,
-                                FlowComp::Le => current_usage <= limit_bytes,
-                            };
-                        }
+                if let Ok(Some(usage_str)) = self.redis.get_string(&cache_key).await {
+                    if let Ok(current_usage) = usage_str.parse::<u64>() {
+                        let limit_bytes = limit.bytes() as u64;
+                        return match comp {
+                            FlowComp::Eq => current_usage == limit_bytes,
+                            FlowComp::Ne => current_usage != limit_bytes,
+                            FlowComp::Gt => current_usage > limit_bytes,
+                            FlowComp::Ge => current_usage >= limit_bytes,
+                            FlowComp::Lt => current_usage < limit_bytes,
+                            FlowComp::Le => current_usage <= limit_bytes,
+                        };
                     }
                 }
                 // 如果没有选中的服务器ID或没有使用量数据，假设使用量为0
