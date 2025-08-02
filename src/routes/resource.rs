@@ -17,19 +17,39 @@ use crate::challenge::{ChallengeType, generate_challenge};
 use crate::config::{AppConfig, DownloadPolicy};
 use crate::error::{DfsError, DfsResult};
 use crate::models::{CreateSessionRequest, DeleteSessionRequest, Session};
-use crate::responses::{ApiResponse, ResponseData};
+use crate::responses::{ApiResponse, ResponseData, MetadataResponse, SessionCreatedResponse, ChallengeResponse, CdnUrlResponse, DownloadUrlResponse, EmptyResponse, ErrorResponse};
 use crate::cache::{should_cache_content, download_and_cache};
 use crate::data_store::CacheMetadata;
 use crate::{
     app_state::{MAX_CHUNK_DOWNLOADS, DataStore},
     modules::flow::runner::{FlowRunner, RunFlowParams},
     modules::thirdparty::kachina,
+    metrics::Metrics,
     RealConnectInfo,
 };
 
 // 错误码常量定义
 const E_RESOURCE_NOT_FOUND: &str = "E_RESOURCE_NOT_FOUND";
 const E_VERSION_NOT_FOUND: &str = "E_VERSION_NOT_FOUND";
+
+// 宏用于记录请求指标
+macro_rules! record_request_metrics {
+    ($metrics:expr, $start_time:expr) => {
+        $metrics.record_request();
+        $metrics.record_request_duration($start_time.elapsed().as_secs_f64());
+    };
+}
+
+// 宏用于记录流程执行指标
+macro_rules! record_flow_metrics {
+    ($metrics:expr, $success:expr) => {
+        $metrics.record_flow_execution();
+        if !$success {
+            $metrics.record_flow_failure();
+        }
+    };
+}
+
 const E_PATH_NOT_FOUND: &str = "E_PATH_NOT_FOUND";
 
 // 下载响应类型
@@ -104,13 +124,31 @@ async fn generate_session_tries(
     Ok(tries)
 }
 
+#[utoipa::path(
+    get,
+    path = "/resource/{resid}",
+    tag = "Resource",
+    summary = "Get resource metadata",
+    description = "Retrieves metadata for a specific resource, including KachinaInstaller information if available",
+    params(
+        ("resid" = String, Path, description = "Resource identifier")
+    ),
+    responses(
+        (status = 200, description = "Metadata retrieved successfully", body = MetadataResponse),
+        (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 #[allow(unused_variables)]
 async fn get_metadata(
     Path(resid): Path<String>,
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(runner): Extension<FlowRunner>,
     Extension(redis): Extension<DataStore>,
+    Extension(metrics): Extension<Arc<Metrics>>,
 ) -> impl IntoResponse {
+    let start_time = std::time::Instant::now();
+    
     // 获取资源配置和文件路径用于缓存key
     let cache_key = {
         let config_guard = config.read().await;
@@ -183,6 +221,9 @@ async fn get_metadata(
                 }
             }
 
+            // 记录成功的请求指标
+            record_request_metrics!(metrics, start_time);
+            
             (
                 StatusCode::OK,
                 Json(ApiResponse::success(ResponseData::Metadata {
@@ -206,6 +247,9 @@ async fn get_metadata(
                 }
             }
 
+            // 记录成功的请求指标
+            record_request_metrics!(metrics, start_time);
+            
             (
                 StatusCode::OK,
                 Json(ApiResponse::success(ResponseData::Metadata {
@@ -224,11 +268,32 @@ async fn get_metadata(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
+            
+            // 记录错误的请求指标
+            record_request_metrics!(metrics, start_time);
+            
             (status_code, Json(ApiResponse::error(error_msg)))
         }
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/resource/{resid}",
+    tag = "Resource",
+    summary = "Create session for resource access",
+    description = "Creates a new session for accessing a resource, handles challenge verification and returns session ID with server tries list",
+    params(
+        ("resid" = String, Path, description = "Resource identifier")
+    ),
+    request_body = CreateSessionRequest,
+    responses(
+        (status = 200, description = "Session created successfully", body = SessionCreatedResponse),
+        (status = 402, description = "Challenge required or failed", body = ChallengeResponse),
+        (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 #[allow(unused_variables)]
 #[axum::debug_handler]
 async fn create_session(
@@ -236,6 +301,7 @@ async fn create_session(
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
+    Extension(metrics): Extension<Arc<Metrics>>,
     Json(mut req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // 读锁访问配置
@@ -642,6 +708,9 @@ async fn create_session(
         }
     };
 
+    // 记录会话创建指标
+    metrics.record_session_created();
+
     (
         StatusCode::OK,
         Json(ApiResponse::success(ResponseData::Session {
@@ -651,16 +720,39 @@ async fn create_session(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/session/{sessionid}/{resid}",
+    tag = "Resource",
+    summary = "Get CDN URL for file chunk",
+    description = "Retrieves CDN URL for downloading a specific chunk of a file using an active session",
+    params(
+        ("sessionid" = String, Path, description = "Session identifier"),
+        ("resid" = String, Path, description = "Resource identifier"),
+        ("range" = String, Query, description = "Byte range for download (e.g., '0-1023' or '0-255,256-511')")
+    ),
+    responses(
+        (status = 200, description = "CDN URL generated successfully", body = CdnUrlResponse),
+        (status = 400, description = "Invalid request parameters", body = ErrorResponse),
+        (status = 404, description = "Session or resource not found", body = ErrorResponse),
+        (status = 429, description = "Too many download attempts", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 #[allow(unused_variables)]
 async fn get_cdn(
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
+    Extension(metrics): Extension<Arc<Metrics>>,
     headers: HeaderMap,
     Path((sessionid, resid)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // 记录请求开始时间
+    let start_time = std::time::Instant::now();
+    
     // 提取客户端IP地址
     let client_ip =
         crate::modules::geolocation::extract_client_ip(&headers).or_else(|| Some(real_connect_info.remote_addr.ip()));
@@ -807,6 +899,10 @@ async fn get_cdn(
                     }
                 };
 
+                // 记录成功的请求和流程执行指标
+                record_request_metrics!(metrics, start_time);
+                record_flow_metrics!(metrics, true);
+                
                 return (
                     StatusCode::OK,
                     Json(ApiResponse::success(ResponseData::Cdn { url: cdn_url })),
@@ -836,13 +932,31 @@ async fn get_cdn(
     )
 }
 
+#[utoipa::path(
+    delete,
+    path = "/session/{sessionid}/{resid}",
+    tag = "Resource",
+    summary = "Delete session and get statistics",
+    description = "Deletes a session and returns statistics about downloads, bandwidth usage, and CDN performance",
+    params(
+        ("sessionid" = String, Path, description = "Session identifier"),
+        ("resid" = String, Path, description = "Resource identifier")
+    ),
+    request_body(content = DeleteSessionRequest, description = "Optional insights data from client"),
+    responses(
+        (status = 200, description = "Session deleted successfully", body = EmptyResponse),
+        (status = 404, description = "Session not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 #[allow(unused_variables)]
 async fn delete_session(
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(redis): Extension<DataStore>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
+    Extension(metrics): Extension<Arc<Metrics>>,
     headers: HeaderMap,
-    Path((resid, sessionid)): Path<(String, String)>,
+    Path((sessionid, resid)): Path<(String, String)>,
     req_body: Option<Json<DeleteSessionRequest>>,
 ) -> impl IntoResponse {
     // 提取客户端IP地址
@@ -1152,12 +1266,31 @@ async fn handle_download_request(
 }
 
 // GET /download/{resid} - 重定向到下载链接
+#[utoipa::path(
+    get,
+    path = "/download/{resid}",
+    tag = "Resource",
+    summary = "Download resource file (redirect)",
+    description = "Downloads a complete resource file. Returns either a redirect to CDN URL or cached content directly. Supports both session-based and free download policies.",
+    params(
+        ("resid" = String, Path, description = "Resource identifier"),
+        ("session" = Option<String>, Query, description = "Session ID (required for enabled download policy)")
+    ),
+    responses(
+        (status = 200, description = "Cached content returned directly"),
+        (status = 302, description = "Redirect to CDN download URL"),
+        (status = 403, description = "Download not allowed", body = ErrorResponse),
+        (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 async fn download_redirect(
     Path(resid): Path<String>,
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
+    Extension(metrics): Extension<Arc<Metrics>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -1198,12 +1331,30 @@ async fn download_redirect(
 }
 
 // POST /download/{resid} - 返回下载链接到响应体
+#[utoipa::path(
+    post,
+    path = "/download/{resid}",
+    tag = "Resource",
+    summary = "Get download URL (JSON response)",
+    description = "Returns download URL in JSON format instead of redirect. Supports both session-based and free download policies.",
+    params(
+        ("resid" = String, Path, description = "Resource identifier"),
+        ("session" = Option<String>, Query, description = "Session ID (required for enabled download policy)")
+    ),
+    responses(
+        (status = 200, description = "Download URL or cached content returned", body = DownloadUrlResponse),
+        (status = 403, description = "Download not allowed", body = ErrorResponse),
+        (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 async fn download_json(
     Path(resid): Path<String>,
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
+    Extension(metrics): Extension<Arc<Metrics>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -1245,6 +1396,23 @@ async fn download_json(
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/resource/{resid}/{sub_path}",
+    tag = "Resource",
+    summary = "Get prefix resource metadata",
+    description = "Retrieves metadata for a specific file within a prefix resource using sub-path",
+    params(
+        ("resid" = String, Path, description = "Prefix resource identifier"),
+        ("sub_path" = String, Path, description = "Sub-path within the prefix resource")
+    ),
+    responses(
+        (status = 200, description = "Metadata retrieved successfully", body = MetadataResponse),
+        (status = 400, description = "Resource is not a prefix type", body = ErrorResponse),
+        (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 #[allow(unused_variables)]
 async fn get_prefix_metadata(
     Path((resid, sub_path)): Path<(String, String)>,
@@ -1373,6 +1541,25 @@ async fn get_prefix_metadata(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/resource/{resid}/{sub_path}",
+    tag = "Resource",
+    summary = "Create session for prefix resource access",
+    description = "Creates a new session for accessing a specific file within a prefix resource, handles challenge verification",
+    params(
+        ("resid" = String, Path, description = "Prefix resource identifier"),
+        ("sub_path" = String, Path, description = "Sub-path within the prefix resource")
+    ),
+    request_body = CreateSessionRequest,
+    responses(
+        (status = 200, description = "Session created successfully", body = SessionCreatedResponse),
+        (status = 400, description = "Resource is not a prefix type", body = ErrorResponse),
+        (status = 402, description = "Challenge required or failed", body = ChallengeResponse),
+        (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 #[allow(unused_variables)]
 #[axum::debug_handler]
 async fn create_prefix_session(
@@ -1380,6 +1567,7 @@ async fn create_prefix_session(
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
+    Extension(metrics): Extension<Arc<Metrics>>,
     Json(mut req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // 读锁访问配置
@@ -1760,6 +1948,9 @@ async fn create_prefix_session(
         }
     };
 
+    // 记录会话创建指标
+    metrics.record_session_created();
+
     (
         StatusCode::OK,
         Json(ApiResponse::success(ResponseData::Session {
@@ -2006,12 +2197,32 @@ async fn handle_prefix_download_request(
 }
 
 // GET /download/{resid}/*sub_path - 重定向到下载链接
+#[utoipa::path(
+    get,
+    path = "/download/{resid}/{sub_path}",
+    tag = "Resource",
+    summary = "Download prefix resource file (redirect)",
+    description = "Downloads a specific file from a prefix resource. Returns either a redirect to CDN URL or cached content directly.",
+    params(
+        ("resid" = String, Path, description = "Prefix resource identifier"),
+        ("sub_path" = String, Path, description = "Sub-path within the prefix resource"),
+        ("session" = Option<String>, Query, description = "Session ID (required for enabled download policy)")
+    ),
+    responses(
+        (status = 200, description = "Cached content returned directly"),
+        (status = 302, description = "Redirect to CDN download URL"),
+        (status = 403, description = "Download not allowed", body = ErrorResponse),
+        (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 async fn download_prefix_redirect(
     Path((resid, sub_path)): Path<(String, String)>,
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
+    Extension(metrics): Extension<Arc<Metrics>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -2052,12 +2263,31 @@ async fn download_prefix_redirect(
 }
 
 // POST /download/{resid}/*sub_path - 返回下载链接到响应体
+#[utoipa::path(
+    post,
+    path = "/download/{resid}/{sub_path}",
+    tag = "Resource",
+    summary = "Get prefix resource download URL (JSON response)",
+    description = "Returns download URL for a specific file from a prefix resource in JSON format instead of redirect.",
+    params(
+        ("resid" = String, Path, description = "Prefix resource identifier"),
+        ("sub_path" = String, Path, description = "Sub-path within the prefix resource"),
+        ("session" = Option<String>, Query, description = "Session ID (required for enabled download policy)")
+    ),
+    responses(
+        (status = 200, description = "Download URL or cached content returned", body = DownloadUrlResponse),
+        (status = 403, description = "Download not allowed", body = ErrorResponse),
+        (status = 404, description = "Resource not found", body = ErrorResponse),
+        (status = 500, description = "Internal server error", body = ErrorResponse)
+    )
+)]
 async fn download_prefix_json(
     Path((resid, sub_path)): Path<(String, String)>,
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
+    Extension(metrics): Extension<Arc<Metrics>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {

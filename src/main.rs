@@ -178,7 +178,8 @@ async fn main() -> DfsResult<()> {
         .layer(axum::Extension(data_store))
         .layer(axum::Extension(jsrunner))
         .layer(axum::Extension(flowrunner))
-        .layer(axum::Extension(config));
+        .layer(axum::Extension(config))
+        .layer(axum::Extension(metrics));
 
     // 获取绑定地址
     let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_string());

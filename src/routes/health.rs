@@ -1,7 +1,6 @@
 use axum::{
     Json, Router, extract::Extension, http::StatusCode, response::IntoResponse, routing::get,
 };
-use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -9,10 +8,9 @@ use tracing::{error, info, warn};
 use crate::app_state::DataStore;
 use crate::config::AppConfig;
 use crate::error::{DfsError, DfsResult};
-use crate::responses::ApiResponse;
 
 /// 健康检查响应结构
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, utoipa::ToSchema)]
 pub struct HealthCheck {
     pub status: String,
     pub version: String,
@@ -24,6 +22,17 @@ pub struct HealthCheck {
 }
 
 /// 详细健康检查
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "Health",
+    summary = "Get detailed health check information",
+    description = "Returns comprehensive health information including Redis status, plugin count, server count, and system metrics",
+    responses(
+        (status = 200, description = "Health check completed successfully", body = HealthCheck),
+        (status = 503, description = "Service degraded - some components unavailable", body = HealthCheck)
+    )
+)]
 #[tracing::instrument(skip(config, redis))]
 pub async fn health_check(
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,

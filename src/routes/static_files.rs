@@ -17,6 +17,21 @@ pub fn routes() -> Router {
 }
 
 /// 服务静态文件
+#[utoipa::path(
+    get,
+    path = "/static/{path}",
+    tag = "System",
+    summary = "Serve static files",
+    description = "Serves static files from the configured static directory for challenge pages and other resources",
+    params(
+        ("path" = String, Path, description = "File path within static directory")
+    ),
+    responses(
+        (status = 200, description = "Static file served successfully"),
+        (status = 403, description = "Access denied - file outside static directory"),
+        (status = 404, description = "File not found")
+    )
+)]
 async fn serve_static_file(Path(file_path): Path<String>) -> impl IntoResponse {
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "static".to_string());
     let full_path = PathBuf::from(&static_dir).join(&file_path);
@@ -41,6 +56,20 @@ async fn serve_static_file(Path(file_path): Path<String>) -> impl IntoResponse {
 }
 
 /// 服务挑战页面
+#[utoipa::path(
+    get,
+    path = "/challenge/{challenge_type}",
+    tag = "Challenge",
+    summary = "Serve challenge verification page",
+    description = "Serves HTML challenge verification pages for different challenge types (math, recaptcha, turnstile, etc.)",
+    params(
+        ("challenge_type" = String, Path, description = "Type of challenge (math, recaptcha, turnstile, geetest)")
+    ),
+    responses(
+        (status = 200, description = "Challenge page served successfully"),
+        (status = 404, description = "Challenge type not supported")
+    )
+)]
 async fn serve_challenge_page(Path(challenge_type): Path<String>) -> impl IntoResponse {
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "static".to_string());
     let template_path = PathBuf::from(&static_dir)

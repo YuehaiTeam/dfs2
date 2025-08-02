@@ -41,7 +41,7 @@ pub struct Challenge {
     pub sid: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, ToSchema)]
 #[allow(dead_code)]
 pub struct InsightData {
     pub bandwidth: HashMap<String, String>,
@@ -54,7 +54,7 @@ pub struct PluginMetadata {
     pub skip_penalty: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 #[allow(dead_code)]
 pub struct DeleteSessionRequest {
     #[serde(default)]

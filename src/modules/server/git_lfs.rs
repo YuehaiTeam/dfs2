@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, error, warn};
+use tracing::debug;
 use url::Url;
 
 #[derive(Clone, Debug)]

@@ -24,7 +24,6 @@ lazy_static::lazy_static! {
 
 // 导出别名以保持向后兼容
 pub type DataStore = Arc<dyn DataStoreBackend>;
-pub type RedisStore = Arc<dyn DataStoreBackend>; // 保持向后兼容的别名
 
 /// 创建数据存储后端
 /// 支持通过环境变量选择存储类型：

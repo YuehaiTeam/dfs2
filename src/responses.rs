@@ -40,17 +40,57 @@ pub enum ResponseData {
     Empty,
 }
 
-// Additional response types for OpenAPI documentation
+// Specific response types for better OpenAPI documentation
 
 #[derive(Serialize, ToSchema)]
-pub struct SessionResponse {
+pub struct SessionCreatedResponse {
     pub tries: Vec<String>,
     pub sid: String,
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct ChallengeResponse {
+    pub challenge: String,
+    pub data: String,
+    pub sid: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct MetadataResponse {
+    #[serde(rename = "_dfs_version")]
+    pub dfs_version: String,
+    pub name: String,
+    pub data: Value,
+}
+
 #[derive(Serialize, ToSchema)]  
-pub struct CdnResponse {
+pub struct CdnUrlResponse {
     pub url: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct DownloadUrlResponse {
+    pub url: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CachedContentResponse {
+    pub cached: bool,
+    pub content: String, // base64 encoded
+    pub content_type: Option<String>,
+    pub etag: String,
+    pub max_age: u32,
+    pub size: u64,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct EmptyResponse {
+    pub success: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub message: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -105,11 +145,6 @@ pub struct HealthMetrics {
     pub active_sessions: u64,
     pub requests_per_second: f64,
     pub error_rate: f64,
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct ErrorResponse {
-    pub message: String,
 }
 
 // Additional request types

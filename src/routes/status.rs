@@ -5,12 +5,33 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::config::AppConfig;
-use crate::responses::ApiResponse;
+use crate::responses::{ApiResponse, EmptyResponse, ErrorResponse};
 
+#[utoipa::path(
+    get,
+    path = "/ping",
+    tag = "System",
+    summary = "Simple ping endpoint",
+    description = "Returns HTTP 200 OK status to indicate server is running",
+    responses(
+        (status = 200, description = "Server is responding")
+    )
+)]
 pub async fn ping() -> impl IntoResponse {
     StatusCode::OK
 }
 
+#[utoipa::path(
+    get,
+    path = "/reload-config",
+    tag = "System",
+    summary = "Reload server configuration",
+    description = "Reloads the server configuration from disk without restarting the service",
+    responses(
+        (status = 200, description = "Configuration reloaded successfully", body = EmptyResponse),
+        (status = 500, description = "Failed to reload configuration", body = ErrorResponse)
+    )
+)]
 pub async fn reload_config(
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
 ) -> impl IntoResponse {

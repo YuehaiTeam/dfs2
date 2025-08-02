@@ -1,5 +1,6 @@
 use utoipa::OpenApi;
-use axum::{Router, routing::get, Json, response::Html};
+use axum::Router;
+use utoipa_swagger_ui::SwaggerUi;
 
 // Import response types for documentation
 use crate::responses::*;
@@ -15,19 +16,51 @@ use crate::models::*;
         license(name = "MIT", url = "https://opensource.org/licenses/MIT"),
         contact(name = "DFS2 Team", email = "support@example.com")
     ),
+    paths(
+        // Health and status endpoints
+        crate::routes::health::health_check,
+        crate::routes::status::ping,
+        crate::routes::status::reload_config,
+        
+        // Resource management endpoints
+        crate::routes::resource::get_metadata,
+        crate::routes::resource::create_session,
+        crate::routes::resource::get_cdn,
+        crate::routes::resource::delete_session,
+        crate::routes::resource::download_redirect,
+        crate::routes::resource::download_json,
+        crate::routes::resource::get_prefix_metadata,
+        crate::routes::resource::create_prefix_session,
+        crate::routes::resource::download_prefix_redirect,
+        crate::routes::resource::download_prefix_json,
+        
+        // Static file and challenge endpoints
+        crate::routes::static_files::serve_static_file,
+        crate::routes::static_files::serve_challenge_page,
+    ),
     components(
         schemas(
             CreateSessionRequest,
-            SessionResponse,
+            SessionCreatedResponse,
+            ChallengeResponse,
+            MetadataResponse,
+            CdnUrlResponse,
+            DownloadUrlResponse,
+            CachedContentResponse,
+            EmptyResponse,
+            ErrorResponse,
             GetCdnRequest,
-            CdnResponse,
             VerifyRequest,
             VerifyResponse,
             StatusResponse,
             HealthResponse,
             Session,
             Challenge,
-            ErrorResponse,
+            ApiResponse,
+            ResponseData,
+            crate::routes::health::HealthCheck,
+            crate::models::DeleteSessionRequest,
+            crate::models::InsightData,
         )
     ),
     servers(
@@ -43,51 +76,7 @@ use crate::models::*;
 )]
 pub struct ApiDoc;
 
-/// OpenAPI JSON handler
-async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
-    Json(ApiDoc::openapi())
-}
-
-/// Simple Swagger UI HTML page
-async fn swagger_ui() -> Html<String> {
-    let html = r#"
-<!DOCTYPE html>
-<html>
-<head>
-    <title>DFS2 API Documentation</title>
-    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@3.52.5/swagger-ui.css" />
-    <style>
-        html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
-        *, *:before, *:after { box-sizing: inherit; }
-        body { margin:0; background: #fafafa; }
-    </style>
-</head>
-<body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@3.52.5/swagger-ui-bundle.js"></script>
-    <script src="https://unpkg.com/swagger-ui-dist@3.52.5/swagger-ui-standalone-preset.js"></script>
-    <script>
-        window.onload = function() {
-            const ui = SwaggerUIBundle({
-                url: '/api-docs/openapi.json',
-                dom_id: '#swagger-ui',
-                deepLinking: true,
-                presets: [
-                    SwaggerUIBundle.presets.apis,
-                    SwaggerUIStandalonePreset
-                ],
-                plugins: [
-                    SwaggerUIBundle.plugins.DownloadUrl
-                ],
-                layout: "StandaloneLayout"
-            });
-        };
-    </script>
-</body>
-</html>
-    "#;
-    Html(html.to_string())
-}
+// Swagger UI is now handled by utoipa-swagger-ui crate
 
 /// Check if OpenAPI docs are enabled via environment variable
 pub fn is_openapi_docs_enabled() -> bool {
@@ -101,14 +90,9 @@ pub fn is_openapi_docs_enabled() -> bool {
 pub fn create_docs_router() -> Router {
     if is_openapi_docs_enabled() {
         Router::new()
-            .route("/api-docs/openapi.json", get(openapi_json))
-            .route("/docs", get(swagger_ui))
+            .merge(SwaggerUi::new("/docs").url("/api-docs/openapi.json", ApiDoc::openapi()))
     } else {
         Router::new() // Return empty router when disabled
     }
 }
 
-/// Get OpenAPI specification
-pub fn get_openapi_spec() -> utoipa::openapi::OpenApi {
-    ApiDoc::openapi()
-}

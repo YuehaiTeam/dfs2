@@ -6,56 +6,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 DFS2 is a Rust-based distributed file system server with JavaScript plugin support. It acts as a middleware for file distribution across multiple storage backends (S3, direct URLs, DFS nodes) with configurable routing flows and CDN optimization.
 
-**Current Status**: Production Ready (v0.2.0) - P0 production stability complete, P1 enhancements in progress
-- ✅ **Production Stable**: All critical safety issues resolved - zero panic risk, complete error handling
-- ✅ **Feature Complete**: Session management, challenge verification, flow control, storage backends fully implemented  
-- ✅ **Well Tested**: 35 unit tests passing (including 6 JavaScript plugin tests), clean compilation with only 2 minor dead code warnings
-- ✅ **Enterprise Logging**: Structured tracing system with configurable levels, external log integration ready
-- ✅ **JavaScript Runtime**: Complete plugin system with Redis storage integration and comprehensive testing
-- 📋 **Next Phase**: P1 monitoring and operational enhancements - see README.md for detailed roadmap
+**Current Status**: Production Ready (v0.3.0)
+- **Core Features**: Session management, challenge verification, flow control, multiple storage backends
+- **Monitoring**: Prometheus metrics (`/metrics`), structured logging, health checks  
+- **Documentation**: OpenAPI docs at `/docs`, configuration validation with `--validate-only`
+- **Plugin System**: JavaScript runtime with Redis storage integration
 
-## Current Technical Debt and Development Priorities
+## Development Approach
 
-### ✅ P0 - Production Stability ✅ COMPLETED (Jan 2025)
-**Status**: All P0 tasks completed - production deployment ready
-
-#### Critical Safety Features Implemented
-- ✅ **Memory Safety**: All dangerous `unwrap()` calls eliminated from production code paths
-  - Remaining 37 unwrap() calls are test-only or have explicit safety guarantees
-  - Zero panic risk in production environment
-- ✅ **Robust Error Handling**: Comprehensive `DfsError` enum with HTTP status mapping (`src/error.rs`)
-  - 20+ error variants covering all failure scenarios
-  - Automatic HTTP status code mapping (404, 500, 503, etc.)
-  - Consistent `Result<T, DfsError>` patterns throughout codebase
-- ✅ **Enterprise Logging**: Complete `tracing` crate integration
-  - All console output replaced with structured logging (info!, warn!, error!, debug!)
-  - Configurable log levels via `RUST_LOG` environment variable
-  - JSON format support for log aggregation systems
-  - External file logging delegation as requested
-- ✅ **System Stability**: All `expect()` calls with proper error handling
-  - HMAC creation, time calculations, JS runtime with graceful degradation
-  - Process exits only for truly unrecoverable errors (startup failures)
-
-#### Production Readiness Achieved
-- **Safety**: Zero panic risk, all error paths handled gracefully
-- **Observability**: Structured logging ready for production monitoring
-- **Reliability**: Comprehensive error system with proper HTTP responses
-- **Quality**: Clean builds with only minor dead code warnings (unused error variants for future features)
-
-### 🟡 P1 - Feature Enhancement (User Experience) - CURRENT FOCUS
-1. **API Documentation**: Missing OpenAPI/Swagger docs and standardized response formats  
-2. **Performance Monitoring**: Hardcoded cache strategies, no Prometheus metrics
-3. **Configuration Validation**: Missing startup-time validation mechanism for better deployment experience
-
-### 🟢 P2 - Deployment Support (Operations Experience)
-1. **Containerization**: Missing Docker configs and compose development environment
-2. **Deployment Scripts**: Need automated deployment and production config examples
-3. **Distributed Tracing**: Integrate OpenTelemetry/Jaeger support
-
-### 🔵 P3 - Developer Experience  
-1. **Code Quality**: 42 Clippy warnings need fixes
-2. **Documentation**: Plugin development guide and integration tests
-3. **Internationalization**: Unify error message languages
+The project follows production-first development with comprehensive error handling, structured logging, and safety guarantees. All core functionality is implemented and tested.
 
 ## Common Development Commands
 
@@ -128,6 +87,13 @@ cargo build --release
   - Module-specific: `RUST_LOG=dfs2=debug,tower_http=info`
   - Production recommendation: `info` or `warn`
 
+### Time Zone Configuration
+- `TZ`: System timezone configuration for daily bandwidth limits and time-based conditions
+  - Examples: `TZ=Asia/Shanghai`, `TZ=America/New_York`, `TZ=UTC`
+  - All daily bandwidth limits (`bw_daily`, `server_bw_daily`) reset at midnight in the specified timezone
+  - Time conditions (`time >= 09:00:00`) also use this timezone for consistency
+  - Default: Uses system local timezone if not specified
+
 ### Session Analytics and Logging
 - `SESSION_LOG_ENABLED`: Enable session analytics logging (default: "true")
   - Set to "false" to disable structured session logging
@@ -157,6 +123,7 @@ export RUST_LOG=info
 export BIND_ADDRESS=0.0.0.0:3000
 export CONFIG_PATH=/etc/dfs2/config.yaml
 export GEOLITE2_PATH=/var/lib/dfs2/GeoLite2-City.mmdb
+export TZ=Asia/Shanghai
 
 # Session analytics configuration
 export SESSION_LOG_ENABLED=true
@@ -288,9 +255,15 @@ The flow rule engine supports sophisticated request routing based on various con
 - **`size <op> <size>`**: File size comparisons
   - Operators: `==`, `!=`, `>`, `>=`, `<`, `<=`
   - Example: `size > 10MB` for large files
-- **`bw_daily <op> <limit>`**: Daily bandwidth usage limits
-  - Tracks usage per session via Redis
-  - Example: `bw_daily < 1GB` for bandwidth throttling
+- **`bw_daily <op> <limit>`**: Daily bandwidth usage limits (session-level)
+  - Tracks usage per session via Redis with automatic 24-hour expiration
+  - Example: `bw_daily < 1GB` for user bandwidth throttling
+  - Updated in real-time for both direct downloads and session-based downloads
+- **`server_bw_daily <server_id> <op> <limit>`**: Daily bandwidth usage limits (server-level)
+  - Tracks usage per specified server via Redis with automatic 24-hour expiration  
+  - Example: `server_bw_daily cdn_server1 < 100GB` for server load balancing
+  - Useful for CDN cost control and traffic distribution
+  - Must specify server_id to avoid ambiguity
 - **`time <op> <time>`**: Time-based conditions
   - Example: `time >= 09:00:00` for business hours
 - **`extras <key>`**: Custom condition flags
@@ -304,29 +277,39 @@ The flow rule engine supports sophisticated request routing based on various con
 ```yaml
 resources:
   example:
+    # Content caching configuration
+    cache_enabled: true
+    cache_subpaths: ["*.json", "images/*"]  # Only for prefix resources
+    cache_max_age: 300  # 5 minutes default
+    
     flow:
       - rules:
-          - cnip false           # Global users only
-          - ipversion 4          # IPv4 connections only
-          - size > 100MB         # Large files
-          - time >= 09:00:00     # Business hours
-        mode: and               # All conditions must match
+          - cnip false                    # Global users only
+          - ipversion 4                   # IPv4 connections only
+          - size > 100MB                  # Large files
+          - time >= 09:00:00              # Business hours
+          - bw_daily < 5GB                # User daily limit
+          - server_bw_daily cdn_global < 100GB  # Server daily limit
+        mode: and                        # All conditions must match
         use:
           - server cdn_global 10
       - rules:
-          - cnip true            # Chinese users
-          - ipversion 6          # IPv6 connections
+          - cnip true                     # Chinese users
+          - server_bw_daily cdn_china < 50GB  # Lower limit for China servers
         use:
-          - server cdn_china_v6 5
+          - server cdn_china 5
       - rules:
-          - ipversion 4          # IPv4 fallback
+          - ipversion 4                   # IPv4 fallback
         use:
-          - server cdn_china_v4 3
+          - server cdn_fallback 3
 ```
 
 **Advanced Features:**
 - **Client IP Detection**: Automatically extracts real client IP from proxy headers
 - **Health Check Integration**: Rules consider server health status from Redis cache
+- **File Size Detection**: Automatically obtains file sizes from health checks for Size conditions
+- **Bandwidth Tracking**: Real-time bandwidth usage tracking for both session and server levels
+- **Content Caching**: Files <100KB cached in Redis with xxhash ETags and proper Cache-Control headers
 - **Async Processing**: All rule evaluation is non-blocking
 - **Fallback Strategy**: Graceful degradation when GeoLite2 database unavailable
 
@@ -339,7 +322,7 @@ DFS2 使用 QuickJS 运行时执行 JavaScript 插件，支持两种插件类型
 - **用途**: 在资源请求流程中进行服务器选择和负载均衡
 - **API**: 
   ```javascript
-  async function exports(pool, indirect, options, extras) {
+  exports = async function(pool, indirect, options, extras) {
       // 返回 [should_break: boolean, new_pool: Array<[string, number]>]
       return [false, pool];
   }
@@ -350,7 +333,7 @@ DFS2 使用 QuickJS 运行时执行 JavaScript 插件，支持两种插件类型
 - **用途**: 处理 Web 人机验证挑战的生成和验证
 - **API**:
   ```javascript
-  async function exports(context, challengeData, options, extras) {
+  exports = async function(context, challengeData, options, extras) {
       if (context === "generate") {
           // 生成阶段：返回验证 URL 和相关数据
           return {
@@ -438,29 +421,10 @@ Redis-backed sessions provide intelligent server selection and tracking:
 
 - Use `Arc<RwLock<>>` for shared mutable state across async contexts
 - Implement `IntoJs` trait for Rust types exposed to JavaScript
-- Handle errors with `anyhow::Result<>` for main application logic
+- Handle errors with comprehensive `DfsError` enum and proper HTTP mapping
 - Use Axum extractors for request handling and dependency injection
 - Plugin code is loaded dynamically from the filesystem at startup
 - All backend implementations provide health check capabilities via `is_alive()` method
-
-### Development Priorities (Updated Jan 2024)
-
-With P0 tasks completed, the project is now production-ready for basic deployment. Current focus shifts to P1 user experience improvements:
-
-### P1 Tasks (Current Priority - User Experience)
-**Focus**: Improve reliability and usability
-- Fix JsRunner Redis integration for plugin storage
-- Add OpenAPI documentation generation
-- Implement Prometheus metrics collection
-- Add configuration validation mechanism
-- **Approach**: Incremental improvements with backward compatibility
-
-### P3 Tasks (Long-term - Developer Experience)
-**Focus**: Code quality and documentation
-- Fix Clippy warnings and code style issues
-- Add comprehensive plugin development documentation
-- Create integration test suite and performance benchmarks
-- **Approach**: Gradual enhancement maintaining project momentum
 
 ### Code Quality Standards
 ```bash
@@ -471,32 +435,25 @@ cargo test              # All tests must pass
 cargo doc --no-deps     # Documentation must build
 ```
 
-### Error Handling Philosophy (Updated - P0 Complete)
-- ✅ **Never use `unwrap()` in production code** - All instances replaced with explicit error handling
-- ✅ **Use unified `DfsError` type for application logic** - Provides rich error context and HTTP mapping
-- ✅ **Use `thiserror` for custom error types** - Better error messages for users
-- ✅ **Log errors before returning them** - Essential for debugging in production (tracing integration complete)
+### Error Handling Philosophy
+- Never use `unwrap()` in production code - use explicit error handling
+- Use unified `DfsError` type for application logic with HTTP status mapping
+- Use `thiserror` for custom error types with clear user messages
+- Log errors before returning them for production debugging
 
 ### Testing Requirements
 - **Unit tests required for all new functions** - Maintain high test coverage
 - **Integration tests for API endpoints** - Ensure correct request/response handling
 - **Performance tests for critical paths** - Prevent regressions in hot code
 
-## Important Implementation Notes (Updated Jan 2024)
+## Important Implementation Notes
 
-### Recently Completed (P0)
-- ✅ **Error Handling**: Comprehensive `DfsError` enum with HTTP status mapping and retry logic
-- ✅ **Logging System**: Complete tracing integration with configurable levels and structured output
-- ✅ **Health Monitoring**: Redis connectivity testing, plugin/server counting, configuration reload
-- ✅ **Safety**: All unsafe `unwrap()` calls eliminated from production code paths
-
-### Current Status
-- **JavaScript Runtime**: Currently has unused Redis field in JsRunner - this needs to be connected for plugin storage functionality (P1 priority)
-- **Session Management**: Fully implemented with intelligent server selection and health-based prioritization
-- **Challenge System**: Complete with MD5/SHA256/Web challenges, including debug mode support
+### Key Features
+- **Session Management**: Intelligent server selection with health-based prioritization
+- **Challenge System**: MD5/SHA256/Web challenges with debug mode support
 - **Static File Service**: Self-hosted challenge pages with JavaScript parameter extraction
 - **Flow Control**: Advanced rule engine with geolocation, bandwidth limiting, and time-based conditions
-- **Configuration Hot Reload**: Manual reload via `GET /reload-config` endpoint implemented, but lacks automatic file monitoring (P1 enhancement)
+- **Configuration Hot Reload**: Manual reload via `GET /reload-config` endpoint
 
 ## Challenge System Implementation
 
