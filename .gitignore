@@ -5,4 +5,5 @@ data_store/
 logs/*
 *.yaml
 *.mmdb
+*.ipdb
 *.toml
