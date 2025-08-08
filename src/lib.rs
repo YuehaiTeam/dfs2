@@ -12,6 +12,7 @@ pub mod routes;
 pub mod docs;
 pub mod analytics;
 pub mod cache;
+pub mod legacy_client;
 
 use axum::http::HeaderMap;
 use std::net::{SocketAddr, IpAddr};

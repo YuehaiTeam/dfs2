@@ -44,7 +44,7 @@ size = "0.5.0"
 chrono = { version = "0.4.41", features = ["serde"] }
 rand = "0.9"
 bytes = "1.10.1"
-maxminddb = { version = "0.26", features = ["mmap"] }
+ipdb = "0.1.4"
 prometheus = "0.14"
 axum-prometheus = "0.8"
 utoipa = { version = "5.3", features = ["axum_extras", "chrono", "uuid"] }
@@ -52,3 +52,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 utoipa-swagger-ui = { version = "9.0", features = ["axum"] }
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+
+[dev-dependencies]
+tempdir = "0.3"
+tokio-test = "0.4"

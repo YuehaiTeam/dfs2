@@ -17,10 +17,11 @@ use crate::models::*;
         contact(name = "DFS2 Team", email = "support@example.com")
     ),
     paths(
-        // Health and status endpoints
-        crate::routes::health::health_check,
-        crate::routes::status::ping,
-        crate::routes::status::reload_config,
+        // Management endpoints
+        crate::routes::mgmt::ping,
+        crate::routes::mgmt::health_check,
+        crate::routes::mgmt::reload_config,
+        crate::routes::mgmt::metrics_handler,
         
         // Resource management endpoints
         crate::routes::resource::get_metadata,
@@ -58,7 +59,7 @@ use crate::models::*;
             Challenge,
             ApiResponse,
             ResponseData,
-            crate::routes::health::HealthCheck,
+            crate::routes::mgmt::HealthCheck,
             crate::models::DeleteSessionRequest,
             crate::models::InsightData,
         )
@@ -69,10 +70,10 @@ use crate::models::*;
     ),
     tags(
         (name = "Resource", description = "File resource and session management"),
-        (name = "Health", description = "Server health and status monitoring"),
-        (name = "System", description = "System configuration and metrics"),
-        (name = "Challenge", description = "Authentication challenges")
-    )
+        (name = "Management", description = "Server management and monitoring endpoints"),
+        (name = "Challenge", description = "Authentication challenges"),
+        (name = "Static", description = "Static file serving")
+    ),
 )]
 pub struct ApiDoc;
 

@@ -7,20 +7,21 @@ use tracing::{error, info, warn};
 use crate::modules::{flow::FlowItem, geolocation, qjs::JsRunner};
 use crate::{app_state::DataStore, config::AppConfig};
 
-use super::{FlowComp, FlowCond, FlowMode, FlowUse};
+use super::{FlowComp, FlowCond, FlowMode, FlowUse, ResourcePattern};
 
 pub struct RunFlowParams {
-    pub path: String,
     pub ranges: Option<Vec<(u32, u32)>>,
     pub extras: serde_json::Value,
     pub session_id: Option<String>,
     pub client_ip: Option<IpAddr>,
     pub file_size: Option<u64>,
     pub plugin_server_mapping: HashMap<String, (Option<String>, bool)>, // url -> (server_id, skip_penalty)
-    pub resource_id: String,          // 新增：资源ID
-    pub sub_path: Option<String>,     // 新增：子路径（仅前缀资源使用）
-    pub selected_server_id: Option<String>, // 新增：记录被选择的服务器ID
-    pub selected_server_weight: Option<u32>, // 新增：记录被选择的服务器权重
+    pub resource_id: String,
+    pub version: String,
+    pub sub_path: Option<String>,
+    pub selected_server_id: Option<String>,
+    pub selected_server_weight: Option<u32>,
+    pub cdn_full_range: bool,
 }
 
 #[derive(Clone)]
@@ -118,12 +119,20 @@ impl FlowRunner {
                 }
             }
             FlowCond::Extras(key) => {
-                // 检查extras中是否存在指定的key且值为true
-                params
-                    .extras
-                    .get(key)
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
+                // 检查extras中是否存在指定的key（不管值是什么）
+                params.extras.get(key).is_some()
+            }
+            FlowCond::GeoIp(keyword) => {
+                // 检查IP地址的位置信息是否包含指定关键词（不区分大小写）
+                if let Some(client_ip) = params.client_ip {
+                    if let Some(location_data) = geolocation::get_ip_location_data(client_ip) {
+                        location_data.to_lowercase().contains(&keyword.to_lowercase())
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
             }
             FlowCond::Size(comp, expected_size) => {
                 if let Some(file_size) = params.file_size {
@@ -140,43 +149,31 @@ impl FlowRunner {
                     false
                 }
             }
-            FlowCond::BwDaily(comp, limit) => {
-                // 带宽限制检查：需要从Redis获取今日使用量
-                if let Some(session_id) = &params.session_id {
-                    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                    let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
-                        if !prefix.is_empty() {
-                            format!("{}:bw_daily:{}:{}", prefix, session_id, today)
-                        } else {
-                            format!("bw_daily:{}:{}", session_id, today)
-                        }
-                    } else {
-                        format!("bw_daily:{}:{}", session_id, today)
-                    };
-
-                    if let Ok(Some(usage_str)) = self.redis.get_string(&cache_key).await {
-                        if let Ok(current_usage) = usage_str.parse::<u64>() {
-                            let limit_bytes = limit.bytes() as u64;
-                            return match comp {
-                                FlowComp::Eq => current_usage == limit_bytes,
-                                FlowComp::Ne => current_usage != limit_bytes,
-                                FlowComp::Gt => current_usage > limit_bytes,
-                                FlowComp::Ge => current_usage >= limit_bytes,
-                                FlowComp::Lt => current_usage < limit_bytes,
-                                FlowComp::Le => current_usage <= limit_bytes,
-                            };
-                        }
+            FlowCond::ResourceBwDaily(pattern, comp, limit) => {
+                // 资源级别的带宽限制检查
+                let current_usage = match pattern {
+                    ResourcePattern::Global => {
+                        // 全局流量统计
+                        self.redis.get_global_daily_bandwidth().await.unwrap_or(0)
                     }
-                }
-                // 如果没有使用量数据，假设使用量为0
+                    ResourcePattern::Current => {
+                        // 当前资源流量统计
+                        self.redis.get_resource_daily_bandwidth(&params.resource_id).await.unwrap_or(0)
+                    }
+                    ResourcePattern::Specific(resource_id) => {
+                        // 指定资源流量统计
+                        self.redis.get_resource_daily_bandwidth(resource_id).await.unwrap_or(0)
+                    }
+                };
+
                 let limit_bytes = limit.bytes() as u64;
                 match comp {
-                    FlowComp::Eq => 0 == limit_bytes,
-                    FlowComp::Ne => 0 != limit_bytes,
-                    FlowComp::Gt => false, // 0不可能大于正数
-                    FlowComp::Ge => limit_bytes == 0,
-                    FlowComp::Lt => limit_bytes > 0,
-                    FlowComp::Le => true, // 0总是小于等于任何数
+                    FlowComp::Eq => current_usage == limit_bytes,
+                    FlowComp::Ne => current_usage != limit_bytes,
+                    FlowComp::Gt => current_usage > limit_bytes,
+                    FlowComp::Ge => current_usage >= limit_bytes,
+                    FlowComp::Lt => current_usage < limit_bytes,
+                    FlowComp::Le => current_usage <= limit_bytes,
                 }
             }
             FlowCond::ServerBwDaily(server_id, comp, limit) => {
@@ -265,10 +262,14 @@ impl FlowRunner {
     pub async fn poolize(
         &self,
         pool: &mut Vec<(String, u32)>,
-        path: &str,
         ranges: Option<Vec<(u32, u32)>>,
         session_id: Option<&str>,
-        plugin_mappings: &HashMap<String, (Option<String>, bool)>
+        plugin_mappings: &HashMap<String, (Option<String>, bool)>,
+        cdn_full_range: bool,
+        resource_id: &str,
+        version: &str,
+        sub_path: Option<&str>,
+        file_size: Option<u64>,
     ) -> Option<(String, u32)> {
         // 1. 应用重复调度惩罚
         if let Some(session_id) = session_id {
@@ -312,6 +313,7 @@ impl FlowRunner {
                         skip_penalty: *skip_penalty,
                         timestamp: chrono::Utc::now().timestamp() as u64,
                         weight: pool.iter().find(|x| x.0 == selected_index).map(|x| x.1).unwrap_or(0),
+                        size: file_size,
                     };
                     
                     let chunk_key = self.format_chunk_key(&ranges);
@@ -336,20 +338,68 @@ impl FlowRunner {
                     let config = self.config.read().await;
                     let server_impl = config.get_server(&selected_index);
                     if let Some(server_impl) = server_impl {
+                        // 动态生成服务器特定的健康检查路径
+                        let health_check_path = if let Some(sub_path) = sub_path {
+                            // 前缀资源：使用完整路径生成
+                            if let Some(path) = config.get_version_path_with_sub(resource_id, version, Some(&selected_index), Some(sub_path)) {
+                                path
+                            } else {
+                                warn!("Failed to get version path for resource {} version {} server {} with sub_path {}", resource_id, version, selected_index, sub_path);
+                                pool.retain(|x| x.0 != selected_index);
+                                continue;
+                            }
+                        } else {
+                            // 普通资源：生成服务器特定路径
+                            if let Some(path) = config.get_version_path(resource_id, version, Some(&selected_index)) {
+                                path
+                            } else {
+                                warn!("Failed to get version path for resource {} version {} server {}", resource_id, version, selected_index);
+                                pool.retain(|x| x.0 != selected_index);
+                                continue;
+                            }
+                        };
+                        
                         server_impl
-                            .is_alive(&selected_index, path, Some(&self.redis))
+                            .is_alive(&selected_index, &health_check_path, Some(&self.redis))
                             .await
                     } else {
                         false
                     }
                 };
                 if is_alive {
-                    // get url
+                    // get url - 根据 cdn_full_range 参数决定是否传递 ranges
                     let url = {
                         let config = self.config.read().await;
                         let server_impl = config.get_server(&selected_index);
                         if let Some(server_impl) = server_impl {
-                            server_impl.url(path, ranges.clone(), session_id, Some(&self.redis)).await
+                            // 动态生成服务器特定的URL路径
+                            let url_path = if let Some(sub_path) = sub_path {
+                                // 前缀资源：使用完整路径生成
+                                if let Some(path) = config.get_version_path_with_sub(resource_id, version, Some(&selected_index), Some(sub_path)) {
+                                    path
+                                } else {
+                                    error!("Failed to get version path for resource {} version {} server {} with sub_path {}", resource_id, version, selected_index, sub_path);
+                                    pool.retain(|x| x.0 != selected_index);
+                                    continue;
+                                }
+                            } else {
+                                // 普通资源：生成服务器特定路径
+                                if let Some(path) = config.get_version_path(resource_id, version, Some(&selected_index)) {
+                                    path
+                                } else {
+                                    error!("Failed to get version path for resource {} version {} server {}", resource_id, version, selected_index);
+                                    pool.retain(|x| x.0 != selected_index);
+                                    continue;
+                                }
+                            };
+                            
+                            let url_ranges = if cdn_full_range {
+                                // 强制生成整个文件的URL
+                                None
+                            } else {
+                                ranges.clone()
+                            };
+                            server_impl.url(&url_path, url_ranges, session_id, Some(&self.redis)).await
                         } else {
                             Err(anyhow::anyhow!("Server not found"))
                         }
@@ -376,6 +426,7 @@ impl FlowRunner {
                                     skip_penalty: false,
                                     timestamp: chrono::Utc::now().timestamp() as u64,
                                     weight: orig_weight,
+                                    size: file_size,
                                 };
                                 
                                 let chunk_key = self.format_chunk_key(&ranges);
@@ -390,7 +441,6 @@ impl FlowRunner {
                     }
                     return None;
                 } else {
-                    warn!("Server {} is not alive for path {}", selected_index, path);
                     // remove it
                     pool.retain(|x| x.0 != selected_index);
                     // rerun poolize
@@ -426,10 +476,14 @@ impl FlowRunner {
                         FlowUse::Poolize => {
                             let selected_server_info = self.poolize(
                                 pool,
-                                &params.path,
                                 params.ranges.clone(),
                                 params.session_id.as_deref(),
-                                &params.plugin_server_mapping
+                                &params.plugin_server_mapping,
+                                params.cdn_full_range,
+                                &params.resource_id,
+                                &params.version,
+                                params.sub_path.as_deref(),
+                                params.file_size,
                             )
                             .await;
                             if let Some((server_id, weight)) = selected_server_info {
@@ -504,10 +558,14 @@ impl FlowRunner {
         {
             let selected_server_info = self.poolize(
                 &mut pool,
-                &params.path,
                 params.ranges.clone(),
                 params.session_id.as_deref(),
-                &params.plugin_server_mapping
+                &params.plugin_server_mapping,
+                params.cdn_full_range,
+                &params.resource_id,
+                &params.version,
+                params.sub_path.as_deref(),
+                params.file_size,
             )
             .await;
             if let Some((server_id, weight)) = selected_server_info {

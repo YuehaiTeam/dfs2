@@ -9,13 +9,17 @@ pub struct CdnRecord {
     pub skip_penalty: bool,         // 是否跳过惩罚机制
     pub timestamp: u64,             // 调度时间戳
     pub weight: u32,                // 实际使用的权重
+    pub size: Option<u64>,          // 实际下载的字节数
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct Session {
-    pub path: String,
+    pub resource_id: String,
+    pub version: String,
     pub chunks: Vec<String>,
     pub cdn_records: HashMap<String, Vec<CdnRecord>>, // chunk_id -> Vec<CdnRecord>
+    #[serde(default = "default_empty_json")]
+    pub extras: serde_json::Value, // 额外的用户自定义数据
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -28,10 +32,16 @@ pub struct CreateSessionRequest {
     pub challenge: String,
     #[serde(default = "default_version")]
     pub version: String,
+    #[serde(default = "default_empty_json")]
+    pub extras: serde_json::Value,
 }
 
 fn default_version() -> String {
     "latest".to_string()
+}
+
+fn default_empty_json() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

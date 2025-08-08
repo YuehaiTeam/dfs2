@@ -15,15 +15,18 @@ pub enum ApiResponse {
 #[serde(untagged)]
 pub enum ResponseData {
     Metadata {
-        #[serde(rename = "_dfs_version")]
-        dfs_version: String,
+        resource_version: String,
         name: String,
+        changelog: Option<String>,
         data: Value,
     },
     Challenge {
         challenge: String,
         data: String,
         sid: String,
+    },
+    LegacyChallengeResponse {
+        challenge: String,  // 直接存储 "hash/source" 格式
     },
     Session {
         tries: Vec<String>,
@@ -57,9 +60,9 @@ pub struct ChallengeResponse {
 
 #[derive(Serialize, ToSchema)]
 pub struct MetadataResponse {
-    #[serde(rename = "_dfs_version")]
-    pub dfs_version: String,
+    pub resource_version: String,
     pub name: String,
+    pub changelog: Option<String>,
     pub data: Value,
 }
 

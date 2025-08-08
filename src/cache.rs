@@ -108,7 +108,7 @@ pub async fn should_cache_content(
 }
 
 /// 简单的glob模式匹配
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub fn glob_match(pattern: &str, text: &str) -> bool {
     // 简化版本的glob匹配，支持*通配符
     if pattern == "*" {
         return true;

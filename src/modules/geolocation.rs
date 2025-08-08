@@ -1,19 +1,19 @@
 use lazy_static::lazy_static;
-use maxminddb::Reader;
+use ipdb::Reader;
 use std::net::IpAddr;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 lazy_static! {
-    static ref IPDB: Option<Reader<Vec<u8>>> = {
+    pub static ref IPDB: Option<Reader> = {
         let path =
-            std::env::var("GEOLITE2_PATH").unwrap_or_else(|_| "GeoLite2-City.mmdb".to_string());
-        match maxminddb::Reader::open_readfile(&path) {
+            std::env::var("IPDB_PATH").unwrap_or_else(|_| "ipipfree.ipdb".to_string());
+        match Reader::open_file(&path) {
             Ok(reader) => {
-                info!("GeoLite2 database loaded from: {}", path);
+                info!("IPIP database loaded from: {}", path);
                 Some(reader)
             }
             Err(e) => {
-                error!("Failed to load GeoLite2 database from {}: {}", path, e);
+                error!("Failed to load IPIP database from {}: {}", path, e);
                 error!("IP geolocation features will be disabled");
                 None
             }
@@ -24,20 +24,16 @@ lazy_static! {
 /// 判断IP是否为全球IP（非中国IP）
 pub fn is_global_ip(ip: IpAddr) -> bool {
     if let Some(ref ipdb) = *IPDB {
-        match ipdb.lookup::<maxminddb::geoip2::City>(ip) {
-            Ok(city_record_opt) => {
-                if let Some(city_record) = city_record_opt {
-                    if let Some(country) = city_record.country {
-                        if let Some(iso_code) = country.iso_code {
-                            let is_cn = iso_code == "CN";
-                            return !is_cn;
-                        }
-                    }
-                }
-                // 如果没有国家信息，默认为全球IP
-                true
+        // 使用find_city_info获取详细的城市信息
+        match ipdb.find_city_info(&ip.to_string(), "CN") {
+            Ok(city_info) => {
+                // 直接检查country_code字段，精确判断
+                let is_cn = city_info.country_code.eq_ignore_ascii_case("CN") 
+                    || city_info.country_code.eq_ignore_ascii_case("CHN");
+                !is_cn // 返回是否为全球IP（非中国IP）
             }
-            Err(_) => {
+            Err(e) => {
+                warn!("Failed to lookup IP {} with find_city_info: {}", ip, e);
                 // 查询失败，默认为全球IP
                 true
             }
@@ -45,6 +41,24 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
     } else {
         // 没有数据库，默认为全球IP
         true
+    }
+}
+
+/// 获取IP地址的完整位置信息（用于geoip关键词匹配）
+pub fn get_ip_location_data(ip: IpAddr) -> Option<String> {
+    if let Some(ref ipdb) = *IPDB {
+        match ipdb.find(&ip.to_string(), "CN") {
+            Ok(result) => {
+                // 将Vec<&str>用空格连接成字符串，用于geoip关键词匹配
+                Some(result.join(" "))
+            }
+            Err(e) => {
+                warn!("Failed to lookup IP location data for {}: {}", ip, e);
+                None
+            }
+        }
+    } else {
+        None
     }
 }
 
@@ -104,10 +118,23 @@ mod tests {
 
     #[test]
     fn test_is_global_ip_fallback() {
-        // 当没有GeoLite2数据库时，应该返回true
+        // 当没有IPIP数据库时，应该返回true
         let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         let result = is_global_ip(ip);
         // 由于测试环境可能没有数据库，我们只确保函数不会panic
         assert!(result == true || result == false);
+    }
+
+    #[test]
+    fn test_get_ip_location_data() {
+        // 测试获取IP位置数据函数
+        let ip = IpAddr::V4(Ipv4Addr::new(114, 114, 114, 114));
+        let result = get_ip_location_data(ip);
+        // 由于测试环境可能没有数据库，我们只确保函数不会panic
+        // 如果有数据库，result应该是Some，如果没有则是None
+        match result {
+            Some(data) => assert!(!data.is_empty()),
+            None => {} // 没有数据库是正常的
+        }
     }
 }

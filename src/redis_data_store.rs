@@ -39,7 +39,8 @@ impl DataStoreBackend for RedisDataStore {
         let mut pipe = redis::pipe();
         pipe.atomic()
             // 存储会话数据
-            .hset(&session_key, "path", &session.path)
+            .hset(&session_key, "resource_id", &session.resource_id)
+            .hset(&session_key, "version", &session.version)
             .hset(
                 &session_key,
                 "chunks",
@@ -49,6 +50,11 @@ impl DataStoreBackend for RedisDataStore {
                 &session_key,
                 "cdn_records",
                 serde_json::to_string(&session.cdn_records).map_err(|e| e.to_string())?,
+            )
+            .hset(
+                &session_key,
+                "extras",
+                serde_json::to_string(&session.extras).map_err(|e| e.to_string())?,
             )
             .expire(&session_key, 3600);
 
@@ -72,25 +78,32 @@ impl DataStoreBackend for RedisDataStore {
         let key = self.redis_key("session", sid);
 
         // 使用Pipeline一次获取所有字段
-        let (path, chunks, cdn_records): (Option<String>, Option<String>, Option<String>) =
+        let (resource_id, version, chunks, cdn_records, extras): (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) =
             redis::pipe()
                 .atomic()
-                .hget(&key, "path")
+                .hget(&key, "resource_id")
+                .hget(&key, "version")
                 .hget(&key, "chunks")
                 .hget(&key, "cdn_records")
+                .hget(&key, "extras")
                 .query_async(&mut conn)
                 .await
                 .map_err(|e| e.to_string())?;
 
-        match (path, chunks, cdn_records) {
-            (Some(path), Some(chunks_json), Some(cdn_records_json)) => {
+        match (resource_id, version, chunks, cdn_records) {
+            (Some(resource_id), Some(version), Some(chunks_json), Some(cdn_records_json)) => {
                 let chunks: Vec<String> = serde_json::from_str(&chunks_json).unwrap_or_default();
                 let cdn_records: HashMap<String, Vec<CdnRecord>> =
                     serde_json::from_str(&cdn_records_json).unwrap_or_default();
+                let extras: serde_json::Value = extras
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_else(|| serde_json::json!({}));
                 Ok(Some(Session {
-                    path,
+                    resource_id,
+                    version,
                     chunks,
                     cdn_records,
+                    extras,
                 }))
             }
             _ => Ok(None),
@@ -165,17 +178,6 @@ impl DataStoreBackend for RedisDataStore {
         conn.hgetall(&counts_key).await.map_err(|e| e.to_string())
     }
 
-    async fn update_session_path(&self, sid: &str, path: &str) -> Result<bool, String> {
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| e.to_string())?;
-        let key = self.redis_key("session", sid);
-
-        let exists: bool = conn.hset(&key, "path", path).await.map_err(|e| e.to_string())?;
-        if exists {
-            let _: () = conn.expire(&key, 3600).await.map_err(|e| e.to_string())?;
-        }
-        Ok(exists)
-    }
 
     async fn update_session_chunks(&self, sid: &str, chunks: &[String]) -> Result<bool, String> {
         let mut conn = self.client.get_multiplexed_async_connection().await
@@ -190,16 +192,6 @@ impl DataStoreBackend for RedisDataStore {
         Ok(exists)
     }
 
-    async fn update_cdn_record(&self, sid: &str, chunk: &str, cdn_url: &str) -> Result<(), String> {
-        let record = CdnRecord {
-            url: cdn_url.to_string(),
-            server_id: None,
-            skip_penalty: false,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-            weight: 0,
-        };
-        self.update_cdn_record_v2(sid, chunk, record).await
-    }
 
     async fn update_cdn_record_v2(&self, sid: &str, chunk: &str, record: CdnRecord) -> Result<(), String> {
         let mut conn = self.client.get_multiplexed_async_connection().await
@@ -257,12 +249,16 @@ impl DataStoreBackend for RedisDataStore {
         let counts_key = self.redis_key("counts", sid);
 
         // 使用Pipeline同时获取所有信息
-        let ((path, chunks, cdn_records), counts): (
-            (Option<String>, Option<String>, Option<String>),
-            HashMap<String, u32>,
+        let (resource_id, version, chunks, cdn_records, counts): (
+            Option<String>, 
+            Option<String>, 
+            Option<String>, 
+            Option<String>,
+            HashMap<String, u32>
         ) = redis::pipe()
             .atomic()
-            .hget(&session_key, "path")
+            .hget(&session_key, "resource_id")
+            .hget(&session_key, "version")
             .hget(&session_key, "chunks")
             .hget(&session_key, "cdn_records")
             .hgetall(&counts_key)
@@ -270,13 +266,14 @@ impl DataStoreBackend for RedisDataStore {
             .await
             .map_err(|e| e.to_string())?;
 
-        match (path, chunks, cdn_records) {
-            (Some(path), Some(chunks_json), Some(cdn_records_json)) => {
+        match (resource_id, version, chunks, cdn_records) {
+            (Some(resource_id), Some(version), Some(chunks_json), Some(cdn_records_json)) => {
                 let chunks: Vec<String> = serde_json::from_str(&chunks_json).unwrap_or_default();
                 let cdn_records: HashMap<String, Vec<CdnRecord>> =
                     serde_json::from_str(&cdn_records_json).unwrap_or_default();
                 Ok(Some(SessionStats {
-                    path,
+                    resource_id,
+                    version,
                     chunks,
                     download_counts: counts,
                     cdn_records,
@@ -469,25 +466,6 @@ impl DataStoreBackend for RedisDataStore {
         conn.del(key).await.map_err(|e| e.to_string())
     }
     
-    async fn update_daily_bandwidth(&self, session_id: &str, bytes: u64) -> Result<(), String> {
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| e.to_string())?;
-        
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let cache_key = self.redis_key("bw_daily", &format!("{}:{}", session_id, today));
-        
-        // 使用 INCRBY 原子性增加计数，并设置24小时过期时间
-        let _: () = redis::pipe()
-            .atomic()
-            .cmd("INCRBY").arg(&cache_key).arg(bytes)
-            .expire(&cache_key, 86400) // 24小时过期
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| e.to_string())?;
-            
-        Ok(())
-    }
-    
     async fn update_server_daily_bandwidth(&self, server_id: &str, bytes: u64) -> Result<(), String> {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| e.to_string())?;
@@ -507,14 +485,224 @@ impl DataStoreBackend for RedisDataStore {
         Ok(())
     }
     
-    async fn get_daily_bandwidth(&self, session_id: &str) -> Result<u64, String> {
+    async fn update_resource_daily_bandwidth(&self, resource_id: &str, bytes: u64) -> Result<(), String> {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| e.to_string())?;
         
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let cache_key = self.redis_key("bw_daily", &format!("{}:{}", session_id, today));
+        let cache_key = self.redis_key("resource_bw_daily", &format!("{}:{}", resource_id, today));
+        
+        // 使用 INCRBY 原子性增加计数，并设置24小时过期时间
+        let _: () = redis::pipe()
+            .atomic()
+            .cmd("INCRBY").arg(&cache_key).arg(bytes)
+            .expire(&cache_key, 86400) // 24小时过期
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+            
+        Ok(())
+    }
+    
+    async fn update_global_daily_bandwidth(&self, bytes: u64) -> Result<(), String> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| e.to_string())?;
+        
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let cache_key = self.redis_key("global_bw_daily", &today);
+        
+        // 使用 INCRBY 原子性增加计数，并设置24小时过期时间
+        let _: () = redis::pipe()
+            .atomic()
+            .cmd("INCRBY").arg(&cache_key).arg(bytes)
+            .expire(&cache_key, 86400) // 24小时过期
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+            
+        Ok(())
+    }
+    
+    async fn get_server_daily_bandwidth(&self, server_id: &str) -> Result<u64, String> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| e.to_string())?;
+        
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let cache_key = self.redis_key("server_bw_daily", &format!("{}:{}", server_id, today));
         
         let result: Option<String> = conn.get(&cache_key).await.map_err(|e| e.to_string())?;
         Ok(result.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+    
+    async fn get_resource_daily_bandwidth(&self, resource_id: &str) -> Result<u64, String> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| e.to_string())?;
+        
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let cache_key = self.redis_key("resource_bw_daily", &format!("{}:{}", resource_id, today));
+        
+        let result: Option<String> = conn.get(&cache_key).await.map_err(|e| e.to_string())?;
+        Ok(result.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+    
+    async fn get_global_daily_bandwidth(&self) -> Result<u64, String> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| e.to_string())?;
+        
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let cache_key = self.redis_key("global_bw_daily", &today);
+        
+        let result: Option<String> = conn.get(&cache_key).await.map_err(|e| e.to_string())?;
+        Ok(result.and_then(|s| s.parse().ok()).unwrap_or(0))
+    }
+    
+    async fn update_bandwidth_batch(&self, batch: crate::data_store::BandwidthUpdateBatch) -> Result<(), String> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| e.to_string())?;
+        
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        
+        // 构建三个Redis键
+        let resource_key = self.redis_key("resource_bw_daily", &format!("{}:{}", batch.resource_id, today));
+        let server_key = self.redis_key("server_bw_daily", &format!("{}:{}", batch.server_id, today));
+        let global_key = self.redis_key("global_bw_daily", &today);
+        
+        // 使用Redis MULTI/EXEC事务原子性更新所有统计
+        let _: () = redis::pipe()
+            .atomic()
+            .cmd("INCRBY").arg(&resource_key).arg(batch.bytes)
+            .expire(&resource_key, 86400)
+            .cmd("INCRBY").arg(&server_key).arg(batch.bytes) 
+            .expire(&server_key, 86400)
+            .cmd("INCRBY").arg(&global_key).arg(batch.bytes)
+            .expire(&global_key, 86400)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+            
+        Ok(())
+    }
+
+    async fn scan_expired_sessions(&self, timeout_seconds: u64) -> Result<Vec<(String, String, std::net::IpAddr)>, String> {
+        
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| e.to_string())?;
+        
+        let mut expired_sessions = Vec::new();
+        let mut cursor = 0u64;
+        
+        // 生成扫描模式，包含前缀支持
+        let scan_pattern = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
+            if !prefix.is_empty() {
+                format!("{}:session:*", prefix)
+            } else {
+                "session:*".to_string()
+            }
+        } else {
+            "session:*".to_string()
+        };
+        
+        loop {
+            // 使用 SCAN 命令扫描匹配的键，每次返回最多100个键
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&scan_pattern)
+                .arg("COUNT")
+                .arg(100u64)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| e.to_string())?;
+            
+            // 检查每个会话键的 TTL
+            for key in keys {
+                match redis::cmd("TTL").arg(&key).query_async::<i64>(&mut conn).await {
+                    Ok(ttl) if ttl > 0 && ttl < 60 => {
+                        // TTL > 0 表示键存在且有过期时间，TTL < 60 表示即将过期
+                        if let Some(session_id) = self.extract_session_id(&key) {
+                            if let Ok(Some(session_info)) = self.get_session_info(&session_id).await {
+                                expired_sessions.push(session_info);
+                            }
+                        }
+                    }
+                    Ok(ttl) if ttl == -1 => {
+                        // TTL = -1 表示键存在但没有设置过期时间，这是异常情况
+                        // 根据创建时间判断是否应该过期
+                        if let Some(session_id) = self.extract_session_id(&key) {
+                            if let Ok(Some(session_info)) = self.check_session_timeout(&session_id, timeout_seconds).await {
+                                expired_sessions.push(session_info);
+                            }
+                        }
+                    }
+                    _ => {
+                        // TTL = -2 表示键不存在，TTL = 0 表示键已过期，忽略
+                    }
+                }
+            }
+            
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        
+        Ok(expired_sessions)
+    }
+}
+
+impl RedisDataStore {
+    /// 从 Redis 键中提取会话 ID
+    fn extract_session_id(&self, key: &str) -> Option<String> {
+        // key 格式: "session:session_id" 或 "prefix:session:session_id"
+        if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
+            if !prefix.is_empty() {
+                let expected_prefix = format!("{}:session:", prefix);
+                if key.starts_with(&expected_prefix) {
+                    return Some(key[expected_prefix.len()..].to_string());
+                }
+            }
+        }
+        
+        if key.starts_with("session:") {
+            Some(key[8..].to_string()) // "session:".len() = 8
+        } else {
+            None
+        }
+    }
+    
+    /// 获取会话信息（resource_id 和 client_ip）
+    async fn get_session_info(&self, session_id: &str) -> Result<Option<(String, String, std::net::IpAddr)>, String> {
+        let mut conn = self.client.get_multiplexed_async_connection().await
+            .map_err(|e| e.to_string())?;
+        
+        let session_key = self.redis_key("session", session_id);
+        
+        let (resource_id, extras): (Option<String>, Option<String>) = redis::pipe()
+            .hget(&session_key, "resource_id")
+            .hget(&session_key, "extras")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        
+        if let (Some(resource_id), Some(extras_json)) = (resource_id, extras) {
+            if let Ok(extras) = serde_json::from_str::<serde_json::Value>(&extras_json) {
+                if let Some(client_ip_str) = extras.get("client_ip").and_then(|v| v.as_str()) {
+                    if let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() {
+                        return Ok(Some((session_id.to_string(), resource_id, client_ip)));
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
+    }
+    
+    /// 检查没有设置TTL的会话是否超时
+    async fn check_session_timeout(&self, session_id: &str, _timeout_seconds: u64) -> Result<Option<(String, String, std::net::IpAddr)>, String> {
+        // 这里可以根据会话的创建时间来判断是否超时
+        // 但由于当前实现中没有存储创建时间，我们暂时跳过这些会话
+        // 在实际生产环境中，建议所有会话都设置TTL
+        warn!("Found session without TTL: {}, skipping", session_id);
+        Ok(None)
     }
 }

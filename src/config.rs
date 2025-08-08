@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{error, info};
 
-use crate::modules::{flow::FlowItem, server::ServerImpl};
 use crate::challenge::ChallengeType;
+use crate::modules::{flow::FlowItem, server::ServerImpl};
 
 /// Challenge configuration for individual resources or global settings
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -12,15 +12,15 @@ pub struct ChallengeConfig {
     /// Challenge type: "md5", "sha256", "web", or "random"
     #[serde(default = "default_challenge_type")]
     pub challenge_type: String,
-    
+
     /// SHA256 challenge difficulty (1-4 bytes, only used for SHA256)
     #[serde(default = "default_sha256_difficulty")]
     pub sha256_difficulty: u8,
-    
+
     /// Default web challenge plugin to use
     #[serde(default = "default_web_plugin")]
     pub web_plugin: String,
-    
+
     /// Type weights for random selection (percentages)
     #[serde(default)]
     pub type_weights: Option<TypeWeights>,
@@ -37,14 +37,63 @@ pub struct TypeWeights {
 }
 
 // Default functions for challenge configuration
-fn default_challenge_type() -> String { "random".to_string() }
-fn default_sha256_difficulty() -> u8 { 2 }
-fn default_web_plugin() -> String { "web_challenge_recaptcha".to_string() }
-fn default_md5_weight() -> u32 { 30 }
-fn default_sha256_weight() -> u32 { 50 }
-fn default_web_weight() -> u32 { 20 }
-fn default_resource_type() -> String { "file".to_string() }
-fn default_cache_max_age() -> u32 { 300 } // 5分钟
+fn default_challenge_type() -> String {
+    "random".to_string()
+}
+fn default_sha256_difficulty() -> u8 {
+    2
+}
+fn default_web_plugin() -> String {
+    "web_challenge_recaptcha".to_string()
+}
+fn default_md5_weight() -> u32 {
+    30
+}
+fn default_sha256_weight() -> u32 {
+    50
+}
+fn default_web_weight() -> u32 {
+    20
+}
+fn default_resource_type() -> String {
+    "file".to_string()
+}
+fn default_cache_max_age() -> u32 {
+    300
+} // 5分钟
+
+/// Version provider configuration for dynamic version fetching
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VersionProviderConfig {
+    /// Provider type: "plugin"
+    pub r#type: String,
+    
+    /// Plugin name (must start with "version_provider_")
+    pub plugin_name: String,
+    
+    /// Cache TTL in seconds (default: 300)
+    #[serde(default)]
+    pub cache_ttl: Option<u32>,
+    
+    /// Webhook token for manual refresh (optional)
+    pub webhook_token: Option<String>,
+    
+    /// Provider-specific options
+    #[serde(default)]
+    pub options: serde_json::Value,
+}
+
+impl<'js> IntoJs<'js> for VersionProviderConfig {
+    fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
+        let obj = rquickjs::Object::new(ctx.clone())?;
+        obj.set("type", self.r#type)?;
+        obj.set("plugin_name", self.plugin_name)?;
+        obj.set("cache_ttl", self.cache_ttl)?;
+        obj.set("webhook_token", self.webhook_token.clone())?;
+        obj.set("options", self.options.to_string())?; // 转换为字符串以便JS处理
+        Ok(obj.into())
+    }
+}
 
 impl Default for ChallengeConfig {
     fn default() -> Self {
@@ -62,7 +111,7 @@ impl Default for ChallengeConfig {
 }
 
 /// Download policy for resources
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DownloadPolicy {
     /// Download disabled (default)
@@ -84,10 +133,10 @@ impl ChallengeConfig {
     pub fn new(challenge_type: ChallengeType, difficulty: Option<u8>) -> Self {
         let type_str = match challenge_type {
             ChallengeType::Md5 => "md5",
-            ChallengeType::Sha256 => "sha256", 
+            ChallengeType::Sha256 => "sha256",
             ChallengeType::Web => "web",
         };
-        
+
         ChallengeConfig {
             challenge_type: type_str.to_string(),
             sha256_difficulty: difficulty.unwrap_or(2).clamp(1, 4),
@@ -110,13 +159,13 @@ impl ChallengeConfig {
                 // Use weights to randomly select type
                 use rand::Rng;
                 let mut rng = rand::rng();
-                
+
                 if let Some(ref weights) = self.type_weights {
                     let total = weights.md5 + weights.sha256 + weights.web;
                     if total == 0 {
                         return ChallengeType::Md5; // fallback
                     }
-                    
+
                     let choice = rng.random_range(0..total);
                     if choice < weights.md5 {
                         ChallengeType::Md5
@@ -136,12 +185,15 @@ impl ChallengeConfig {
                 }
             }
             _ => {
-                error!("Unknown challenge type: {}, defaulting to MD5", self.challenge_type);
+                error!(
+                    "Unknown challenge type: {}, defaulting to MD5",
+                    self.challenge_type
+                );
                 ChallengeType::Md5
             }
         }
     }
-    
+
     /// Get SHA256 difficulty, clamped to valid range
     pub fn get_sha256_difficulty(&self) -> u8 {
         self.sha256_difficulty.clamp(1, 4)
@@ -211,6 +263,18 @@ pub struct ResourceConfig {
     /// 缓存时间（秒），用于Cache-Control max-age
     #[serde(default = "default_cache_max_age")]
     pub cache_max_age: u32,
+    /// 是否启用历史客户端支持（默认 false）
+    #[serde(default)]
+    pub legacy_client_support: bool,
+    /// 历史客户端全范围模式：虽然验证range但生成签名时始终使用整个文件（默认 false）
+    #[serde(default)]
+    pub legacy_client_full_range: bool,
+    /// 静态changelog配置 (可选)
+    #[serde(default)]
+    pub changelog: Option<String>,
+    /// 动态版本提供者配置 (可选)
+    #[serde(default)]
+    pub version_provider: Option<VersionProviderConfig>,
 }
 impl<'js> IntoJs<'js> for ResourceConfig {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
@@ -224,6 +288,14 @@ impl<'js> IntoJs<'js> for ResourceConfig {
             versions.set(key, value)?;
         }
         obj.set("versions", versions)?;
+        obj.set("legacy_client_support", self.legacy_client_support)?;
+        obj.set("legacy_client_full_range", self.legacy_client_full_range)?;
+        if let Some(changelog) = self.changelog {
+            obj.set("changelog", changelog)?;
+        }
+        if let Some(version_provider) = self.version_provider {
+            obj.set("version_provider", version_provider)?;
+        }
         Ok(obj.into())
     }
 }
@@ -274,20 +346,20 @@ impl AppConfig {
         }
         &self.challenge
     }
-    
+
     /// Apply environment variable overrides to challenge configuration
     pub fn apply_env_overrides(&mut self) {
         // Override global challenge config with environment variables
         if let Ok(challenge_type) = std::env::var("CHALLENGE_DEFAULT_TYPE") {
             self.challenge.challenge_type = challenge_type;
         }
-        
+
         if let Ok(difficulty_str) = std::env::var("CHALLENGE_SHA256_DIFFICULTY") {
             if let Ok(difficulty) = difficulty_str.parse::<u8>() {
                 self.challenge.sha256_difficulty = difficulty.clamp(1, 4);
             }
         }
-        
+
         if let Ok(web_plugin) = std::env::var("CHALLENGE_WEB_PLUGIN") {
             self.challenge.web_plugin = web_plugin;
         }
@@ -342,10 +414,10 @@ impl AppConfig {
             server_impl.insert(id.clone(), server);
         }
         config.server_impl = server_impl;
-        
+
         // Apply environment variable overrides
         config.apply_env_overrides();
-        
+
         Ok(config)
     }
 
@@ -365,17 +437,35 @@ impl AppConfig {
     ) -> Option<String> {
         let resource = self.get_resource(resid)?;
 
-        let version_map = resource.versions.get(version)?;
-
-        // 如果指定了特定服务器，尝试获取该服务器的路径
-        if let Some(server_id) = server_id {
-            if let Some(path) = version_map.get(server_id) {
-                return Some(path.clone());
+        // 首先尝试获取特定版本的配置
+        let path = if let Some(version_map) = resource.versions.get(version) {
+            // 版本存在，获取路径
+            if let Some(server_id) = server_id {
+                version_map
+                    .get(server_id)
+                    .or_else(|| version_map.get("default"))
+            } else {
+                version_map.get("default")
             }
-        }
+        } else {
+            // 版本不存在，尝试使用default模板
+            None
+        };
 
-        // 否则返回默认路径
-        version_map.get("default").cloned()
+        // 如果没有找到路径，尝试使用default模板
+        let path = path.or_else(|| {
+            let default_template = resource.versions.get("default")?;
+            if let Some(server_id) = server_id {
+                default_template
+                    .get(server_id)
+                    .or_else(|| default_template.get("default"))
+            } else {
+                default_template.get("default")
+            }
+        })?;
+
+        // 执行版本号占位符替换
+        Some(path.replace("${version}", version))
     }
 
     /// Get version path with optional sub-path for prefix resources
@@ -388,7 +478,7 @@ impl AppConfig {
     ) -> Option<String> {
         let resource = self.get_resource(resid)?;
         let base_path = self.get_version_path(resid, version, server_id)?;
-        
+
         match resource.resource_type.as_str() {
             "prefix" => {
                 if let Some(sub) = sub_path {
@@ -397,8 +487,43 @@ impl AppConfig {
                     None // 前缀资源必须提供子路径
                 }
             }
-            _ => Some(base_path) // 文件资源忽略子路径
+            _ => Some(base_path), // 文件资源忽略子路径
         }
+    }
+    
+    /// Get effective version for a resource with version cache support
+    pub async fn get_effective_version_with_cache(
+        &self, 
+        resource_id: &str,
+        version_cache: Option<&crate::modules::version_provider::VersionCache>
+    ) -> String {
+        if let Some(resource) = self.get_resource(resource_id) {
+            // Check if resource has version provider configured
+            if resource.version_provider.is_some() {
+                // Try to get cached version
+                if let Some(cache) = version_cache {
+                    if let Some(cached_version) = cache.get_cached_version(resource_id).await {
+                        return cached_version;
+                    }
+                }
+            }
+            
+            // Fallback to static latest version
+            if !resource.latest.is_empty() {
+                resource.latest.clone()
+            } else {
+                "latest".to_string()
+            }
+        } else {
+            "latest".to_string()
+        }
+    }
+    
+    /// Check if resource has dynamic version provider configured
+    pub fn has_version_provider(&self, resource_id: &str) -> bool {
+        self.get_resource(resource_id)
+            .map(|resource| resource.version_provider.is_some())
+            .unwrap_or(false)
     }
 }
 
@@ -416,7 +541,7 @@ fn normalize_path(path: &str) -> String {
         .replace("../", "")
         .replace("..\\", "")
         .replace("\\", "/");
-    
+
     // 确保以斜杠开头
     if !cleaned.starts_with('/') {
         format!("/{}", cleaned)
@@ -469,13 +594,17 @@ mod tests {
                 versions,
                 tries: vec!["s3_server".to_string(), "direct_server".to_string()],
                 server: vec!["s3_server".to_string(), "direct_server".to_string()],
-                flow: vec![], // 简单测试不需要复杂flow
+                flow: vec![],    // 简单测试不需要复杂flow
                 challenge: None, // 使用默认挑战配置
                 download: crate::config::DownloadPolicy::Enabled, // 默认下载策略
                 resource_type: "file".to_string(), // 默认文件类型
+                legacy_client_support: false, // 测试中默认不支持历史客户端
+                legacy_client_full_range: false, // 测试中默认不启用全范围模式
                 cache_enabled: false, // 默认不启用缓存
                 cache_subpaths: vec![], // 默认无缓存子路径
                 cache_max_age: default_cache_max_age(), // 默认缓存时间
+                changelog: None, // 测试中默认无静态changelog
+                version_provider: None, // 测试中默认不使用动态版本
             },
         );
 
@@ -543,6 +672,113 @@ mod tests {
     }
 
     #[test]
+    fn test_version_placeholder_replacement() {
+        let mut config = create_test_config();
+
+        // 添加包含版本占位符的配置
+        let mut version_with_placeholder = HashMap::new();
+        version_with_placeholder.insert(
+            "default".to_string(),
+            "/releases/${version}/app.exe".to_string(),
+        );
+        version_with_placeholder.insert(
+            "s3_server".to_string(),
+            "/s3-bucket/${version}/installer.exe".to_string(),
+        );
+
+        if let Some(resource) = config.resources.get_mut("test_app") {
+            resource
+                .versions
+                .insert("2.0".to_string(), version_with_placeholder);
+        }
+
+        // 测试版本占位符替换 - 默认路径
+        let path = config.get_version_path("test_app", "2.0", None);
+        assert_eq!(path, Some("/releases/2.0/app.exe".to_string()));
+
+        // 测试版本占位符替换 - 特定服务器路径
+        let path = config.get_version_path("test_app", "2.0", Some("s3_server"));
+        assert_eq!(path, Some("/s3-bucket/2.0/installer.exe".to_string()));
+
+        // 测试不存在占位符的路径不受影响
+        let path = config.get_version_path("test_app", "1.0", None);
+        assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
+
+        // 测试复杂版本号的替换
+        let mut complex_version = HashMap::new();
+        complex_version.insert(
+            "default".to_string(),
+            "/apps/${version}/final/dist.zip".to_string(),
+        );
+
+        if let Some(resource) = config.resources.get_mut("test_app") {
+            resource
+                .versions
+                .insert("1.2.3-beta".to_string(), complex_version);
+        }
+
+        let path = config.get_version_path("test_app", "1.2.3-beta", None);
+        assert_eq!(path, Some("/apps/1.2.3-beta/final/dist.zip".to_string()));
+    }
+
+    #[test]
+    fn test_versions_default_template() {
+        let mut config = create_test_config();
+
+        // 添加default模板配置
+        let mut default_template = HashMap::new();
+        default_template.insert(
+            "default".to_string(),
+            "/releases/${version}/app.exe".to_string(),
+        );
+        default_template.insert(
+            "s3_server".to_string(),
+            "/s3-releases/${version}/installer.exe".to_string(),
+        );
+
+        if let Some(resource) = config.resources.get_mut("test_app") {
+            resource
+                .versions
+                .insert("default".to_string(), default_template);
+        }
+
+        // 测试使用default模板 - 不存在的版本应该使用default模板
+        let path = config.get_version_path("test_app", "3.0.0", None);
+        assert_eq!(path, Some("/releases/3.0.0/app.exe".to_string()));
+
+        // 测试使用default模板 - 特定服务器
+        let path = config.get_version_path("test_app", "3.0.0", Some("s3_server"));
+        assert_eq!(path, Some("/s3-releases/3.0.0/installer.exe".to_string()));
+
+        // 测试特定版本优先级高于default模板
+        let path = config.get_version_path("test_app", "1.0", None);
+        assert_eq!(path, Some("/app/v1.0/app.exe".to_string())); // 仍然使用特定版本配置
+
+        // 添加一个只有部分服务器配置的版本
+        let mut partial_version = HashMap::new();
+        partial_version.insert(
+            "direct_server".to_string(),
+            "/direct/v4.0.0/app.exe".to_string(),
+        );
+
+        if let Some(resource) = config.resources.get_mut("test_app") {
+            resource
+                .versions
+                .insert("4.0.0".to_string(), partial_version);
+        }
+
+        // 测试混合使用：特定版本有部分配置，缺失的回退到default模板
+        let path = config.get_version_path("test_app", "4.0.0", Some("direct_server"));
+        assert_eq!(path, Some("/direct/v4.0.0/app.exe".to_string())); // 使用特定配置
+
+        let path = config.get_version_path("test_app", "4.0.0", None);
+        assert_eq!(path, Some("/releases/4.0.0/app.exe".to_string())); // default服务器使用模板
+
+        let path = config.get_version_path("test_app", "4.0.0", Some("s3_server"));
+        assert_eq!(path, Some("/s3-releases/4.0.0/installer.exe".to_string())); // s3_server使用模板
+    }
+
+    #[test]
     fn test_server_config_serialization() {
         let server = ServerConfig {
             id: "test".to_string(),
@@ -575,9 +811,13 @@ mod tests {
             challenge: None,
             download: DownloadPolicy::Enabled,
             resource_type: "file".to_string(),
+            legacy_client_support: false,
+            legacy_client_full_range: false,
             cache_enabled: false,
             cache_subpaths: vec![],
             cache_max_age: default_cache_max_age(),
+            changelog: None,
+            version_provider: None,
         };
 
         let yaml = serde_yaml::to_string(&resource).unwrap();
@@ -596,23 +836,32 @@ mod tests {
         assert_eq!(normalize_path("/file.txt"), "/file.txt");
         assert_eq!(normalize_path("../../../etc/passwd"), "/etc/passwd");
         assert_eq!(normalize_path("dir\\file.txt"), "/dir/file.txt");
-        
+
         // 测试前缀路径组合
-        assert_eq!(combine_prefix_path("/app/v1.0/", "bin/app.exe"), "/app/v1.0/bin/app.exe");
-        assert_eq!(combine_prefix_path("/app/v1.0", "/bin/app.exe"), "/app/v1.0/bin/app.exe");
-        assert_eq!(combine_prefix_path("/app/v1.0/", "../../../etc/passwd"), "/app/v1.0/etc/passwd");
+        assert_eq!(
+            combine_prefix_path("/app/v1.0/", "bin/app.exe"),
+            "/app/v1.0/bin/app.exe"
+        );
+        assert_eq!(
+            combine_prefix_path("/app/v1.0", "/bin/app.exe"),
+            "/app/v1.0/bin/app.exe"
+        );
+        assert_eq!(
+            combine_prefix_path("/app/v1.0/", "../../../etc/passwd"),
+            "/app/v1.0/etc/passwd"
+        );
     }
 
     #[test]
     fn test_get_version_path_with_sub() {
         let mut config = create_test_config();
-        
+
         // 添加前缀资源
         let mut prefix_versions = HashMap::new();
         let mut prefix_version_1_0 = HashMap::new();
         prefix_version_1_0.insert("default".to_string(), "/releases/v1.0/".to_string());
         prefix_versions.insert("1.0".to_string(), prefix_version_1_0);
-        
+
         config.resources.insert(
             "app_suite".to_string(),
             ResourceConfig {
@@ -624,23 +873,28 @@ mod tests {
                 challenge: None,
                 download: DownloadPolicy::Enabled,
                 resource_type: "prefix".to_string(),
+                legacy_client_support: false,
+                legacy_client_full_range: false,
                 cache_enabled: false,
                 cache_subpaths: vec![],
                 cache_max_age: default_cache_max_age(),
+                changelog: None,
+                version_provider: None,
             },
         );
-        
+
         // 测试文件资源（忽略子路径）
         let path = config.get_version_path_with_sub("test_app", "1.0", None, Some("ignored"));
         assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
-        
+
         // 测试前缀资源（需要子路径）
         let path = config.get_version_path_with_sub("app_suite", "1.0", None, None);
         assert!(path.is_none()); // 前缀资源必须提供子路径
-        
-        let path = config.get_version_path_with_sub("app_suite", "1.0", None, Some("windows/app.exe"));
+
+        let path =
+            config.get_version_path_with_sub("app_suite", "1.0", None, Some("windows/app.exe"));
         assert_eq!(path, Some("/releases/v1.0/windows/app.exe".to_string()));
-        
+
         // 测试不存在的资源
         let path = config.get_version_path_with_sub("nonexistent", "1.0", None, Some("file"));
         assert!(path.is_none());

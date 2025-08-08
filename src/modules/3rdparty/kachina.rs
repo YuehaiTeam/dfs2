@@ -179,8 +179,8 @@ pub async fn fetch_file_range(
     // 确定版本
     let target_version = version.unwrap_or(&resource_config.latest);
 
-    // 检查版本是否存在
-    if !resource_config.versions.contains_key(target_version) {
+    // 检查版本是否存在或有default模板
+    if !resource_config.versions.contains_key(target_version) && !resource_config.versions.contains_key("default") {
         return Err(E_VERSION_NOT_FOUND.to_string());
     }
 
@@ -194,18 +194,26 @@ pub async fn fetch_file_range(
 
     // 使用 FlowRunner 获取文件的下载 URL
     let flow_list = &resource_config.flow;
+    // 根据range计算文件大小
+    let request_file_size = if let Some(ref ranges) = ranges {
+        Some(ranges.iter().map(|(start, end)| (end - start + 1) as u64).sum())
+    } else {
+        None // 没有range时不知道文件大小
+    };
+
     let mut params = RunFlowParams {
-        path: path.clone(),
         ranges: ranges.clone(),
         extras: serde_json::json!({}),
         session_id: None,
         client_ip: None, // Kachina解析通常不需要客户端IP信息
-        file_size: None, // 这里也不知道文件大小
+        file_size: request_file_size, // 使用请求的range大小
         plugin_server_mapping: std::collections::HashMap::new(), // 初始化插件服务器映射
         resource_id: resid.to_string(),                         // 新增：资源ID
+        version: target_version.to_string(),                    // 使用确定的版本
         sub_path: None,                                         // Kachina解析时不处理子路径
         selected_server_id: None,                               // 初始化为None，由poolize函数设置
         selected_server_weight: None,                        // 初始化为None，由poolize函数设置
+        cdn_full_range: false, // Kachina解析不使用全范围模式
     };
 
     let cdn_url = match runner.run_flow(flow_list, &mut params).await {

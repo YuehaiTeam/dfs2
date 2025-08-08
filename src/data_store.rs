@@ -50,9 +50,7 @@ pub trait DataStoreBackend: Send + Sync {
     async fn increment_download_count(&self, sid: &str, chunk: &str) -> Result<Option<u32>, String>;
     async fn refresh_session(&self, sid: &str) -> Result<(), String>;
     async fn get_download_counts(&self, sid: &str) -> Result<HashMap<String, u32>, String>;
-    async fn update_session_path(&self, sid: &str, path: &str) -> Result<bool, String>;
     async fn update_session_chunks(&self, sid: &str, chunks: &[String]) -> Result<bool, String>;
-    async fn update_cdn_record(&self, sid: &str, chunk: &str, cdn_url: &str) -> Result<(), String>;
     async fn update_cdn_record_v2(&self, sid: &str, chunk: &str, record: CdnRecord) -> Result<(), String>;
     async fn get_cdn_records(&self, sid: &str, chunk: &str) -> Result<Vec<CdnRecord>, String>;
     async fn get_session_stats(&self, sid: &str) -> Result<Option<SessionStats>, String>;
@@ -68,6 +66,9 @@ pub trait DataStoreBackend: Send + Sync {
     // 新增：健康信息支持
     async fn get_health_info(&self, server_id: &str, path: &str) -> Result<Option<HealthInfo>, String>;
     async fn set_health_info(&self, server_id: &str, path: &str, info: &HealthInfo) -> Result<(), String>;
+    
+    // 新增：会话清理支持
+    async fn scan_expired_sessions(&self, timeout_seconds: u64) -> Result<Vec<(String, String, std::net::IpAddr)>, String>;
     
     // 新增：分离式内容缓存接口
     async fn get_cache_metadata(&self, key: &str) -> Result<Option<CacheMetadata>, String>;
@@ -112,14 +113,28 @@ pub trait DataStoreBackend: Send + Sync {
     async fn delete(&self, key: &str) -> Result<(), String>;
     
     // 流量统计相关方法
-    async fn update_daily_bandwidth(&self, session_id: &str, bytes: u64) -> Result<(), String>;
     async fn update_server_daily_bandwidth(&self, server_id: &str, bytes: u64) -> Result<(), String>;
-    async fn get_daily_bandwidth(&self, session_id: &str) -> Result<u64, String>;
+    async fn update_resource_daily_bandwidth(&self, resource_id: &str, bytes: u64) -> Result<(), String>;
+    async fn update_global_daily_bandwidth(&self, bytes: u64) -> Result<(), String>;
+    async fn get_server_daily_bandwidth(&self, server_id: &str) -> Result<u64, String>;
+    async fn get_resource_daily_bandwidth(&self, resource_id: &str) -> Result<u64, String>;
+    async fn get_global_daily_bandwidth(&self) -> Result<u64, String>;
+    
+    // 批量带宽更新接口
+    async fn update_bandwidth_batch(&self, batch: BandwidthUpdateBatch) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone)]
+pub struct BandwidthUpdateBatch {
+    pub resource_id: String,
+    pub server_id: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug)]
 pub struct SessionStats {
-    pub path: String,
+    pub resource_id: String,
+    pub version: String,
     pub chunks: Vec<String>,
     pub download_counts: HashMap<String, u32>,
     pub cdn_records: HashMap<String, Vec<CdnRecord>>,
@@ -304,15 +319,6 @@ impl DataStoreBackend for FileDataStore {
         Ok(HashMap::new())
     }
 
-    async fn update_session_path(&self, sid: &str, path: &str) -> Result<bool, String> {
-        if let Some(mut session) = self.get_session(sid).await? {
-            session.path = path.to_string();
-            self.store_session(sid, &session).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
 
     async fn update_session_chunks(&self, sid: &str, chunks: &[String]) -> Result<bool, String> {
         if let Some(mut session) = self.get_session(sid).await? {
@@ -324,17 +330,6 @@ impl DataStoreBackend for FileDataStore {
         }
     }
 
-    async fn update_cdn_record(&self, sid: &str, chunk: &str, cdn_url: &str) -> Result<(), String> {
-        // 向后兼容的方法，创建简单的CdnRecord
-        let record = CdnRecord {
-            url: cdn_url.to_string(),
-            server_id: None,
-            skip_penalty: false,
-            timestamp: chrono::Utc::now().timestamp() as u64,
-            weight: 0,
-        };
-        self.update_cdn_record_v2(sid, chunk, record).await
-    }
 
     async fn update_cdn_record_v2(&self, sid: &str, chunk: &str, record: CdnRecord) -> Result<(), String> {
         let key = format!("cdn_records:{}:{}", sid, chunk);
@@ -362,7 +357,8 @@ impl DataStoreBackend for FileDataStore {
             }
             
             Ok(Some(SessionStats {
-                path: session.path,
+                resource_id: session.resource_id,
+                version: session.version,
                 chunks: session.chunks,
                 download_counts,
                 cdn_records,
@@ -512,18 +508,6 @@ impl DataStoreBackend for FileDataStore {
         self.delete_file(&storage_key).await
     }
     
-    async fn update_daily_bandwidth(&self, session_id: &str, bytes: u64) -> Result<(), String> {
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let key = format!("bw_daily:{}:{}", session_id, today);
-        
-        // 读取当前使用量
-        let current_usage: u64 = self.read_json_file(&key).await?.unwrap_or(0);
-        let new_usage = current_usage + bytes;
-        
-        // 写入新的使用量
-        self.write_json_file(&key, &new_usage).await
-    }
-    
     async fn update_server_daily_bandwidth(&self, server_id: &str, bytes: u64) -> Result<(), String> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let key = format!("server_bw_daily:{}:{}", server_id, today);
@@ -536,12 +520,136 @@ impl DataStoreBackend for FileDataStore {
         self.write_json_file(&key, &new_usage).await
     }
     
-    async fn get_daily_bandwidth(&self, session_id: &str) -> Result<u64, String> {
+    async fn update_resource_daily_bandwidth(&self, resource_id: &str, bytes: u64) -> Result<(), String> {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let key = format!("bw_daily:{}:{}", session_id, today);
+        let key = format!("resource_bw_daily:{}:{}", resource_id, today);
+        
+        // 读取当前使用量
+        let current_usage: u64 = self.read_json_file(&key).await?.unwrap_or(0);
+        let new_usage = current_usage + bytes;
+        
+        // 写入新的使用量
+        self.write_json_file(&key, &new_usage).await
+    }
+    
+    async fn update_global_daily_bandwidth(&self, bytes: u64) -> Result<(), String> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let key = format!("global_bw_daily:{}", today);
+        
+        // 读取当前使用量
+        let current_usage: u64 = self.read_json_file(&key).await?.unwrap_or(0);
+        let new_usage = current_usage + bytes;
+        
+        // 写入新的使用量
+        self.write_json_file(&key, &new_usage).await
+    }
+    
+    async fn get_server_daily_bandwidth(&self, server_id: &str) -> Result<u64, String> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let key = format!("server_bw_daily:{}:{}", server_id, today);
         
         // 读取当前使用量，如果不存在返回0
         Ok(self.read_json_file(&key).await?.unwrap_or(0))
+    }
+    
+    async fn get_resource_daily_bandwidth(&self, resource_id: &str) -> Result<u64, String> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let key = format!("resource_bw_daily:{}:{}", resource_id, today);
+        
+        // 读取当前使用量，如果不存在返回0
+        Ok(self.read_json_file(&key).await?.unwrap_or(0))
+    }
+    
+    async fn get_global_daily_bandwidth(&self) -> Result<u64, String> {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let key = format!("global_bw_daily:{}", today);
+        
+        // 读取当前使用量，如果不存在返回0
+        Ok(self.read_json_file(&key).await?.unwrap_or(0))
+    }
+    
+    async fn update_bandwidth_batch(&self, batch: BandwidthUpdateBatch) -> Result<(), String> {
+        // 对于文件存储，由于没有事务支持，我们按顺序更新各项
+        // 使用文件锁来确保一致性
+        self.update_resource_daily_bandwidth(&batch.resource_id, batch.bytes).await?;
+        self.update_server_daily_bandwidth(&batch.server_id, batch.bytes).await?;
+        self.update_global_daily_bandwidth(batch.bytes).await?;
+        Ok(())
+    }
+
+    async fn scan_expired_sessions(&self, timeout_seconds: u64) -> Result<Vec<(String, String, std::net::IpAddr)>, String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        
+        let mut expired_sessions = Vec::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        // 读取会话目录
+        let session_dir = self.base_path.join("session");
+        if !session_dir.exists() {
+            return Ok(expired_sessions);
+        }
+        
+        let mut dir_reader = match fs::read_dir(&session_dir).await {
+            Ok(reader) => reader,
+            Err(_) => return Ok(expired_sessions),
+        };
+        
+        while let Ok(Some(entry)) = dir_reader.next_entry().await {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            
+            // 获取文件名作为会话 ID
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) if name.ends_with(".json") => {
+                    &name[..name.len() - 5] // 移除 .json 后缀
+                }
+                _ => continue,
+            };
+            
+            // 检查文件修改时间
+            if let Ok(metadata) = fs::metadata(&path).await {
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(modified_secs) = modified.duration_since(UNIX_EPOCH) {
+                        let file_age = now - modified_secs.as_secs();
+                        
+                        // 如果文件年龄接近超时时间（在最后60秒内）
+                        if file_age >= timeout_seconds.saturating_sub(60) {
+                            // 尝试读取会话信息
+                            if let Ok(Some(session_info)) = self.get_file_session_info(file_name).await {
+                                expired_sessions.push(session_info);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(expired_sessions)
+    }
+}
+
+impl FileDataStore {
+    /// 从文件中获取会话信息
+    async fn get_file_session_info(&self, session_id: &str) -> Result<Option<(String, String, std::net::IpAddr)>, String> {
+        
+        // 读取会话文件
+        if let Ok(Some(session)) = self.get_session(session_id).await {
+            // 从 extras 中提取 client_ip
+            if let Some(client_ip_value) = session.extras.get("client_ip") {
+                if let Some(client_ip_str) = client_ip_value.as_str() {
+                    if let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() {
+                        return Ok(Some((session_id.to_string(), session.resource_id, client_ip)));
+                    }
+                }
+            }
+        }
+        
+        Ok(None)
     }
 }
 

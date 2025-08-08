@@ -157,6 +157,14 @@ impl JsRunner {
             redis,
         }
     }
+    pub fn get_config(&self) -> Arc<RwLock<AppConfig>> {
+        self.config.clone()
+    }
+    
+    pub async fn execute_async(&self, code: &str) -> anyhow::Result<serde_json::Value> {
+        self.eval(code.to_string()).await
+    }
+    
     pub async fn eval(&self, code: String) -> anyhow::Result<serde_json::Value> {
         let config = self.config.read().await.clone();
         let ret = async_with!(self.context => |ctx| {

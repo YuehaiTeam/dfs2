@@ -163,6 +163,24 @@ impl DfsError {
             reason: reason.into(),
         }
     }
+    
+    /// 创建插件未找到错误
+    pub fn plugin_not_found<S: Into<String>>(plugin_id: S) -> Self {
+        Self::PluginNotFound {
+            plugin_id: plugin_id.into(),
+        }
+    }
+    
+    /// 创建插件错误（别名，兼容性）
+    pub fn plugin_error<S1: Into<String>, S2: Into<String>>(
+        plugin_id: S1,
+        reason: S2,
+    ) -> Self {
+        Self::PluginExecutionFailed {
+            plugin_id: plugin_id.into(),
+            reason: reason.into(),
+        }
+    }
 
     /// 创建内部错误
     pub fn internal_error<S: Into<String>>(reason: S) -> Self {
@@ -313,6 +331,20 @@ impl From<anyhow::Error> for DfsError {
     fn from(err: anyhow::Error) -> Self {
         Self::InternalError {
             reason: err.to_string(),
+        }
+    }
+}
+
+impl From<String> for DfsError {
+    fn from(reason: String) -> Self {
+        Self::InternalError { reason }
+    }
+}
+
+impl From<&str> for DfsError {
+    fn from(reason: &str) -> Self {
+        Self::InternalError {
+            reason: reason.to_string(),
         }
     }
 }

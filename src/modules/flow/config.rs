@@ -169,6 +169,13 @@ impl Serialize for FlowComp {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResourcePattern {
+    Global,           // * - 所有资源
+    Current,          // $ - 当前资源
+    Specific(String), // 具体资源ID
+}
+
 #[derive(Debug, Clone)]
 pub enum FlowCond {
     CnIp(bool),
@@ -176,9 +183,10 @@ pub enum FlowCond {
     Cidr(cidr::IpCidr),
     Extras(String),
     Size(FlowComp, Size),
-    BwDaily(FlowComp, Size),
+    ResourceBwDaily(ResourcePattern, FlowComp, Size), // 资源级别的日流量限制
     ServerBwDaily(String, FlowComp, Size), // 服务器级别的日流量限制，必须指定server_id
     Time(FlowComp, chrono::NaiveTime),
+    GeoIp(String), // geoip关键词匹配
 }
 impl<'de> Deserialize<'de> for FlowCond {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -211,15 +219,36 @@ impl<'de> Deserialize<'de> for FlowCond {
                 let extras = parts[1].to_string();
                 Ok(FlowCond::Extras(extras))
             }
+            "geoip" => {
+                let keyword = parts[1].to_string();
+                Ok(FlowCond::GeoIp(keyword))
+            }
             "size" => {
                 let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
                 let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
                 Ok(FlowCond::Size(comp, size))
             }
             "bw_daily" => {
-                let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
-                let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
-                Ok(FlowCond::BwDaily(comp, size))
+                if parts.len() == 3 {
+                    // 旧格式：bw_daily <comp> <size> - 视为当前资源
+                    let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
+                    let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
+                    Ok(FlowCond::ResourceBwDaily(ResourcePattern::Current, comp, size))
+                } else if parts.len() == 4 {
+                    // 新格式：bw_daily <resource> <comp> <size>
+                    let resource_pattern = match parts[1] {
+                        "*" => ResourcePattern::Global,
+                        "$" => ResourcePattern::Current,
+                        resource_id => ResourcePattern::Specific(resource_id.to_string()),
+                    };
+                    let comp = FlowComp::from_str(parts[2]).map_err(serde::de::Error::custom)?;
+                    let size = Size::from_str(parts[3]).map_err(serde::de::Error::custom)?;
+                    Ok(FlowCond::ResourceBwDaily(resource_pattern, comp, size))
+                } else {
+                    return Err(serde::de::Error::custom(
+                        "bw_daily requires format: bw_daily [resource] {comp} {size}"
+                    ));
+                }
             }
             "server_bw_daily" => {
                 if parts.len() != 4 {
@@ -313,6 +342,10 @@ mod tests {
         let cond: FlowCond = serde_yaml::from_str("extras debug").unwrap();
         assert!(matches!(cond, FlowCond::Extras(ref key) if key == "debug"));
 
+        // 测试GeoIp条件
+        let cond: FlowCond = serde_yaml::from_str("geoip china").unwrap();
+        assert!(matches!(cond, FlowCond::GeoIp(ref keyword) if keyword == "china"));
+
         // 测试Size条件
         let cond: FlowCond = serde_yaml::from_str("size > 10MB").unwrap();
         assert!(matches!(cond, FlowCond::Size(FlowComp::Gt, _)));
@@ -335,6 +368,10 @@ mod tests {
         let cond = FlowCond::Extras("debug".to_string());
         let yaml = serde_yaml::to_string(&cond).unwrap();
         assert!(yaml.contains("extras debug"));
+
+        let cond = FlowCond::GeoIp("china".to_string());
+        let yaml = serde_yaml::to_string(&cond).unwrap();
+        assert!(yaml.contains("geoip china"));
     }
 
     #[test]
@@ -359,11 +396,17 @@ impl Serialize for FlowCond {
             }
             FlowCond::Cidr(cidr) => serializer.serialize_str(&format!("cidr {}", cidr)),
             FlowCond::Extras(extras) => serializer.serialize_str(&format!("extras {}", extras)),
+            FlowCond::GeoIp(keyword) => serializer.serialize_str(&format!("geoip {}", keyword)),
             FlowCond::Size(comp, size) => {
                 serializer.serialize_str(&format!("size {} {}", comp, size))
             }
-            FlowCond::BwDaily(comp, size) => {
-                serializer.serialize_str(&format!("bw_daily {} {}", comp, size))
+            FlowCond::ResourceBwDaily(pattern, comp, size) => {
+                let pattern_str = match pattern {
+                    ResourcePattern::Global => "*",
+                    ResourcePattern::Current => "$",
+                    ResourcePattern::Specific(resource_id) => resource_id,
+                };
+                serializer.serialize_str(&format!("bw_daily {} {} {}", pattern_str, comp, size))
             }
             FlowCond::ServerBwDaily(server_id, comp, size) => {
                 serializer.serialize_str(&format!("server_bw_daily {} {} {}", server_id, comp, size))

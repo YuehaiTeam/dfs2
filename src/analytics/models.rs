@@ -53,7 +53,6 @@ pub struct SessionLog {
     pub session_id: Option<String>,
     pub resource_id: String,
     pub version: String,
-    pub file_path: String,
     pub client_ip: String,
     pub user_agent: Option<String>,
     pub geo_info: GeoInfo,
@@ -66,7 +65,7 @@ pub struct SessionLog {
 
 impl GeoInfo {
     pub fn from_ip(ip: IpAddr) -> Self {
-        // 基础实现，后续会集成 GeoLite2
+        // 使用IPIP数据库进行地理位置信息解析
         let is_global_ip = crate::modules::geolocation::is_global_ip(ip);
         let is_china_ip = !is_global_ip; // 非全球IP视为中国IP
         let ip_version = match ip {

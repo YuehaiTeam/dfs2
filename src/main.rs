@@ -6,6 +6,7 @@ mod config;
 mod data_store;
 mod docs;
 mod error;
+mod legacy_client;
 mod metrics;
 mod models;
 mod modules;
@@ -25,7 +26,7 @@ use error::{DfsError, DfsResult};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validation::ConfigValidator;
 
@@ -139,7 +140,7 @@ async fn main() -> DfsResult<()> {
     info!("Flow runner initialized");
 
     // 初始化Prometheus指标
-    let metrics = match Metrics::new() {
+    let metrics = match Metrics::new(config.clone()) {
         Ok(metrics) => {
             info!("Prometheus metrics initialized");
             Arc::new(metrics)
@@ -157,29 +158,58 @@ async fn main() -> DfsResult<()> {
         metrics.set_server_health(config_read.servers.len() as u64, config_read.servers.len() as u64);
     }
 
+    // 初始化版本提供者系统
+    let version_cache = Arc::new(modules::version_provider::VersionCache::new(data_store.clone()));
+    let plugin_provider = Arc::new(modules::version_provider::PluginVersionProvider::new(
+        jsrunner.clone(),
+        config.clone(),
+    ));
+    let version_updater = Arc::new(modules::version_provider::VersionUpdater::new(
+        config.clone(),
+        version_cache.clone(),
+        plugin_provider.clone(),
+    ));
+    
+    // 初始化版本缓存
+    {
+        let config_guard = config.read().await;
+        match modules::version_provider::updater::initialize_version_system(
+            &config_guard, 
+            version_cache.clone(),
+            plugin_provider.clone()
+        ).await {
+            Ok(init_count) => {
+                info!("Version provider system initialized for {} resources", init_count);
+            }
+            Err(e) => {
+                warn!("Failed to initialize version provider system: {}", e);
+            }
+        }
+    }
+    
+    // 启动版本更新后台任务
+    version_updater.clone().start_background_task().await;
+    info!("Version updater background task started");
+    
     // 启动会话清理任务
     let cleanup_task = Arc::new(analytics::SessionCleanupTask::new(config.clone(), data_store.clone()));
     cleanup_task.clone().start_background_task().await;
     info!("Session cleanup task started");
 
     // 构建路由
-    let metrics_route = Router::new()
-        .route("/metrics", get(metrics::metrics_handler))
-        .with_state(metrics.clone());
-
     let app = Router::new()
         .merge(routes::resource::routes())
-        .merge(routes::status::routes())
-        .merge(routes::health::routes())
         .merge(routes::static_files::routes())
+        .merge(routes::mgmt::routes())
         .merge(create_docs_router())
-        .merge(metrics_route)
         .layer(middleware::from_fn(real_ip_middleware))
         .layer(axum::Extension(data_store))
         .layer(axum::Extension(jsrunner))
         .layer(axum::Extension(flowrunner))
         .layer(axum::Extension(config))
-        .layer(axum::Extension(metrics));
+        .layer(axum::Extension(metrics))
+        .layer(axum::Extension(version_cache))
+        .layer(axum::Extension(version_updater));
 
     // 获取绑定地址
     let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_string());

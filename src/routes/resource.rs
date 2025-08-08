@@ -5,32 +5,98 @@ use axum::{
     response::{IntoResponse, Redirect},
     routing::get,
 };
-use base64::{Engine as _, engine::general_purpose};
+use rand::RngCore;
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
+use crate::cache::{download_and_cache, should_cache_content};
 use crate::challenge::{ChallengeType, generate_challenge};
 use crate::config::{AppConfig, DownloadPolicy};
-use crate::error::{DfsError, DfsResult};
-use crate::models::{CreateSessionRequest, DeleteSessionRequest, Session};
-use crate::responses::{ApiResponse, ResponseData, MetadataResponse, SessionCreatedResponse, ChallengeResponse, CdnUrlResponse, DownloadUrlResponse, EmptyResponse, ErrorResponse};
-use crate::cache::{should_cache_content, download_and_cache};
+use crate::data_store::BandwidthUpdateBatch;
 use crate::data_store::CacheMetadata;
+use crate::error::{DfsError, DfsResult};
+use crate::legacy_client::LegacyClientHandler;
+use crate::models::{CreateSessionRequest, DeleteSessionRequest, Session};
+use crate::responses::{
+    ApiResponse, CdnUrlResponse, ChallengeResponse, DownloadUrlResponse, EmptyResponse,
+    ErrorResponse, MetadataResponse, ResponseData, SessionCreatedResponse,
+};
 use crate::{
-    app_state::{MAX_CHUNK_DOWNLOADS, DataStore},
+    RealConnectInfo,
+    app_state::{DataStore, MAX_CHUNK_DOWNLOADS},
+    metrics::Metrics,
     modules::flow::runner::{FlowRunner, RunFlowParams},
     modules::thirdparty::kachina,
-    metrics::Metrics,
-    RealConnectInfo,
 };
+
+// 查询参数结构体
+#[derive(Deserialize, Debug)]
+struct MetadataQuery {
+    /// 是否返回 kachina metadata (有参数 = 是, 未设置 = 否)
+    with_metadata: Option<String>,
+}
 
 // 错误码常量定义
 const E_RESOURCE_NOT_FOUND: &str = "E_RESOURCE_NOT_FOUND";
 const E_VERSION_NOT_FOUND: &str = "E_VERSION_NOT_FOUND";
+
+// 解析range字符串为flowrunner的ranges格式
+// "0-" 或整个文件 -> None
+// "1024-2047" 等具体范围 -> Some(vec![(start, end)])
+fn parse_range_for_flow(range_str: &str) -> Option<Vec<(u32, u32)>> {
+    let parts: Vec<&str> = range_str.split('-').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let start = parts[0].parse::<u32>().ok()?;
+
+    // 如果是 "0-" 格式（从开头到结尾），返回 None 表示整个文件
+    if parts[1].is_empty() && start == 0 {
+        return None;
+    }
+
+    let end = if parts[1].is_empty() {
+        // 其他 "X-" 格式，表示从X到文件末尾
+        u32::MAX
+    } else {
+        parts[1].parse::<u32>().ok()?
+    };
+
+    Some(vec![(start, end)])
+}
+
+// 计算range覆盖的实际字节数
+fn calculate_actual_bytes_from_range(range_str: Option<&str>, full_file_size: u64) -> u64 {
+    if let Some(range_str) = range_str {
+        if let Some(ranges) = parse_range_for_flow(range_str) {
+            // 有具体range，计算range覆盖的字节数
+            ranges
+                .iter()
+                .map(|(start, end)| {
+                    let end_byte = if *end == u32::MAX {
+                        // "X-" 格式，从start到文件结尾
+                        full_file_size.saturating_sub(*start as u64)
+                    } else {
+                        // "X-Y" 格式，计算范围大小
+                        (*end as u64).saturating_sub(*start as u64) + 1
+                    };
+                    end_byte
+                })
+                .sum()
+        } else {
+            // parse_range_for_flow返回None表示整个文件("0-")
+            full_file_size
+        }
+    } else {
+        // 没有range参数，整个文件
+        full_file_size
+    }
+}
 
 // 宏用于记录请求指标
 macro_rules! record_request_metrics {
@@ -52,6 +118,13 @@ macro_rules! record_flow_metrics {
 
 const E_PATH_NOT_FOUND: &str = "E_PATH_NOT_FOUND";
 
+// 生成32位 hex 格式的 session ID
+fn generate_hex_session_id() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 // 下载响应类型
 #[derive(Debug)]
 enum DownloadResponse {
@@ -64,64 +137,13 @@ enum DownloadResponse {
 
 // 生成会话尝试服务器列表
 async fn generate_session_tries(
-    config: &AppConfig,
-    resid: &str,
-    file_path: &str,  // 新增：完整文件路径用于健康检查
-    redis: &DataStore,
+    _config: &AppConfig,
+    _resid: &str,
+    _file_path: &str,
+    _redis: &DataStore,
 ) -> DfsResult<Vec<String>> {
-    let resource_config = config.get_resource(resid).ok_or_else(|| {
-        warn!("Resource {} not found when generating tries", resid);
-        DfsError::resource_not_found(resid)
-    })?;
-
-    // 使用传入的完整文件路径进行健康检查（支持前缀资源）
-    let path = file_path;
-
-    // 如果资源配置中定义了tries列表，验证健康状态并使用
-    let server_candidates = if !resource_config.tries.is_empty() {
-        &resource_config.tries
-    } else {
-        // 否则，使用server列表作为候选服务器
-        &resource_config.server
-    };
-
-    let mut healthy_servers = Vec::new();
-    let mut unhealthy_servers = Vec::new();
-
-    for server_id in server_candidates {
-        // 检查服务器是否在全局配置中存在
-        if let Some(server_impl) = config.get_server(server_id) {
-            // 进行健康检查
-            let is_healthy = server_impl.is_alive(server_id, &path, Some(redis)).await;
-
-            if is_healthy {
-                healthy_servers.push(server_id.clone());
-            } else {
-                unhealthy_servers.push(server_id.clone());
-                warn!("Server {} is unhealthy for path {}", server_id, path);
-            }
-        } else {
-            warn!(
-                "Server {} referenced in resource {} but not found in global config",
-                server_id, resid
-            );
-        }
-    }
-
-    // 优先返回健康的服务器，不健康的服务器放在后面作为备选
-    let mut tries = healthy_servers;
-    tries.extend(unhealthy_servers);
-
-    // 如果没有可用的服务器，返回错误
-    if tries.is_empty() {
-        error!("No valid servers found for resource {}", resid);
-        return Err(DfsError::server_unavailable(
-            "no_servers_available".to_string(),
-        ));
-    }
-
-    info!("Generated tries list for resource {}: {:?}", resid, tries);
-    Ok(tries)
+    // 此函数已废弃，始终返回空数组
+    Ok(Vec::new())
 }
 
 #[utoipa::path(
@@ -142,50 +164,78 @@ async fn generate_session_tries(
 #[allow(unused_variables)]
 async fn get_metadata(
     Path(resid): Path<String>,
+    Query(query): Query<MetadataQuery>,
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(runner): Extension<FlowRunner>,
     Extension(redis): Extension<DataStore>,
     Extension(metrics): Extension<Arc<Metrics>>,
+    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
 ) -> impl IntoResponse {
     let start_time = std::time::Instant::now();
-    
-    // 获取资源配置和文件路径用于缓存key
-    let cache_key = {
-        let config_guard = config.read().await;
 
-        // 检查资源是否存在
-        let resource_config = match config_guard.get_resource(&resid) {
-            Some(rc) => rc,
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(ApiResponse::error(E_RESOURCE_NOT_FOUND.to_string())),
-                );
-            }
-        };
+    // 检查是否请求 kachina metadata（有参数就是 true，无参数就是 false）
+    let with_metadata = query.with_metadata.is_some();
 
-        // 获取版本对应的默认路径
-        let version = &resource_config.latest;
-        let path = match config_guard.get_version_path(&resid, version, None) {
-            Some(p) => p,
-            None => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiResponse::error(E_PATH_NOT_FOUND.to_string())),
-                );
-            }
-        };
+    // 获取changelog（优先级：版本提供者 > 静态配置）
+    let changelog = get_resource_changelog(&config, &version_cache, &resid).await;
 
-        if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
-            if !prefix.is_empty() {
-                format!("{}:kachina_meta:{}", prefix, path)
-            } else {
-                format!("kachina_meta:{}", path)
-            }
+    // 获取基本资源信息
+    let config_guard = config.read().await;
+
+    // 检查资源是否存在
+    let resource_config = match config_guard.get_resource(&resid) {
+        Some(rc) => rc,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error(E_RESOURCE_NOT_FOUND.to_string())),
+            );
+        }
+    };
+
+    // 获取有效版本（考虑动态版本提供者）
+    let effective_version = config_guard
+        .get_effective_version_with_cache(&resid, Some(&version_cache))
+        .await;
+
+    // 如果不需要 kachina metadata，直接返回基本信息
+    if !with_metadata {
+        // 记录成功的请求指标
+        record_request_metrics!(metrics, start_time);
+
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success(ResponseData::Metadata {
+                resource_version: effective_version,
+                name: resid.clone(),
+                changelog: changelog.clone(),
+                data: json!(null), // 不返回 kachina metadata
+            })),
+        );
+    }
+
+    // 以下是 kachina metadata 处理逻辑
+    let path = match config_guard.get_version_path(&resid, &effective_version, None) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(E_PATH_NOT_FOUND.to_string())),
+            );
+        }
+    };
+
+    let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
+        if !prefix.is_empty() {
+            format!("{}:kachina_meta:{}", prefix, path)
         } else {
             format!("kachina_meta:{}", path)
         }
+    } else {
+        format!("kachina_meta:{}", path)
     };
+
+    drop(config_guard); // 释放配置锁
 
     // 先检查缓存
     if let Ok(Some(cached_data)) = redis.get_cached_metadata(&cache_key).await {
@@ -193,8 +243,9 @@ async fn get_metadata(
             return (
                 StatusCode::OK,
                 Json(ApiResponse::success(ResponseData::Metadata {
-                    dfs_version: "1.0.0".to_string(),
-                    name: format!("resource-{}", resid),
+                    resource_version: effective_version.clone(),
+                    name: resid.clone(),
+                    changelog: changelog.clone(),
                     data: cached_json,
                 })),
             );
@@ -202,7 +253,7 @@ async fn get_metadata(
     }
 
     // 使用 kachina 模块解析 KachinaInstaller 文件
-    match kachina::parse_kachina_metadata(&config, &runner, &resid, None).await {
+    match kachina::parse_kachina_metadata(&config, &runner, &resid, Some(&effective_version)).await {
         Ok(Some(metadata)) => {
             // 返回解析后的数据
             let response_data = json!({
@@ -223,12 +274,13 @@ async fn get_metadata(
 
             // 记录成功的请求指标
             record_request_metrics!(metrics, start_time);
-            
+
             (
                 StatusCode::OK,
                 Json(ApiResponse::success(ResponseData::Metadata {
-                    dfs_version: "1.0.0".to_string(),
-                    name: format!("resource-{}", resid),
+                    resource_version: effective_version.clone(),
+                    name: resid.clone(),
+                    changelog: changelog.clone(),
                     data: response_data,
                 })),
             )
@@ -249,12 +301,13 @@ async fn get_metadata(
 
             // 记录成功的请求指标
             record_request_metrics!(metrics, start_time);
-            
+
             (
                 StatusCode::OK,
                 Json(ApiResponse::success(ResponseData::Metadata {
-                    dfs_version: "1.0.0".to_string(),
-                    name: format!("resource-{}", resid),
+                    resource_version: effective_version.clone(),
+                    name: resid.clone(),
+                    changelog: changelog.clone(),
                     data: null_data,
                 })),
             )
@@ -268,10 +321,10 @@ async fn get_metadata(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            
+
             // 记录错误的请求指标
             record_request_metrics!(metrics, start_time);
-            
+
             (status_code, Json(ApiResponse::error(error_msg)))
         }
     }
@@ -302,6 +355,7 @@ async fn create_session(
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
     Extension(metrics): Extension<Arc<Metrics>>,
+    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
     Json(mut req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // 读锁访问配置
@@ -320,13 +374,18 @@ async fn create_session(
 
     // 使用配置文件中的版本路径
     let version = if req.version.is_empty() || req.version == "latest" {
-        resource_config.latest.as_str()
+        // 获取有效版本（考虑动态版本提供者）
+        config_guard
+            .get_effective_version_with_cache(&resid, Some(&version_cache))
+            .await
     } else {
-        req.version.as_str()
+        req.version.clone()
     };
 
-    // 检查版本是否存在
-    if !resource_config.versions.contains_key(version) {
+    // 检查版本是否存在或有default模板
+    if !resource_config.versions.contains_key(&version)
+        && !resource_config.versions.contains_key("default")
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error(format!("版本 {} 不存在", version))),
@@ -334,7 +393,7 @@ async fn create_session(
     }
 
     // 获取版本对应的默认路径
-    let path = match config_guard.get_version_path(&resid, version, None) {
+    let path = match config_guard.get_version_path(&resid, &version, None) {
         Some(p) => p,
         None => {
             return (
@@ -345,18 +404,18 @@ async fn create_session(
     };
 
     if req.sid.is_empty() {
-        req.sid = Uuid::new_v4().to_string();
+        req.sid = generate_hex_session_id();
     }
 
     if req.challenge.is_empty() {
         // Get challenge configuration from config file (resource-specific or global)
         let config_guard = config.read().await;
         let challenge_config = config_guard.get_challenge_config(&resid);
-        
+
         // Generate challenge based on configuration
         let base_data = format!("data/{}/{}", resid, req.sid);
         let challenge_type = challenge_config.get_effective_type();
-        
+
         // Create actual challenge config for generation
         let generation_config = crate::challenge::ChallengeConfig {
             challenge_type,
@@ -366,7 +425,7 @@ async fn create_session(
                 2 // MD5 always uses 2, Web doesn't use this field
             },
         };
-        
+
         let challenge = generate_challenge(&generation_config, &base_data);
 
         // Handle Web challenges differently using the plugin system
@@ -680,9 +739,11 @@ async fn create_session(
     }
 
     let session = Session {
-        path,
+        resource_id: resid.clone(),
+        version: version.clone(),
         chunks: req.chunks.clone(),
         cdn_records: HashMap::new(),
+        extras: req.extras.clone(),
     };
 
     if let Err(e) = redis.store_session(&req.sid, &session).await {
@@ -694,19 +755,7 @@ async fn create_session(
     }
 
     // 获取测试服务器列表（使用会话的路径）
-    let tries = match generate_session_tries(&config_guard, &resid, &session.path, &redis).await {
-        Ok(tries) => tries,
-        Err(e) => {
-            error!("Failed to generate session tries: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(format!(
-                    "Failed to generate server list: {}",
-                    e
-                ))),
-            );
-        }
-    };
+    let tries = vec![];
 
     // 记录会话创建指标
     metrics.record_session_created();
@@ -752,10 +801,10 @@ async fn get_cdn(
 ) -> impl IntoResponse {
     // 记录请求开始时间
     let start_time = std::time::Instant::now();
-    
+
     // 提取客户端IP地址
-    let client_ip =
-        crate::modules::geolocation::extract_client_ip(&headers).or_else(|| Some(real_connect_info.remote_addr.ip()));
+    let client_ip = crate::modules::geolocation::extract_client_ip(&headers)
+        .or_else(|| Some(real_connect_info.remote_addr.ip()));
 
     let session = match redis.get_session(&sessionid).await {
         Ok(Some(s)) => s,
@@ -875,17 +924,18 @@ async fn get_cdn(
                 };
 
                 let mut params = RunFlowParams {
-                    path: session.path.clone(),
                     ranges,
-                    extras: serde_json::json!({}),
+                    extras: session.extras.clone(),
                     session_id: Some(sessionid.clone()),
-                    client_ip, // 传递客户端IP信息用于流规则判断
-                    file_size, // 根据ranges计算出的文件大小
+                    client_ip,                             // 传递客户端IP信息用于流规则判断
+                    file_size,                             // 根据ranges计算出的文件大小
                     plugin_server_mapping: HashMap::new(), // 初始化插件服务器映射
-                    resource_id: resid.clone(),            // 新增：资源ID
-                    sub_path: None,                        // 对于普通文件资源，子路径为None
-                    selected_server_id: None,              // 初始化为None，由poolize函数设置
-                    selected_server_weight: None,          // 初始化为None，由poolize函数设置
+                    resource_id: resid.clone(),
+                    version: session.version.clone(),
+                    sub_path: None,               // 对于普通文件资源，子路径为None
+                    selected_server_id: None,     // 初始化为None，由poolize函数设置
+                    selected_server_weight: None, // 初始化为None，由poolize函数设置
+                    cdn_full_range: false,        // get_cdn接口不使用全范围模式
                 };
                 let flow_res = runner.run_flow(flow_list, &mut params).await;
                 let cdn_url = match flow_res {
@@ -902,7 +952,7 @@ async fn get_cdn(
                 // 记录成功的请求和流程执行指标
                 record_request_metrics!(metrics, start_time);
                 record_flow_metrics!(metrics, true);
-                
+
                 return (
                     StatusCode::OK,
                     Json(ApiResponse::success(ResponseData::Cdn { url: cdn_url })),
@@ -968,11 +1018,20 @@ async fn delete_session(
         Ok(Some(stats)) => {
             // 如果有客户端IP，记录结构化日志
             if let Some(ip) = client_ip {
-                let session_logger = crate::analytics::SessionLogger::new(config.clone(), redis.clone());
-                let insights = req_body.as_ref().and_then(|Json(req)| req.insights.as_ref());
-                let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-                
-                if let Err(e) = session_logger.log_session_completed(&sessionid, &resid, ip, user_agent, insights.cloned()).await {
+                let session_logger =
+                    crate::analytics::SessionLogger::new(config.clone(), redis.clone());
+                let insights = req_body
+                    .as_ref()
+                    .and_then(|Json(req)| req.insights.as_ref());
+                let user_agent = headers
+                    .get("user-agent")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+
+                if let Err(e) = session_logger
+                    .log_session_completed(&sessionid, &resid, ip, user_agent, insights.cloned())
+                    .await
+                {
                     error!("Failed to log session completion: {}", e);
                 }
             }
@@ -984,7 +1043,8 @@ async fn delete_session(
                     json!({
                         "session_id": sessionid,
                         "resource_id": resid,
-                        "path": stats.path,
+                        "resource_id": &stats.resource_id,
+                        "version": &stats.version,
                         "chunks": stats.chunks,
                         "download_counts": stats.download_counts,
                         "cdn_records": stats.cdn_records,  // 包含了CDN调度记录
@@ -997,7 +1057,8 @@ async fn delete_session(
                     json!({
                         "session_id": sessionid,
                         "resource_id": resid,
-                        "path": stats.path,
+                        "resource_id": &stats.resource_id,
+                        "version": &stats.version,
                         "chunks": stats.chunks,
                         "download_counts": stats.download_counts,
                         "cdn_records": stats.cdn_records,
@@ -1008,7 +1069,6 @@ async fn delete_session(
                 json!({
                     "session_id": sessionid,
                     "resource_id": resid,
-                    "path": stats.path,
                     "chunks": stats.chunks,
                     "download_counts": stats.download_counts,
                     "cdn_records": stats.cdn_records,
@@ -1056,23 +1116,27 @@ async fn delete_session(
 async fn handle_download_request(
     resid: String,
     session_id: Option<String>,
+    range: Option<String>,
     config: Arc<RwLock<AppConfig>>,
     redis: DataStore,
     runner: FlowRunner,
     client_ip: Option<std::net::IpAddr>,
     user_agent: Option<String>,
+    metrics: Arc<Metrics>,
+    version_cache: Arc<crate::modules::version_provider::VersionCache>,
 ) -> DfsResult<DownloadResponse> {
     let config_guard = config.read().await;
-    
+
     // 检查资源是否存在
-    let resource_config = config_guard.get_resource(&resid)
+    let resource_config = config_guard
+        .get_resource(&resid)
         .ok_or_else(|| DfsError::resource_not_found(&resid))?;
-    
+
     // 保存原始 session_id 用于后续销毁
     let original_session_id = session_id.clone();
-    
-    // 检查下载策略
-    match &resource_config.download {
+
+    // 提取 extras 信息用于 Flow 规则
+    let extras = match &resource_config.download {
         DownloadPolicy::Disabled => {
             return Err(DfsError::download_not_allowed(
                 &resid,
@@ -1080,40 +1144,114 @@ async fn handle_download_request(
             ));
         }
         DownloadPolicy::Free => {
-            // 无需 session 验证，直接生成下载链接
+            // 无需 session 验证，使用空 extras
+            serde_json::json!({})
         }
         DownloadPolicy::Enabled => {
             // 需要验证 session
             let session_id = session_id.as_ref().ok_or_else(|| {
                 DfsError::download_not_allowed(&resid, "session parameter is required")
             })?;
-            
+
             // 获取 session
-            let session = redis.get_session(session_id).await.map_err(|e| {
-                DfsError::redis_error("get_session", e.to_string())
+            let session = redis
+                .get_session(session_id)
+                .await
+                .map_err(|e| DfsError::redis_error("get_session", e.to_string()))?;
+
+            let session = session.ok_or_else(|| DfsError::SessionNotFound {
+                session_id: session_id.clone(),
             })?;
-            
-            let session = session.ok_or_else(|| {
-                DfsError::SessionNotFound { session_id: session_id.clone() }
-            })?;
-            
-            // 验证 chunks 包含 "0-"
-            let has_zero_range = session.chunks.iter().any(|chunk| chunk.starts_with("0-"));
-            if !has_zero_range {
-                return Err(DfsError::download_not_allowed(
-                    &resid,
-                    "chunks must contain '0-' range for download",
-                ));
+
+            // 验证 chunks：比较请求的 range 与 session chunks 是否一致
+            if let Some(requested_range) = &range {
+                // 请求带有 range 参数，检查 session 是否包含对应的 range
+                if !session.chunks.contains(requested_range) {
+                    return Err(DfsError::download_not_allowed(
+                        &resid,
+                        &format!("session does not allow range '{}'", requested_range),
+                    ));
+                }
+            } else {
+                // 请求没有 range 参数，检查 session 是否包含 "0-"
+                let has_zero_range = session.chunks.iter().any(|chunk| chunk.starts_with("0-"));
+                if !has_zero_range {
+                    return Err(DfsError::download_not_allowed(
+                        &resid,
+                        "chunks must contain '0-' range for download",
+                    ));
+                }
             }
+
+            // 返回 session 的 extras
+            session.extras.clone()
+        }
+    };
+
+    // 获取版本对应的默认路径
+    let version = config_guard
+        .get_effective_version_with_cache(&resid, Some(&version_cache))
+        .await;
+    let path = config_guard
+        .get_version_path(&resid, &version, None)
+        .ok_or_else(|| DfsError::path_not_found(&resid, &version))?;
+
+    // 检查资源是否启用缓存，如果是，先检查缓存
+    if resource_config.cache_enabled {
+        // 先进行简单的缓存检查（不需要server_id）
+        if let Ok(Some((metadata, content))) =
+            redis.get_full_cached_content(&resid, &version, &path).await
+        {
+            // 缓存命中！记录缓存命中日志
+            if matches!(resource_config.download, DownloadPolicy::Free) {
+                if let Some(ip) = client_ip {
+                    let session_logger =
+                        crate::analytics::SessionLogger::new(config.clone(), redis.clone());
+                    if let Err(e) = session_logger
+                        .log_cached_download(
+                            &resid,
+                            &version,
+                            ip,
+                            user_agent.clone(),
+                            metadata.content_length,
+                            metadata.max_age,
+                            &metadata.etag,
+                        )
+                        .await
+                    {
+                        error!("Failed to log cached download: {}", e);
+                    }
+                }
+            }
+
+            // 缓存命中时更新流量统计 - 使用"cache"作为server_id
+            let file_size = metadata.content_length;
+            let server_id = "cache";
+
+            if let Err(e) = redis
+                .update_bandwidth_batch(BandwidthUpdateBatch {
+                    resource_id: resid.clone(),
+                    server_id: server_id.to_string(),
+                    bytes: file_size,
+                })
+                .await
+            {
+                warn!("Failed to update bandwidth for cached download: {}", e);
+            }
+
+            // 记录缓存命中的调度请求 - 没有实际调度到服务器
+            metrics.record_scheduled_request(&resid, server_id, true);
+
+            debug!(
+                "Cache hit: file_size={}, resource_id={}, server_id={}",
+                file_size, resid, server_id
+            );
+
+            return Ok(DownloadResponse::Cached { content, metadata });
         }
     }
-    
-    // 获取版本对应的默认路径
-    let version = &resource_config.latest;
-    let path = config_guard
-        .get_version_path(&resid, version, None)
-        .ok_or_else(|| DfsError::path_not_found(&resid, version))?;
-    
+
+    // 缓存未命中，需要进行实际的服务器调度
     // 尝试从任一服务器获取文件大小（用于Size条件评估）
     let file_size = {
         let mut size_candidate = None;
@@ -1127,141 +1265,166 @@ async fn handle_download_request(
         }
         size_candidate
     };
-    
-    // 使用流系统生成下载 URL（完整文件下载）
+
+    // 解析range参数（保持原有逻辑，让flow规则正常工作）
+    let parsed_ranges = range.as_ref().and_then(|r| parse_range_for_flow(r));
+
+    // 根据range请求计算实际请求的文件大小
+    let request_file_size = if let Some(ref ranges) = parsed_ranges {
+        // 如果有range请求，计算range的总大小
+        Some(
+            ranges
+                .iter()
+                .map(|(start, end)| (end - start + 1) as u64)
+                .sum(),
+        )
+    } else {
+        // 如果没有range请求，使用完整文件大小
+        file_size
+    };
+
+    // 使用流系统生成下载 URL
     let mut params = RunFlowParams {
-        path,
-        ranges: None, // 完整文件下载
-        extras: serde_json::json!({}),
+        ranges: parsed_ranges,
+        extras,
         session_id: original_session_id.clone(),
         client_ip,
-        file_size, // 从健康检查获取的文件大小，用于Size条件评估
+        file_size: request_file_size, // 使用请求的实际大小，用于Size条件评估
         plugin_server_mapping: HashMap::new(), // 初始化插件服务器映射
-        resource_id: resid.clone(),            // 新增：资源ID
-        sub_path: None,                        // 下载时暂不支持子路径参数
-        selected_server_id: None,              // 初始化为None，由poolize函数设置
-        selected_server_weight: None,          // 初始化为None，由poolize函数设置
+        resource_id: resid.clone(),   // 新增：资源ID
+        version: version.clone(),     // 使用获取到的版本
+        sub_path: None,               // 下载时暂不支持子路径参数
+        selected_server_id: None,     // 初始化为None，由poolize函数设置
+        selected_server_weight: None, // 初始化为None，由poolize函数设置
+        cdn_full_range: resource_config.legacy_client_full_range
+            && resource_config.legacy_client_support, // 历史客户端全范围模式
     };
-    
+
     let flow_list = &resource_config.flow;
     let cdn_url = runner.run_flow(flow_list, &mut params).await.map_err(|e| {
         error!("Failed to run flow for download: {}", e);
         DfsError::internal_error(format!("Failed to generate download URL: {}", e))
     })?;
-    
+
     // 检查是否应该缓存
-    if let Some((file_size, max_age)) = should_cache_content(
-        &config_guard, &redis, &resid, None, // sub_path为None，这是普通文件下载
-        params.selected_server_id.as_deref().unwrap_or("unknown"), 
-        &params.path
-    ).await {
-        if file_size < 100 * 1024 { // 100KB限制
-            // 检查缓存
-            if let Ok(Some((metadata, content))) = redis.get_full_cached_content(
-                &resid, &version, &params.path
-            ).await {
-                // 记录缓存命中日志
-                if matches!(resource_config.download, DownloadPolicy::Free) {
-                    if let Some(ip) = client_ip {
-                        let session_logger = crate::analytics::SessionLogger::new(config.clone(), redis.clone());
-                        if let Err(e) = session_logger.log_cached_download(
-                            &resid,
-                            &version,
-                            &params.path,
-                            ip,
-                            user_agent.clone(),
-                            metadata.content_length,
-                            metadata.max_age,
-                            &metadata.etag,
-                        ).await {
-                            error!("Failed to log cached download: {}", e);
-                        }
-                    }
-                }
-                
-                // 缓存命中时更新流量统计
-                let file_size = metadata.content_length;
-                if let Some(ref session_id) = original_session_id {
-                    if let Err(e) = redis.update_daily_bandwidth(session_id, file_size).await {
-                        warn!("Failed to update daily bandwidth for cached download session {}: {}", session_id, e);
-                    }
-                }
-                
-                // 注意：缓存下载没有特定的server_id，我们不更新server级别的流量统计
-                debug!("Updated bandwidth stats for cached download: file_size={}, session_id={:?}", 
-                       file_size, original_session_id);
-                
-                return Ok(DownloadResponse::Cached { content, metadata });
-            }
-            
+    let cached_result = if let Some((file_size, max_age)) = should_cache_content(
+        &config_guard,
+        &redis,
+        &resid,
+        None, // sub_path为None，这是普通文件下载
+        params.selected_server_id.as_deref().unwrap_or("unknown"),
+        &path,
+    )
+    .await
+    {
+        if file_size < 100 * 1024 {
+            // 100KB限制
             // 下载并缓存
-            if let Ok((metadata, content)) = download_and_cache(
-                &cdn_url, &resid, &version, &params.path, &redis, max_age
-            ).await {
-                return Ok(DownloadResponse::Cached { content, metadata });
-            }
+            download_and_cache(&cdn_url, &resid, &version, &path, &redis, max_age)
+                .await
+                .ok()
+        } else {
+            None
         }
-    }
-    
+    } else {
+        None
+    };
+
     // 如果是 Free 模式，记录直接下载日志
     if matches!(resource_config.download, DownloadPolicy::Free) {
         if let Some(ip) = client_ip {
-            let session_logger = crate::analytics::SessionLogger::new(config.clone(), redis.clone());
+            let session_logger =
+                crate::analytics::SessionLogger::new(config.clone(), redis.clone());
             // 使用选中的服务器ID和权重，如果没有则使用默认值
-            let server_id = params.selected_server_id
-                .as_deref()
-                .unwrap_or("unknown");
+            let server_id = params.selected_server_id.as_deref().unwrap_or("unknown");
             let server_weight = params.selected_server_weight.unwrap_or(10);
-            
-            if let Err(e) = session_logger.log_direct_download(
-                &resid,
-                version,
-                &params.path,
-                ip,
-                user_agent.clone(),
-                &cdn_url,
-                server_id,
-                server_weight,
-            ).await {
+
+            if let Err(e) = session_logger
+                .log_direct_download(
+                    &resid,
+                    &version,
+                    ip,
+                    user_agent.clone(),
+                    &cdn_url,
+                    server_id,
+                    server_weight,
+                )
+                .await
+            {
                 error!("Failed to log direct download: {}", e);
             }
         }
     }
-    
-    // 如果是 enabled 模式且有 session，销毁 session
+
+    // 如果是 enabled 模式且有 session，记录日志并销毁 session
     if matches!(resource_config.download, DownloadPolicy::Enabled) {
         if let Some(ref sid) = original_session_id {
+            // 在删除之前记录直接下载日志
+            if let Some(ip) = client_ip {
+                let session_logger =
+                    crate::analytics::SessionLogger::new(config.clone(), redis.clone());
+                let server_id = params.selected_server_id.as_deref().unwrap_or("unknown");
+                let server_weight = params.selected_server_weight.unwrap_or(10);
+
+                if let Err(e) = session_logger
+                    .log_direct_download(
+                        &resid,
+                        &resource_config.latest,
+                        ip,
+                        user_agent.clone(),
+                        &cdn_url, // 添加缺失的 cdn_url 参数
+                        server_id,
+                        server_weight,
+                    )
+                    .await
+                {
+                    error!("Failed to log direct download: {}", e);
+                }
+            }
+
             if let Err(e) = redis.remove_session(sid).await {
                 warn!("Failed to remove session after download: {}", e);
-            } else {
-                info!("Session {} destroyed after download", sid);
             }
         }
     }
-    
+
     // 更新流量统计（在成功生成下载URL后）
     if let Some(server_id) = &params.selected_server_id {
         // 尝试从健康检查缓存获取文件大小
-        if let Ok(Some(health_info)) = redis.get_health_info(server_id, &params.path).await {
-            if let Some(file_size) = health_info.file_size {
-                // 更新session级别的流量统计（如果有session_id）
-                if let Some(ref session_id) = original_session_id {
-                    if let Err(e) = redis.update_daily_bandwidth(session_id, file_size).await {
-                        warn!("Failed to update daily bandwidth for session {}: {}", session_id, e);
-                    }
+        if let Ok(Some(health_info)) = redis.get_health_info(server_id, &path).await {
+            if let Some(full_file_size) = health_info.file_size {
+                // 根据range计算实际传输字节数
+                let actual_bytes =
+                    calculate_actual_bytes_from_range(range.as_deref(), full_file_size);
+
+                // 使用批量更新接口同时更新资源、服务器和全局流量统计
+                if let Err(e) = redis
+                    .update_bandwidth_batch(BandwidthUpdateBatch {
+                        resource_id: resid.clone(),
+                        server_id: server_id.clone(),
+                        bytes: actual_bytes,
+                    })
+                    .await
+                {
+                    warn!("Failed to update bandwidth for server {}: {}", server_id, e);
+                } else {
+                    // 记录成功的调度请求（非缓存）
+                    metrics.record_scheduled_request(&resid, server_id, false);
                 }
-                
-                // 更新server级别的流量统计
-                if let Err(e) = redis.update_server_daily_bandwidth(server_id, file_size).await {
-                    warn!("Failed to update server daily bandwidth for {}: {}", server_id, e);
-                }
-                
-                debug!("Updated bandwidth stats: file_size={}, server_id={}, session_id={:?}", 
-                       file_size, server_id, original_session_id);
+
+                debug!(
+                    "Updated bandwidth stats: actual_bytes={}, full_file_size={}, range={:?}, resource_id={}, server_id={}",
+                    actual_bytes, full_file_size, range, resid, server_id
+                );
             }
         }
     }
-    
+
+    // 如果有缓存结果，返回缓存内容
+    if let Some((metadata, content)) = cached_result {
+        return Ok(DownloadResponse::Cached { content, metadata });
+    }
+
     Ok(DownloadResponse::Redirect(cdn_url))
 }
 
@@ -1291,40 +1454,66 @@ async fn download_redirect(
     Extension(runner): Extension<FlowRunner>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
     Extension(metrics): Extension<Arc<Metrics>>,
+    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     // 提取客户端IP地址
     let client_ip = crate::modules::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
-    
+
     // 获取 session 参数
     let session_id = params.get("session").map(|s| s.clone());
-    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    
-    match handle_download_request(resid, session_id, config, redis, runner, client_ip, user_agent).await {
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    match handle_download_request(
+        resid,
+        session_id,
+        None,
+        config,
+        redis,
+        runner,
+        client_ip,
+        user_agent,
+        metrics,
+        version_cache,
+    )
+    .await
+    {
         Ok(DownloadResponse::Cached { content, metadata }) => {
             let remaining_max_age = metadata.remaining_max_age();
-            
+
             let mut headers = HeaderMap::new();
-            headers.insert("cache-control", format!("public, max-age={}", remaining_max_age).parse().unwrap());
+            headers.insert(
+                "cache-control",
+                format!("public, max-age={}", remaining_max_age)
+                    .parse()
+                    .unwrap(),
+            );
             headers.insert("etag", metadata.etag.parse().unwrap());
             headers.insert("x-cache", "HIT".parse().unwrap());
-            headers.insert("content-length", metadata.content_length.to_string().parse().unwrap());
-            
+            headers.insert(
+                "content-length",
+                metadata.content_length.to_string().parse().unwrap(),
+            );
+
             if let Some(ct) = metadata.content_type {
                 headers.insert("content-type", ct.parse().unwrap());
             } else {
                 headers.insert("content-type", "application/octet-stream".parse().unwrap());
             }
-            
+
             (StatusCode::OK, headers, content).into_response()
         }
         Ok(DownloadResponse::Redirect(download_url)) => {
             Redirect::temporary(&download_url).into_response()
         }
         Err(e) => {
-            let status_code = StatusCode::from_u16(e.http_status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status_code = StatusCode::from_u16(e.http_status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status_code, Json(ApiResponse::error(e.to_string()))).into_response()
         }
     }
@@ -1355,34 +1544,92 @@ async fn download_json(
     Extension(runner): Extension<FlowRunner>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
     Extension(metrics): Extension<Arc<Metrics>>,
+    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     // 提取客户端IP地址
     let client_ip = crate::modules::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
-    
-    // 获取 session 参数
-    let session_id = params.get("session").map(|s| s.clone());
-    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    
-    match handle_download_request(resid, session_id, config, redis, runner, client_ip, user_agent).await {
-        Ok(DownloadResponse::Cached { content, metadata }) => {
-            // 对于JSON响应，返回base64编码的内容和元数据
-            let content_base64 = general_purpose::STANDARD.encode(&content);
-            let response_data = serde_json::json!({
-                "cached": true,
-                "content": content_base64,
-                "content_type": metadata.content_type,
-                "etag": metadata.etag,
-                "max_age": metadata.remaining_max_age(),
-                "size": metadata.content_length
-            });
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success(ResponseData::Raw(response_data))),
-            )
+
+    // 提取 range 参数（历史客户端支持）
+    let range = params.get("range").map(|s| s.clone());
+
+    // 统一从 sid 参数获取，支持历史客户端
+    let session_id = {
+        let legacy_handler = LegacyClientHandler::new(config.clone(), redis.clone());
+
+        // 检查是否是历史客户端资源
+        let config_guard = config.read().await;
+        let is_legacy_resource = config_guard
+            .get_resource(&resid)
+            .map(|r| r.legacy_client_support)
+            .unwrap_or(false);
+        let is_free = config_guard
+            .get_resource(&resid)
+            .map(|r| r.download == DownloadPolicy::Free)
+            .unwrap_or(false);
+        drop(config_guard);
+
+        if is_legacy_resource && !is_free {
+            // 历史客户端处理：sid 可能为空（第一次请求）
+            let sid = params.get("sid").map(|s| s.as_str()).unwrap_or("");
+
+            if sid.is_empty() {
+                // 首次请求，生成challenge并创建session
+                match legacy_handler
+                    .generate_legacy_challenge(&resid, range.as_deref())
+                    .await
+                {
+                    Ok(challenge) => {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(ApiResponse::success(
+                                ResponseData::LegacyChallengeResponse {
+                                    challenge: challenge.format_data(), // 直接使用 "hash/source" 格式
+                                },
+                            )),
+                        );
+                    }
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiResponse::error(format!(
+                                "LEGACY_ERROR: {}",
+                                e.to_string()
+                            ))),
+                        );
+                    }
+                }
+            } else {
+                // 有sid，直接使用
+                Some(sid.to_string())
+            }
+        } else {
+            // 新客户端：使用 sid 参数
+            params.get("sid").map(|s| s.clone())
         }
+    };
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    match handle_download_request(
+        resid,
+        session_id,
+        range,
+        config,
+        redis,
+        runner,
+        client_ip,
+        user_agent,
+        metrics,
+        version_cache,
+    )
+    .await
+    {
         Ok(DownloadResponse::Redirect(download_url)) => (
             StatusCode::OK,
             Json(ApiResponse::success(ResponseData::Download {
@@ -1390,9 +1637,17 @@ async fn download_json(
             })),
         ),
         Err(e) => {
-            let status_code = StatusCode::from_u16(e.http_status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status_code = StatusCode::from_u16(e.http_status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status_code, Json(ApiResponse::error(e.to_string())))
         }
+        // 移除缓存支持以保证历史客户端兼容性
+        Ok(DownloadResponse::Cached { .. }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(
+                "Cached responses not supported in POST download".to_string(),
+            )),
+        ),
     }
 }
 
@@ -1419,7 +1674,11 @@ async fn get_prefix_metadata(
     Extension(config): Extension<Arc<RwLock<AppConfig>>>,
     Extension(runner): Extension<FlowRunner>,
     Extension(redis): Extension<DataStore>,
+    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
 ) -> impl IntoResponse {
+    // 获取changelog（优先级：版本提供者 > 静态配置）
+    let changelog = get_resource_changelog(&config, &version_cache, &resid).await;
+
     // 读锁访问配置
     let config_guard = config.read().await;
 
@@ -1429,7 +1688,9 @@ async fn get_prefix_metadata(
         Some(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::error("Resource is not a prefix type".to_string())),
+                Json(ApiResponse::error(
+                    "Resource is not a prefix type".to_string(),
+                )),
             );
         }
         None => {
@@ -1441,16 +1702,19 @@ async fn get_prefix_metadata(
     };
 
     // 获取完整文件路径
-    let version = &resource_config.latest;
-    let full_path = match config_guard.get_version_path_with_sub(&resid, version, None, Some(&sub_path)) {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(E_PATH_NOT_FOUND.to_string())),
-            );
-        }
-    };
+    let version = config_guard
+        .get_effective_version_with_cache(&resid, Some(&version_cache))
+        .await;
+    let full_path =
+        match config_guard.get_version_path_with_sub(&resid, &version, None, Some(&sub_path)) {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error(E_PATH_NOT_FOUND.to_string())),
+                );
+            }
+        };
 
     // 生成缓存key（基于完整路径）
     let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
@@ -1469,16 +1733,17 @@ async fn get_prefix_metadata(
             return (
                 StatusCode::OK,
                 Json(ApiResponse::success(ResponseData::Metadata {
-                    dfs_version: "1.0.0".to_string(),
-                    name: format!("resource-{}/{}", resid, sub_path),
+                    resource_version: version.clone(),
+                    name: format!("{}/{}", resid, sub_path),
+                    changelog: changelog.clone(),
                     data: cached_json,
                 })),
             );
         }
     }
 
-    // 使用 kachina 模块解析文件（使用完整路径）
-    match kachina::parse_kachina_metadata(&config, &runner, &resid, Some(&full_path)).await {
+    // 使用 kachina 模块解析文件（使用动态版本）
+    match kachina::parse_kachina_metadata(&config, &runner, &resid, Some(&version)).await {
         Ok(Some(metadata)) => {
             let response_data = json!({
                 "index": metadata.index,
@@ -1499,8 +1764,9 @@ async fn get_prefix_metadata(
             (
                 StatusCode::OK,
                 Json(ApiResponse::success(ResponseData::Metadata {
-                    dfs_version: "1.0.0".to_string(),
-                    name: format!("resource-{}/{}", resid, sub_path),
+                    resource_version: version.clone(),
+                    name: format!("{}/{}", resid, sub_path),
+                    changelog: changelog.clone(),
                     data: response_data,
                 })),
             )
@@ -1521,8 +1787,9 @@ async fn get_prefix_metadata(
             (
                 StatusCode::OK,
                 Json(ApiResponse::success(ResponseData::Metadata {
-                    dfs_version: "1.0.0".to_string(),
-                    name: format!("resource-{}/{}", resid, sub_path),
+                    resource_version: version.clone(),
+                    name: format!("{}/{}", resid, sub_path),
+                    changelog: changelog.clone(),
                     data: null_data,
                 })),
             )
@@ -1568,6 +1835,7 @@ async fn create_prefix_session(
     Extension(redis): Extension<DataStore>,
     Extension(runner): Extension<FlowRunner>,
     Extension(metrics): Extension<Arc<Metrics>>,
+    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
     Json(mut req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // 读锁访问配置
@@ -1579,7 +1847,9 @@ async fn create_prefix_session(
         Some(_) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(ApiResponse::error("Resource is not a prefix type".to_string())),
+                Json(ApiResponse::error(
+                    "Resource is not a prefix type".to_string(),
+                )),
             );
         }
         None => {
@@ -1592,13 +1862,18 @@ async fn create_prefix_session(
 
     // 使用配置文件中的版本路径
     let version = if req.version.is_empty() || req.version == "latest" {
-        resource_config.latest.as_str()
+        // 获取有效版本（考虑动态版本提供者）
+        config_guard
+            .get_effective_version_with_cache(&resid, Some(&version_cache))
+            .await
     } else {
-        req.version.as_str()
+        req.version.clone()
     };
 
-    // 检查版本是否存在
-    if !resource_config.versions.contains_key(version) {
+    // 检查版本是否存在或有default模板
+    if !resource_config.versions.contains_key(&version)
+        && !resource_config.versions.contains_key("default")
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error(format!("版本 {} 不存在", version))),
@@ -1606,28 +1881,29 @@ async fn create_prefix_session(
     }
 
     // 获取完整文件路径（前缀 + 子路径）
-    let full_path = match config_guard.get_version_path_with_sub(&resid, version, None, Some(&sub_path)) {
-        Some(p) => p,
-        None => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error("无法构建资源路径".to_string())),
-            );
-        }
-    };
+    let full_path =
+        match config_guard.get_version_path_with_sub(&resid, &version, None, Some(&sub_path)) {
+            Some(p) => p,
+            None => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiResponse::error("无法构建资源路径".to_string())),
+                );
+            }
+        };
 
     if req.sid.is_empty() {
-        req.sid = Uuid::new_v4().to_string();
+        req.sid = generate_hex_session_id();
     }
 
     if req.challenge.is_empty() {
         // 挑战生成逻辑与原函数相同，但使用完整路径和前缀资源信息
         let config_guard = config.read().await;
         let challenge_config = config_guard.get_challenge_config(&resid);
-        
+
         let base_data = format!("data/{}/{}/{}", resid, sub_path, req.sid);
         let challenge_type = challenge_config.get_effective_type();
-        
+
         let generation_config = crate::challenge::ChallengeConfig {
             challenge_type,
             difficulty: if challenge_type == ChallengeType::Sha256 {
@@ -1636,7 +1912,7 @@ async fn create_prefix_session(
                 2
             },
         };
-        
+
         let challenge = generate_challenge(&generation_config, &base_data);
 
         // Web challenges 处理逻辑与原函数相同
@@ -1719,7 +1995,10 @@ async fn create_prefix_session(
                     }
                 }
                 Err(e) => {
-                    error!("Failed to run web challenge plugin {}: {}", web_plugin_id, e);
+                    error!(
+                        "Failed to run web challenge plugin {}: {}",
+                        web_plugin_id, e
+                    );
                     // Fallback to MD5
                     let fallback_config = crate::challenge::ChallengeConfig {
                         challenge_type: ChallengeType::Md5,
@@ -1869,7 +2148,8 @@ async fn create_prefix_session(
                             challenge_type,
                             hash: hash.to_string(),
                             partial_data: partial_data.to_string(),
-                            missing_bytes: challenge_json["missing_bytes"].as_u64().unwrap_or(2) as u8,
+                            missing_bytes: challenge_json["missing_bytes"].as_u64().unwrap_or(2)
+                                as u8,
                             original_data,
                         };
 
@@ -1878,9 +2158,7 @@ async fn create_prefix_session(
                         if !verification_success.success && !config_guard.debug_mode {
                             return (
                                 StatusCode::PAYMENT_REQUIRED,
-                                Json(ApiResponse::error(
-                                    "Invalid challenge response".to_string(),
-                                )),
+                                Json(ApiResponse::error("Invalid challenge response".to_string())),
                             );
                         }
 
@@ -1920,9 +2198,11 @@ async fn create_prefix_session(
 
     // 创建会话（使用完整文件路径）
     let session = Session {
-        path: full_path.clone(),
+        resource_id: resid.clone(),
+        version: version.clone(),
         chunks: req.chunks.clone(),
         cdn_records: HashMap::new(),
+        extras: req.extras.clone(),
     };
 
     if let Err(e) = redis.store_session(&req.sid, &session).await {
@@ -1934,19 +2214,7 @@ async fn create_prefix_session(
     }
 
     // 生成服务器尝试列表（使用完整文件路径进行健康检查）
-    let tries = match generate_session_tries(&config_guard, &resid, &full_path, &redis).await {
-        Ok(tries) => tries,
-        Err(e) => {
-            error!("Failed to generate session tries: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(format!(
-                    "Failed to generate server list: {}",
-                    e
-                ))),
-            );
-        }
-    };
+    let tries = vec![];
 
     // 记录会话创建指标
     metrics.record_session_created();
@@ -1965,14 +2233,17 @@ async fn handle_prefix_download_request(
     resid: String,
     sub_path: String,
     session_id: Option<String>,
+    range: Option<String>,
     config: Arc<RwLock<AppConfig>>,
     redis: DataStore,
     runner: FlowRunner,
     client_ip: Option<std::net::IpAddr>,
     user_agent: Option<String>,
+    metrics: Arc<Metrics>,
+    version_cache: Arc<crate::modules::version_provider::VersionCache>,
 ) -> DfsResult<DownloadResponse> {
     let config_guard = config.read().await;
-    
+
     // 检查资源是否存在且为前缀类型
     let resource_config = match config_guard.get_resource(&resid) {
         Some(rc) if rc.resource_type == "prefix" => rc,
@@ -1986,12 +2257,12 @@ async fn handle_prefix_download_request(
             return Err(DfsError::resource_not_found(&resid));
         }
     };
-    
+
     // 保存原始 session_id 用于后续销毁
     let original_session_id = session_id.clone();
-    
-    // 检查下载策略
-    match &resource_config.download {
+
+    // 提取 extras 信息用于 Flow 规则
+    let extras = match &resource_config.download {
         DownloadPolicy::Disabled => {
             return Err(DfsError::download_not_allowed(
                 &resid,
@@ -1999,53 +2270,123 @@ async fn handle_prefix_download_request(
             ));
         }
         DownloadPolicy::Free => {
-            // 无需 session 验证，直接生成下载链接
+            // 无需 session 验证，使用空 extras
+            serde_json::json!({})
         }
         DownloadPolicy::Enabled => {
             // 需要验证 session
             let session_id = session_id.as_ref().ok_or_else(|| {
                 DfsError::download_not_allowed(&resid, "session parameter is required")
             })?;
-            
+
             // 获取 session
-            let session = redis.get_session(session_id).await.map_err(|e| {
-                DfsError::redis_error("get_session", e.to_string())
+            let session = redis
+                .get_session(session_id)
+                .await
+                .map_err(|e| DfsError::redis_error("get_session", e.to_string()))?;
+
+            let session = session.ok_or_else(|| DfsError::SessionNotFound {
+                session_id: session_id.clone(),
             })?;
-            
-            let session = session.ok_or_else(|| {
-                DfsError::SessionNotFound { session_id: session_id.clone() }
-            })?;
-            
-            // 验证会话路径是否匹配请求的文件
-            let version = &resource_config.latest;
-            let expected_path = config_guard
-                .get_version_path_with_sub(&resid, version, None, Some(&sub_path))
-                .ok_or_else(|| DfsError::path_not_found(&resid, version))?;
-                
-            if session.path != expected_path {
-                return Err(DfsError::download_not_allowed(
-                    &resid,
-                    "session path does not match requested file",
-                ));
+
+            // 验证 chunks：比较请求的 range 与 session chunks 是否一致
+            if let Some(requested_range) = &range {
+                // 请求带有 range 参数，检查 session 是否包含对应的 range
+                if !session.chunks.contains(requested_range) {
+                    return Err(DfsError::download_not_allowed(
+                        &resid,
+                        &format!("session does not allow range '{}'", requested_range),
+                    ));
+                }
+            } else {
+                // 请求没有 range 参数，检查 session 是否包含 "0-"
+                let has_zero_range = session.chunks.iter().any(|chunk| chunk.starts_with("0-"));
+                if !has_zero_range {
+                    return Err(DfsError::download_not_allowed(
+                        &resid,
+                        "chunks must contain '0-' range for download",
+                    ));
+                }
             }
-            
-            // 验证 chunks 包含 "0-"
-            let has_zero_range = session.chunks.iter().any(|chunk| chunk.starts_with("0-"));
-            if !has_zero_range {
-                return Err(DfsError::download_not_allowed(
-                    &resid,
-                    "chunks must contain '0-' range for download",
-                ));
+
+            // 返回 session 的 extras
+            session.extras.clone()
+        }
+    };
+
+    // 获取动态版本
+    let version = config_guard.get_effective_version_with_cache(&resid, Some(&version_cache)).await;
+    let full_path = config_guard
+        .get_version_path_with_sub(&resid, &version, None, Some(&sub_path))
+        .ok_or_else(|| DfsError::path_not_found(&resid, &version))?;
+
+    // 检查资源是否启用缓存，如果是，先检查缓存
+    if resource_config.cache_enabled {
+        // 检查子路径是否匹配缓存模式
+        if resource_config
+            .cache_subpaths
+            .iter()
+            .any(|pattern| crate::cache::glob_match(pattern, &sub_path))
+        {
+            // 先进行简单的缓存检查（不需要server_id）
+            if let Ok(Some((metadata, content))) = redis
+                .get_full_cached_content(&resid, &version, &full_path)
+                .await
+            {
+                // 缓存命中！记录缓存命中日志
+                if matches!(resource_config.download, DownloadPolicy::Free) {
+                    if let Some(ip) = client_ip {
+                        let session_logger =
+                            crate::analytics::SessionLogger::new(config.clone(), redis.clone());
+                        if let Err(e) = session_logger
+                            .log_cached_download(
+                                &resid,
+                                &version,
+                                ip,
+                                user_agent.clone(),
+                                metadata.content_length,
+                                metadata.max_age,
+                                &metadata.etag,
+                            )
+                            .await
+                        {
+                            error!("Failed to log cached prefix download: {}", e);
+                        }
+                    }
+                }
+
+                // 缓存命中时更新流量统计 - 使用"cache"作为server_id
+                let file_size = metadata.content_length;
+                let server_id = "cache";
+
+                if let Err(e) = redis
+                    .update_bandwidth_batch(BandwidthUpdateBatch {
+                        resource_id: resid.clone(),
+                        server_id: server_id.to_string(),
+                        bytes: file_size,
+                    })
+                    .await
+                {
+                    warn!(
+                        "Failed to update bandwidth for cached prefix download: {}",
+                        e
+                    );
+                }
+
+                // 记录缓存命中的调度请求 - 没有实际调度到服务器
+                metrics.record_scheduled_request(&resid, server_id, true);
+
+                debug!(
+                    "Prefix cache hit: file_size={}, resource_id={}, server_id={}, sub_path={}",
+                    file_size, resid, server_id, sub_path
+                );
+
+                return Ok(DownloadResponse::Cached { content, metadata });
             }
         }
     }
-    
-    // 获取完整文件路径
-    let version = &resource_config.latest;
-    let full_path = config_guard
-        .get_version_path_with_sub(&resid, version, None, Some(&sub_path))
-        .ok_or_else(|| DfsError::path_not_found(&resid, version))?;
-    
+
+    // 缓存未命中，需要进行实际的服务器调度
     // 尝试从任一服务器获取文件大小（用于Size条件评估）
     let file_size = {
         let mut size_candidate = None;
@@ -2059,109 +2400,123 @@ async fn handle_prefix_download_request(
         }
         size_candidate
     };
-    
-    // 使用流系统生成下载 URL（完整文件下载）
+
+    // 解析range参数（保持原有逻辑，让flow规则正常工作）
+    let parsed_ranges = range.as_ref().and_then(|r| parse_range_for_flow(r));
+
+    // 根据range请求计算实际请求的文件大小
+    let request_file_size = if let Some(ref ranges) = parsed_ranges {
+        // 如果有range请求，计算range的总大小
+        Some(
+            ranges
+                .iter()
+                .map(|(start, end)| (end - start + 1) as u64)
+                .sum(),
+        )
+    } else {
+        // 如果没有range请求，使用完整文件大小
+        file_size
+    };
+
+    // 使用流系统生成下载 URL
     let mut params = RunFlowParams {
-        path: full_path,
-        ranges: None, // 完整文件下载
-        extras: serde_json::json!({}),
+        ranges: parsed_ranges,
+        extras,
         session_id: original_session_id.clone(),
         client_ip,
-        file_size, // 从健康检查获取的文件大小，用于Size条件评估
+        file_size: request_file_size, // 使用请求的实际大小，用于Size条件评估
         plugin_server_mapping: HashMap::new(), // 初始化插件服务器映射
-        resource_id: resid.clone(),            // 资源ID
-        sub_path: Some(sub_path.clone()),              // 子路径
-        selected_server_id: None,              // 初始化为None，由poolize函数设置
-        selected_server_weight: None,          // 初始化为None，由poolize函数设置
+        resource_id: resid.clone(),   // 资源ID
+        version: version.clone(),     // 使用获取到的版本
+        sub_path: Some(sub_path.clone()), // 子路径
+        selected_server_id: None,     // 初始化为None，由poolize函数设置
+        selected_server_weight: None, // 初始化为None，由poolize函数设置
+        cdn_full_range: resource_config.legacy_client_full_range
+            && resource_config.legacy_client_support, // 历史客户端全范围模式
     };
-    
+
     let flow_list = &resource_config.flow;
     let cdn_url = runner.run_flow(flow_list, &mut params).await.map_err(|e| {
         error!("Failed to run flow for prefix download: {}", e);
         DfsError::internal_error(format!("Failed to generate download URL: {}", e))
     })?;
-    
+
     // 检查是否应该缓存（前缀资源）
-    if let Some((file_size, max_age)) = should_cache_content(
-        &config_guard, &redis, &resid, Some(&sub_path), // 传入子路径用于模式匹配
-        params.selected_server_id.as_deref().unwrap_or("unknown"), 
-        &params.path
-    ).await {
-        if file_size < 100 * 1024 { // 100KB限制
-            // 检查缓存
-            if let Ok(Some((metadata, content))) = redis.get_full_cached_content(
-                &resid, &version, &params.path
-            ).await {
-                // 记录缓存命中日志
-                if matches!(resource_config.download, DownloadPolicy::Free) {
-                    if let Some(ip) = client_ip {
-                        let session_logger = crate::analytics::SessionLogger::new(config.clone(), redis.clone());
-                        if let Err(e) = session_logger.log_cached_download(
-                            &resid,
-                            &version,
-                            &params.path,
-                            ip,
-                            user_agent.clone(),
-                            metadata.content_length,
-                            metadata.max_age,
-                            &metadata.etag,
-                        ).await {
-                            error!("Failed to log cached prefix download: {}", e);
-                        }
-                    }
-                }
-                
-                // 缓存命中时更新流量统计
-                let file_size = metadata.content_length;
-                if let Some(ref session_id) = original_session_id {
-                    if let Err(e) = redis.update_daily_bandwidth(session_id, file_size).await {
-                        warn!("Failed to update daily bandwidth for cached prefix download session {}: {}", session_id, e);
-                    }
-                }
-                
-                debug!("Updated bandwidth stats for cached prefix download: file_size={}, session_id={:?}", 
-                       file_size, original_session_id);
-                
-                return Ok(DownloadResponse::Cached { content, metadata });
-            }
-            
+    let cached_result = if let Some((file_size, max_age)) = should_cache_content(
+        &config_guard,
+        &redis,
+        &resid,
+        Some(&sub_path), // 传入子路径用于模式匹配
+        params.selected_server_id.as_deref().unwrap_or("unknown"),
+        &full_path,
+    )
+    .await
+    {
+        if file_size < 100 * 1024 {
+            // 100KB限制
             // 下载并缓存
-            if let Ok((metadata, content)) = download_and_cache(
-                &cdn_url, &resid, &version, &params.path, &redis, max_age
-            ).await {
-                return Ok(DownloadResponse::Cached { content, metadata });
-            }
+            download_and_cache(&cdn_url, &resid, &version, &full_path, &redis, max_age)
+                .await
+                .ok()
+        } else {
+            None
         }
-    }
-    
+    } else {
+        None
+    };
+
     // 如果是 Free 模式，记录直接下载日志
     if matches!(resource_config.download, DownloadPolicy::Free) {
         if let Some(ip) = client_ip {
-            let session_logger = crate::analytics::SessionLogger::new(config.clone(), redis.clone());
+            let session_logger =
+                crate::analytics::SessionLogger::new(config.clone(), redis.clone());
             // 使用选中的服务器ID和权重，如果没有则使用默认值
-            let server_id = params.selected_server_id
-                .as_deref()
-                .unwrap_or("unknown");
+            let server_id = params.selected_server_id.as_deref().unwrap_or("unknown");
             let server_weight = params.selected_server_weight.unwrap_or(10);
-            
-            if let Err(e) = session_logger.log_direct_download(
-                &resid,
-                version,
-                &params.path,
-                ip,
-                user_agent.clone(),
-                &cdn_url,
-                server_id,
-                server_weight,
-            ).await {
+
+            if let Err(e) = session_logger
+                .log_direct_download(
+                    &resid,
+                    &version,
+                    ip,
+                    user_agent.clone(),
+                    &cdn_url,
+                    server_id,
+                    server_weight,
+                )
+                .await
+            {
                 error!("Failed to log prefix direct download: {}", e);
             }
         }
     }
-    
-    // 如果是 enabled 模式且有 session，销毁 session
+
+    // 如果是 enabled 模式且有 session，记录日志并销毁 session
     if matches!(resource_config.download, DownloadPolicy::Enabled) {
         if let Some(ref sid) = original_session_id {
+            // 在删除之前记录直接下载日志
+            if let Some(ip) = client_ip {
+                let session_logger =
+                    crate::analytics::SessionLogger::new(config.clone(), redis.clone());
+                let server_id = params.selected_server_id.as_deref().unwrap_or("unknown");
+                let server_weight = params.selected_server_weight.unwrap_or(10);
+
+                if let Err(e) = session_logger
+                    .log_direct_download(
+                        &resid,
+                        &resource_config.latest,
+                        ip,
+                        user_agent.clone(),
+                        &cdn_url, // 添加缺失的 cdn_url 参数
+                        server_id,
+                        server_weight,
+                    )
+                    .await
+                {
+                    error!("Failed to log direct download for prefix: {}", e);
+                }
+            }
+
             if let Err(e) = redis.remove_session(sid).await {
                 warn!("Failed to remove session after prefix download: {}", e);
             } else {
@@ -2169,30 +2524,47 @@ async fn handle_prefix_download_request(
             }
         }
     }
-    
+
     // 更新流量统计（在成功生成下载URL后）
     if let Some(server_id) = &params.selected_server_id {
         // 尝试从健康检查缓存获取文件大小
-        if let Ok(Some(health_info)) = redis.get_health_info(server_id, &params.path).await {
-            if let Some(file_size) = health_info.file_size {
-                // 更新session级别的流量统计（如果有session_id）
-                if let Some(ref session_id) = original_session_id {
-                    if let Err(e) = redis.update_daily_bandwidth(session_id, file_size).await {
-                        warn!("Failed to update daily bandwidth for session {}: {}", session_id, e);
-                    }
+        if let Ok(Some(health_info)) = redis.get_health_info(server_id, &full_path).await {
+            if let Some(full_file_size) = health_info.file_size {
+                // 根据range计算实际传输字节数
+                let actual_bytes =
+                    calculate_actual_bytes_from_range(range.as_deref(), full_file_size);
+
+                // 使用批量更新接口同时更新资源、服务器和全局流量统计
+                if let Err(e) = redis
+                    .update_bandwidth_batch(BandwidthUpdateBatch {
+                        resource_id: resid.clone(),
+                        server_id: server_id.clone(),
+                        bytes: actual_bytes,
+                    })
+                    .await
+                {
+                    warn!(
+                        "Failed to update bandwidth for prefix server {}: {}",
+                        server_id, e
+                    );
+                } else {
+                    // 记录成功的调度请求（非缓存）
+                    metrics.record_scheduled_request(&resid, server_id, false);
                 }
-                
-                // 更新server级别的流量统计
-                if let Err(e) = redis.update_server_daily_bandwidth(server_id, file_size).await {
-                    warn!("Failed to update server daily bandwidth for {}: {}", server_id, e);
-                }
-                
-                debug!("Updated prefix download bandwidth stats: file_size={}, server_id={}, session_id={:?}", 
-                       file_size, server_id, original_session_id);
+
+                debug!(
+                    "Updated prefix download bandwidth stats: actual_bytes={}, full_file_size={}, range={:?}, server_id={}, session_id={:?}",
+                    actual_bytes, full_file_size, range, server_id, original_session_id
+                );
             }
         }
     }
-    
+
+    // 如果有缓存结果，返回缓存内容
+    if let Some((metadata, content)) = cached_result {
+        return Ok(DownloadResponse::Cached { content, metadata });
+    }
+
     Ok(DownloadResponse::Redirect(cdn_url))
 }
 
@@ -2223,40 +2595,57 @@ async fn download_prefix_redirect(
     Extension(runner): Extension<FlowRunner>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
     Extension(metrics): Extension<Arc<Metrics>>,
+    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     // 提取客户端IP地址
     let client_ip = crate::modules::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
-    
+
     // 获取 session 参数
     let session_id = params.get("session").map(|s| s.clone());
-    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    
-    match handle_prefix_download_request(resid, sub_path, session_id, config, redis, runner, client_ip, user_agent).await {
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    match handle_prefix_download_request(
+        resid, sub_path, session_id, None, config, redis, runner, client_ip, user_agent, metrics, version_cache,
+    )
+    .await
+    {
         Ok(DownloadResponse::Cached { content, metadata }) => {
             let remaining_max_age = metadata.remaining_max_age();
-            
+
             let mut headers = HeaderMap::new();
-            headers.insert("cache-control", format!("public, max-age={}", remaining_max_age).parse().unwrap());
+            headers.insert(
+                "cache-control",
+                format!("public, max-age={}", remaining_max_age)
+                    .parse()
+                    .unwrap(),
+            );
             headers.insert("etag", metadata.etag.parse().unwrap());
             headers.insert("x-cache", "HIT".parse().unwrap());
-            headers.insert("content-length", metadata.content_length.to_string().parse().unwrap());
-            
+            headers.insert(
+                "content-length",
+                metadata.content_length.to_string().parse().unwrap(),
+            );
+
             if let Some(ct) = metadata.content_type {
                 headers.insert("content-type", ct.parse().unwrap());
             } else {
                 headers.insert("content-type", "application/octet-stream".parse().unwrap());
             }
-            
+
             (StatusCode::OK, headers, content).into_response()
         }
         Ok(DownloadResponse::Redirect(download_url)) => {
             Redirect::temporary(&download_url).into_response()
         }
         Err(e) => {
-            let status_code = StatusCode::from_u16(e.http_status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status_code = StatusCode::from_u16(e.http_status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status_code, Json(ApiResponse::error(e.to_string()))).into_response()
         }
     }
@@ -2288,34 +2677,79 @@ async fn download_prefix_json(
     Extension(runner): Extension<FlowRunner>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
     Extension(metrics): Extension<Arc<Metrics>>,
+    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     // 提取客户端IP地址
     let client_ip = crate::modules::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
-    
-    // 获取 session 参数
-    let session_id = params.get("session").map(|s| s.clone());
-    let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.to_string());
-    
-    match handle_prefix_download_request(resid, sub_path, session_id, config, redis, runner, client_ip, user_agent).await {
-        Ok(DownloadResponse::Cached { content, metadata }) => {
-            // 对于JSON响应，返回base64编码的内容和元数据
-            let content_base64 = general_purpose::STANDARD.encode(&content);
-            let response_data = serde_json::json!({
-                "cached": true,
-                "content": content_base64,
-                "content_type": metadata.content_type,
-                "etag": metadata.etag,
-                "max_age": metadata.remaining_max_age(),
-                "size": metadata.content_length
-            });
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success(ResponseData::Raw(response_data))),
-            )
+
+    // 提取 range 参数（历史客户端支持）
+    let range = params.get("range").map(|s| s.clone());
+
+    // 统一从 sid 参数获取，支持历史客户端
+    let session_id = {
+        let legacy_handler = LegacyClientHandler::new(config.clone(), redis.clone());
+
+        // 检查是否是历史客户端资源
+        let config_guard = config.read().await;
+        let is_legacy_resource = config_guard
+            .get_resource(&resid)
+            .map(|r| r.legacy_client_support)
+            .unwrap_or(false);
+        drop(config_guard);
+
+        if is_legacy_resource {
+            // 历史客户端处理：sid 可能为空（第一次请求）
+            let sid = params.get("sid").map(|s| s.as_str()).unwrap_or("");
+
+            if sid.is_empty() {
+                // 首次请求，生成challenge并创建session
+                match legacy_handler
+                    .generate_legacy_challenge(&resid, range.as_deref())
+                    .await
+                {
+                    Ok(challenge) => {
+                        return (
+                            StatusCode::UNAUTHORIZED,
+                            Json(ApiResponse::success(
+                                ResponseData::LegacyChallengeResponse {
+                                    challenge: challenge.format_data(), // 直接使用 "hash/source" 格式
+                                },
+                            )),
+                        );
+                    }
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ApiResponse::error(format!(
+                                "LEGACY_ERROR: {}",
+                                e.to_string()
+                            ))),
+                        );
+                    }
+                }
+            } else {
+                // 有sid，直接使用
+                Some(sid.to_string())
+            }
+        } else {
+            // 新客户端：使用 sid 参数
+            params.get("sid").map(|s| s.clone())
         }
+    };
+
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    match handle_prefix_download_request(
+        resid, sub_path, session_id, range, config, redis, runner, client_ip, user_agent, metrics, version_cache,
+    )
+    .await
+    {
         Ok(DownloadResponse::Redirect(download_url)) => (
             StatusCode::OK,
             Json(ApiResponse::success(ResponseData::Download {
@@ -2323,79 +2757,150 @@ async fn download_prefix_json(
             })),
         ),
         Err(e) => {
-            let status_code = StatusCode::from_u16(e.http_status_code()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status_code = StatusCode::from_u16(e.http_status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status_code, Json(ApiResponse::error(e.to_string())))
         }
+        // 移除缓存支持以保证历史客户端兼容性
+        Ok(DownloadResponse::Cached { .. }) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(
+                "Cached responses not supported in POST download".to_string(),
+            )),
+        ),
     }
 }
 
 // 辅助函数：更新会话模式的流量统计
 async fn update_session_bandwidth_stats(
     redis: &DataStore,
-    session_id: &str,
+    _session_id: &str,
     resource_id: &str,
     stats: &crate::data_store::SessionStats,
 ) {
     // 从每个成功下载的chunk中提取服务器信息和估算流量
     let mut server_usage: HashMap<String, u64> = HashMap::new();
     let mut total_bandwidth = 0u64;
-    
+
     for (chunk_id, download_count) in &stats.download_counts {
         if *download_count > 0 {
             // 获取该chunk的CDN记录
             if let Some(cdn_records) = stats.cdn_records.get(chunk_id) {
                 if let Some(latest_record) = cdn_records.last() {
                     if let Some(server_id) = &latest_record.server_id {
-                        // 尝试从健康检查获取文件大小，如果无法获取则使用估算值
-                        let estimated_chunk_size = if let Ok(Some(health_info)) = 
-                            redis.get_health_info(server_id, &stats.path).await {
-                            health_info.file_size.unwrap_or(1024 * 1024) // 默认1MB
-                        } else {
-                            1024 * 1024 // 默认1MB
-                        };
-                        
+                        // 使用CdnRecord中记录的文件大小，如果没有则使用默认值
+                        let estimated_chunk_size = latest_record.size.unwrap_or(1024 * 1024);
+
                         // 根据下载次数估算流量（通常一次成功即可）
-                        let chunk_bandwidth = estimated_chunk_size.min(estimated_chunk_size * (*download_count as u64));
-                        
+                        let chunk_bandwidth = estimated_chunk_size
+                            .min(estimated_chunk_size * (*download_count as u64));
+
                         // 累计到服务器使用量
                         *server_usage.entry(server_id.clone()).or_default() += chunk_bandwidth;
                         total_bandwidth += chunk_bandwidth;
-                        
-                        debug!("Session bandwidth calculation: chunk={}, server={}, size={}, downloads={}", 
-                               chunk_id, server_id, chunk_bandwidth, download_count);
+
+                        debug!(
+                            "Session bandwidth calculation: chunk={}, server={}, size={}, downloads={}",
+                            chunk_id, server_id, chunk_bandwidth, download_count
+                        );
                     }
                 }
             }
         }
     }
-    
-    // 更新session级别的流量统计
+
+    // 更新流量统计（资源级别和服务器级别）
     if total_bandwidth > 0 {
-        if let Err(e) = redis.update_daily_bandwidth(session_id, total_bandwidth).await {
-            warn!("Failed to update session daily bandwidth for {}: {}", session_id, e);
+        // 首先更新全局资源统计，使用总带宽量
+        if let Err(e) = redis
+            .update_resource_daily_bandwidth(resource_id, total_bandwidth)
+            .await
+        {
+            warn!(
+                "Failed to update resource daily bandwidth for {}: {}",
+                resource_id, e
+            );
         }
-        
-        // 更新各个服务器的流量统计
+        if let Err(e) = redis.update_global_daily_bandwidth(total_bandwidth).await {
+            warn!("Failed to update global daily bandwidth: {}", e);
+        }
+
+        // 分别更新各个服务器的流量统计
         let server_count = server_usage.len();
         for (server_id, bandwidth) in server_usage {
-            if let Err(e) = redis.update_server_daily_bandwidth(&server_id, bandwidth).await {
-                warn!("Failed to update server daily bandwidth for {}: {}", server_id, e);
+            if let Err(e) = redis
+                .update_server_daily_bandwidth(&server_id, bandwidth)
+                .await
+            {
+                warn!(
+                    "Failed to update server daily bandwidth for {}: {}",
+                    server_id, e
+                );
             }
         }
-        
-        info!("Updated session bandwidth stats: session_id={}, resource_id={}, total_bandwidth={}, servers={}", 
-              session_id, resource_id, total_bandwidth, server_count);
+
+        info!(
+            "Updated bandwidth stats: resource_id={}, total_bandwidth={}, servers={}",
+            resource_id, total_bandwidth, server_count
+        );
     }
+}
+
+/// 获取资源的changelog
+/// 优先级：版本提供者插件返回的changelog > 资源配置中的静态changelog > None
+async fn get_resource_changelog(
+    config: &Arc<RwLock<AppConfig>>,
+    version_cache: &Arc<crate::modules::version_provider::VersionCache>,
+    resource_id: &str,
+) -> Option<String> {
+    let config_guard = config.read().await;
+
+    // 获取资源配置
+    let resource_config = match config_guard.get_resource(resource_id) {
+        Some(rc) => rc,
+        None => return None,
+    };
+
+    // 优先级1: 尝试从版本提供者获取changelog
+    if let Some(ref version_provider) = resource_config.version_provider {
+        // 尝试从版本缓存获取VersionInfo
+        if let Some(version_info) = version_cache.get_cached_version_info(resource_id).await {
+            if let Some(changelog) = version_info.changelog {
+                if !changelog.trim().is_empty() {
+                    return Some(changelog);
+                }
+            }
+        }
+    }
+
+    // 优先级2: 使用资源配置中的静态changelog
+    if let Some(ref static_changelog) = resource_config.changelog {
+        if !static_changelog.trim().is_empty() {
+            return Some(static_changelog.clone());
+        }
+    }
+
+    // 默认返回None
+    None
 }
 
 pub fn routes() -> Router {
     Router::new()
         .route("/resource/{resid}", get(get_metadata).post(create_session))
-        .route("/resource/{resid}/{*sub_path}", get(get_prefix_metadata).post(create_prefix_session))
+        .route(
+            "/resource/{resid}/{*sub_path}",
+            get(get_prefix_metadata).post(create_prefix_session),
+        )
         .route(
             "/session/{sessionid}/{resid}",
             get(get_cdn).delete(delete_session),
         )
-        .route("/download/{resid}", get(download_redirect).post(download_json))
-        .route("/download/{resid}/{*sub_path}", get(download_prefix_redirect).post(download_prefix_json))
+        .route(
+            "/download/{resid}",
+            get(download_redirect).post(download_json),
+        )
+        .route(
+            "/download/{resid}/{*sub_path}",
+            get(download_prefix_redirect).post(download_prefix_json),
+        )
 }

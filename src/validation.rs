@@ -15,6 +15,7 @@ pub struct ValidationReport {
     pub plugins_valid: bool,
     pub servers_valid: bool,
     pub redis_valid: bool,
+    pub version_providers_valid: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -26,6 +27,7 @@ impl ValidationReport {
             plugins_valid: true,
             servers_valid: true,
             redis_valid: true,
+            version_providers_valid: true,
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -40,7 +42,7 @@ impl ValidationReport {
     }
 
     pub fn is_valid(&self) -> bool {
-        self.config_valid && self.plugins_valid && self.servers_valid && self.redis_valid
+        self.config_valid && self.plugins_valid && self.servers_valid && self.redis_valid && self.version_providers_valid
     }
 
     pub fn print_report(&self) {
@@ -51,6 +53,7 @@ impl ValidationReport {
         println!("🔌 插件系统: {}", if self.plugins_valid { "✅ 有效" } else { "❌ 无效" });
         println!("🌐 服务器连接: {}", if self.servers_valid { "✅ 有效" } else { "❌ 无效" });
         println!("🗃️  Redis连接: {}", if self.redis_valid { "✅ 有效" } else { "❌ 无效" });
+        println!("🔄 版本提供者: {}", if self.version_providers_valid { "✅ 有效" } else { "❌ 无效" });
         
         // 打印错误
         if !self.errors.is_empty() {
@@ -107,7 +110,10 @@ impl ConfigValidator {
         // 4. 验证Redis连接
         Self::validate_redis_connection(data_store, &mut report).await;
         
-        // 5. 验证环境变量配置
+        // 5. 验证版本提供者配置和功能
+        Self::validate_version_providers(config, data_store, &mut report).await;
+        
+        // 6. 验证环境变量配置
         Self::validate_environment_variables(&mut report).await;
         
         info!("配置验证完成");
@@ -161,6 +167,70 @@ impl ConfigValidator {
         // 检查插件配置
         if !config.plugins.is_empty() {
             info!("找到 {} 个插件配置", config.plugins.len());
+        }
+        
+        // 验证版本提供者配置格式
+        let mut resources_with_providers = 0;
+        for (resource_id, resource) in &config.resources {
+            if let Some(ref version_provider) = resource.version_provider {
+                resources_with_providers += 1;
+                
+                // 验证类型字段
+                if version_provider.r#type != "plugin" {
+                    report.add_error(format!(
+                        "资源 '{}' 的版本提供者类型 '{}' 不支持，目前只支持 'plugin'",
+                        resource_id, version_provider.r#type
+                    ));
+                    report.config_valid = false;
+                }
+                
+                // 验证插件名称格式
+                if !version_provider.plugin_name.starts_with("version_provider_") {
+                    report.add_error(format!(
+                        "资源 '{}' 的版本提供者插件名称 '{}' 必须以 'version_provider_' 开头",
+                        resource_id, version_provider.plugin_name
+                    ));
+                    report.config_valid = false;
+                }
+                
+                // 验证插件是否存在
+                if !config.plugin_code.contains_key(&version_provider.plugin_name) {
+                    report.add_error(format!(
+                        "资源 '{}' 引用的版本提供者插件 '{}' 不存在",
+                        resource_id, version_provider.plugin_name
+                    ));
+                    report.config_valid = false;
+                }
+                
+                // 验证缓存TTL设置
+                if let Some(cache_ttl) = version_provider.cache_ttl {
+                    if cache_ttl < 60 {
+                        report.add_warning(format!(
+                            "资源 '{}' 的缓存TTL ({}) 小于60秒，可能导致API调用过于频繁",
+                            resource_id, cache_ttl
+                        ));
+                    } else if cache_ttl > 86400 {
+                        report.add_warning(format!(
+                            "资源 '{}' 的缓存TTL ({}) 大于24小时，版本更新可能不及时",
+                            resource_id, cache_ttl
+                        ));
+                    }
+                }
+                
+                // 验证webhook token长度
+                if let Some(ref webhook_token) = version_provider.webhook_token {
+                    if webhook_token.len() < 16 {
+                        report.add_warning(format!(
+                            "资源 '{}' 的webhook token 长度过短，建议至少16个字符以确保安全性",
+                            resource_id
+                        ));
+                    }
+                }
+            }
+        }
+        
+        if resources_with_providers > 0 {
+            info!("找到 {} 个配置了版本提供者的资源", resources_with_providers);
         }
     }
     
@@ -263,7 +333,7 @@ impl ConfigValidator {
     /// 验证服务器连接性
     async fn validate_server_connectivity(
         config: &AppConfig, 
-        data_store: &DataStore, 
+        _data_store: &DataStore, 
         report: &mut ValidationReport
     ) {
         info!("验证服务器连接性...");
@@ -279,8 +349,8 @@ impl ConfigValidator {
                 
                 // 获取服务器实现
                 if let Some(server_impl) = config.get_server(server_id) {
-                    // 使用配置的健康检查路径来测试连接性
-                    let is_alive = server_impl.is_alive(server_id, health_check_path, Some(data_store)).await;
+                    // 使用配置的健康检查路径来测试连接性，不缓存结果
+                    let is_alive = server_impl.is_alive(server_id, health_check_path, None).await;
                     
                     if is_alive {
                         valid_servers += 1;
@@ -359,6 +429,104 @@ impl ConfigValidator {
             }
         } else {
             info!("使用文件存储后端，跳过Redis连接测试");
+        }
+    }
+    
+    /// 验证版本提供者配置和功能
+    async fn validate_version_providers(
+        config: &AppConfig, 
+        data_store: &DataStore, 
+        report: &mut ValidationReport
+    ) {
+        info!("验证版本提供者功能...");
+        
+        // 找到所有配置了版本提供者的资源
+        let resources_with_providers: Vec<(&String, &crate::config::ResourceConfig)> = config.resources.iter()
+            .filter(|(_, resource)| resource.version_provider.is_some())
+            .collect();
+        
+        if resources_with_providers.is_empty() {
+            info!("未发现配置版本提供者的资源，跳过版本提供者功能验证");
+            return;
+        }
+        
+        info!("发现 {} 个配置了版本提供者的资源，开始功能验证", resources_with_providers.len());
+        
+        // 创建JS运行时和版本提供者系统
+        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let js_runner = JsRunner::new(config_arc.clone(), data_store.clone()).await;
+        let plugin_provider = crate::modules::version_provider::PluginVersionProvider::new(
+            js_runner, 
+            config_arc.clone()
+        );
+        
+        let mut successful_validations = 0;
+        
+        let total_resources = resources_with_providers.len();
+        
+        for (resource_id, resource) in &resources_with_providers {
+            if let Some(ref version_provider) = resource.version_provider {
+                info!("测试版本提供者插件: {} (资源: {})", version_provider.plugin_name, resource_id);
+                
+                // 测试版本获取功能
+                match plugin_provider.fetch_version_info(resource_id).await {
+                    Ok(version_info) => {
+                        // 验证返回的版本信息
+                        if version_info.version.is_empty() {
+                            report.add_error(format!(
+                                "资源 '{}' 的版本提供者插件 '{}' 返回了空版本",
+                                resource_id, version_provider.plugin_name
+                            ));
+                            report.version_providers_valid = false;
+                        } else {
+                            successful_validations += 1;
+                            info!("版本提供者测试成功: {} -> 版本 '{}'", 
+                                 resource_id, version_info.version);
+                            
+                            // 如果有元数据，记录一下
+                            if let Some(ref metadata) = version_info.metadata {
+                                info!("版本元数据: {}", serde_json::to_string(metadata).unwrap_or_default());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // 检查是否是API限制或网络问题（这些应该是警告而不是错误）
+                        let error_msg = e.to_string().to_lowercase();
+                        if error_msg.contains("rate limit") || 
+                           error_msg.contains("api limit") ||
+                           error_msg.contains("quota") {
+                            report.add_warning(format!(
+                                "资源 '{}' 的版本提供者插件 '{}' 触发API限制: {}",
+                                resource_id, version_provider.plugin_name, e
+                            ));
+                        } else if error_msg.contains("network") || 
+                                 error_msg.contains("timeout") ||
+                                 error_msg.contains("connection") {
+                            report.add_warning(format!(
+                                "资源 '{}' 的版本提供者插件 '{}' 网络连接问题: {}",
+                                resource_id, version_provider.plugin_name, e
+                            ));
+                        } else {
+                            // 插件逻辑错误或配置错误应该是致命问题
+                            report.add_error(format!(
+                                "资源 '{}' 的版本提供者插件 '{}' 执行失败: {}",
+                                resource_id, version_provider.plugin_name, e
+                            ));
+                            report.version_providers_valid = false;
+                        }
+                    }
+                }
+                
+                // 稍微延迟以避免API限制
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+        
+        info!("版本提供者功能验证完成: {}/{} 个成功", 
+             successful_validations, total_resources);
+        
+        if successful_validations == 0 && !resources_with_providers.is_empty() {
+            report.add_warning("所有版本提供者测试都失败了，请检查插件配置和网络连接".to_string());
         }
     }
     

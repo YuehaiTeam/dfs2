@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 // use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::app_state::DataStore;
 use crate::config::AppConfig;
@@ -79,17 +79,22 @@ impl SessionCleanupTask {
 
     /// 查找过期的会话
     async fn find_expired_sessions(&self) -> Result<Vec<(String, String, IpAddr)>, String> {
-        // 这是一个简化实现，实际中需要扫描 Redis 中的所有会话
-        // 由于当前的 DataStore trait 没有提供扫描所有会话的方法，
-        // 这里返回空列表，后续可以根据实际的 Redis 实现来扩展
+        let timeout_hours = self._get_session_timeout_hours();
+        let timeout_seconds = timeout_hours * 3600;
         
-        // TODO: 实现实际的会话扫描逻辑
-        // 1. 扫描所有 session:* 键
-        // 2. 检查 TTL
-        // 3. 对于即将过期的会话，提取必要信息
+        info!("Scanning for expired sessions with timeout: {} hours ({} seconds)", timeout_hours, timeout_seconds);
         
-        warn!("Session scanning not yet implemented - returning empty list");
-        Ok(Vec::new())
+        // 使用数据存储后端的扫描方法
+        match self.redis.scan_expired_sessions(timeout_seconds).await {
+            Ok(sessions) => {
+                info!("Found {} potentially expired sessions", sessions.len());
+                Ok(sessions)
+            }
+            Err(e) => {
+                error!("Failed to scan expired sessions: {}", e);
+                Err(e)
+            }
+        }
     }
 
     /// 处理单个过期的会话

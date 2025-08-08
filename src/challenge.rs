@@ -48,14 +48,14 @@ impl Challenge {
         // Calculate MD5 hash of the first hash (second hash - this is the complete challenge)
         let second_hash = format!("{:x}", md5::compute(first_hash.as_bytes()));
         
-        // Remove last 2 bytes (4 hex characters) from FIRST hash as partial data
-        let partial_first_hash = first_hash[..first_hash.len() - 4].to_string();
+        // Remove last 1 byte (2 hex characters) from FIRST hash as partial data
+        let partial_first_hash = first_hash[..first_hash.len() - 2].to_string();
 
         Challenge {
             challenge_type: ChallengeType::Md5,
             hash: second_hash,          // Complete second hash
-            partial_data: partial_first_hash, // Partial first hash (missing last 4 chars)
-            missing_bytes: 2, // 2 bytes = 4 hex characters
+            partial_data: partial_first_hash, // Partial first hash (missing last 2 chars)
+            missing_bytes: 1, // 1 byte = 2 hex characters
             original_data: original_data,
         }
     }
@@ -217,10 +217,10 @@ mod tests {
         assert!(challenge.partial_data.len() > 0);
         assert!(challenge.challenge_type == ChallengeType::Md5);
 
-        // 验证部分数据确实缺少2字节（hex编码后的长度应该正确）
+        // 验证部分数据确实缺少1字节（hex编码后的长度应该正确）
         let expected_byte_length = challenge.partial_data.len() / 2; // Convert hex length to byte length
-        let _complete_byte_length = expected_byte_length + 2; // Add back the 2 missing bytes
-        assert_eq!(challenge.missing_bytes, 2);
+        let _complete_byte_length = expected_byte_length + 1; // Add back the 1 missing byte
+        assert_eq!(challenge.missing_bytes, 1);
         assert!(challenge.partial_data.len() % 2 == 0); // Hex strings should be even length
     }
 

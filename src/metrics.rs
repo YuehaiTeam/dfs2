@@ -1,11 +1,15 @@
-use prometheus::{Counter, Gauge, Histogram, Registry, TextEncoder};
+use prometheus::{Counter, CounterVec, Gauge, GaugeVec, Histogram, Opts, Registry, TextEncoder};
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use tracing::{error, debug};
+use chrono;
+use crate::config::AppConfig;
+use crate::data_store::DataStore;
 
 /// DFS2 Prometheus Metrics
 #[derive(Clone)]
@@ -36,10 +40,28 @@ pub struct Metrics {
     // Flow runner metrics
     pub flow_executions_total: Counter,
     pub flow_failures_total: Counter,
+    
+    // 流量指标（3个独立指标）
+    pub bandwidth_bytes_today: Gauge,                    // 全局流量
+    pub bandwidth_bytes_today_per_resource: GaugeVec,   // 资源流量
+    pub bandwidth_bytes_today_per_server: GaugeVec,     // 服务器流量
+    
+    // 总请求数指标（3个，包含缓存的和非缓存的）
+    pub scheduled_requests_total: Counter,               // 全局总请求数
+    pub scheduled_requests_per_server: CounterVec,      // 服务器总请求数
+    pub scheduled_requests_per_resource: CounterVec,    // 资源总请求数
+    
+    // 缓存请求数指标（3个）
+    pub cached_requests_total: Counter,                  // 全局缓存请求数
+    pub cached_requests_per_server: CounterVec,         // 服务器缓存请求数
+    pub cached_requests_per_resource: CounterVec,       // 资源缓存请求数
+    
+    // 配置引用（用于实时获取ID列表）
+    pub config: Arc<RwLock<AppConfig>>,
 }
 
 impl Metrics {
-    pub fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(config: Arc<RwLock<AppConfig>>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let registry = Arc::new(Registry::new());
         
         // Request metrics
@@ -128,6 +150,63 @@ impl Metrics {
         )?;
         registry.register(Box::new(flow_failures_total.clone()))?;
         
+        // 流量指标
+        let bandwidth_bytes_today = Gauge::new(
+            "dfs_bandwidth_bytes_today", 
+            "Total daily bandwidth usage in bytes"
+        )?;
+        registry.register(Box::new(bandwidth_bytes_today.clone()))?;
+
+        let bandwidth_bytes_today_per_resource = GaugeVec::new(
+            Opts::new("dfs_bandwidth_bytes_today_per_resource", "Daily bandwidth usage per resource in bytes"),
+            &["resource_id"]
+        )?;
+        registry.register(Box::new(bandwidth_bytes_today_per_resource.clone()))?;
+
+        let bandwidth_bytes_today_per_server = GaugeVec::new(
+            Opts::new("dfs_bandwidth_bytes_today_per_server", "Daily bandwidth usage per server in bytes"),
+            &["server_id"]
+        )?;
+        registry.register(Box::new(bandwidth_bytes_today_per_server.clone()))?;
+
+        // 总请求数指标
+        let scheduled_requests_total = Counter::new(
+            "dfs_scheduled_requests_total",
+            "Total number of scheduled requests (cached and non-cached)"
+        )?;
+        registry.register(Box::new(scheduled_requests_total.clone()))?;
+
+        let scheduled_requests_per_server = CounterVec::new(
+            Opts::new("dfs_scheduled_requests_per_server", "Total number of scheduled requests per server (cached and non-cached)"),
+            &["server_id"]
+        )?;
+        registry.register(Box::new(scheduled_requests_per_server.clone()))?;
+
+        let scheduled_requests_per_resource = CounterVec::new(
+            Opts::new("dfs_scheduled_requests_per_resource", "Total number of scheduled requests per resource (cached and non-cached)"),
+            &["resource_id"]
+        )?;
+        registry.register(Box::new(scheduled_requests_per_resource.clone()))?;
+
+        // 缓存请求数指标
+        let cached_requests_total = Counter::new(
+            "dfs_cached_requests_total",
+            "Total number of cached requests"
+        )?;
+        registry.register(Box::new(cached_requests_total.clone()))?;
+
+        let cached_requests_per_server = CounterVec::new(
+            Opts::new("dfs_cached_requests_per_server", "Total number of cached requests per server"),
+            &["server_id"]
+        )?;
+        registry.register(Box::new(cached_requests_per_server.clone()))?;
+
+        let cached_requests_per_resource = CounterVec::new(
+            Opts::new("dfs_cached_requests_per_resource", "Total number of cached requests per resource"),
+            &["resource_id"]
+        )?;
+        registry.register(Box::new(cached_requests_per_resource.clone()))?;
+        
         Ok(Self {
             registry,
             requests_total,
@@ -143,6 +222,16 @@ impl Metrics {
             plugin_errors_total,
             flow_executions_total,
             flow_failures_total,
+            bandwidth_bytes_today,
+            bandwidth_bytes_today_per_resource,
+            bandwidth_bytes_today_per_server,
+            scheduled_requests_total,
+            scheduled_requests_per_server,
+            scheduled_requests_per_resource,
+            cached_requests_total,
+            cached_requests_per_server,
+            cached_requests_per_resource,
+            config,
         })
     }
     
@@ -212,10 +301,71 @@ impl Metrics {
     pub fn record_flow_failure(&self) {
         self.flow_failures_total.inc();
     }
+    
+    /// Record scheduled request (区分缓存状态)
+    pub fn record_scheduled_request(&self, resource_id: &str, server_id: &str, is_cached: bool) {
+        // 总请求数（包含缓存和非缓存）
+        self.scheduled_requests_total.inc();
+        self.scheduled_requests_per_server
+            .with_label_values(&[server_id]).inc();
+        self.scheduled_requests_per_resource
+            .with_label_values(&[resource_id]).inc();
+        
+        // 如果是缓存请求，额外记录到缓存指标
+        if is_cached {
+            self.cached_requests_total.inc();
+            self.cached_requests_per_server
+                .with_label_values(&[server_id]).inc();
+            self.cached_requests_per_resource
+                .with_label_values(&[resource_id]).inc();
+        }
+    }
+    
+    /// Update bandwidth metrics (在/metrics端点处理时调用)
+    pub async fn update_bandwidth_metrics(&self, redis: &DataStore) {
+        // 更新全局流量
+        if let Ok(global_bw) = redis.get_global_daily_bandwidth().await {
+            self.bandwidth_bytes_today.set(global_bw as f64);
+        }
+        
+        // 实时从配置获取资源ID并更新流量
+        let resource_ids: Vec<String> = {
+            let config = self.config.read().await;
+            config.resources.keys().cloned().collect()
+        };
+        
+        for resource_id in &resource_ids {
+            if let Ok(resource_bw) = redis.get_resource_daily_bandwidth(resource_id).await {
+                self.bandwidth_bytes_today_per_resource
+                    .with_label_values(&[resource_id])
+                    .set(resource_bw as f64);
+            }
+        }
+        
+        // 实时从配置获取服务器ID并更新流量
+        let server_ids: Vec<String> = {
+            let config = self.config.read().await;
+            config.servers.keys().cloned().collect()
+        };
+        
+        for server_id in &server_ids {
+            if let Ok(server_bw) = redis.get_server_daily_bandwidth(server_id).await {
+                self.bandwidth_bytes_today_per_server
+                    .with_label_values(&[server_id])
+                    .set(server_bw as f64);
+            }
+        }
+    }
 }
 
 /// Handler for /metrics endpoint
-pub async fn metrics_handler(State(metrics): State<Arc<Metrics>>) -> Response {
+pub async fn metrics_handler(
+    State(metrics): State<Arc<Metrics>>,
+    State(redis): State<DataStore>
+) -> Response {
+    // 实时更新流量指标
+    metrics.update_bandwidth_metrics(&redis).await;
+    
     let encoder = TextEncoder::new();
     let metric_families = metrics.registry.gather();
     
