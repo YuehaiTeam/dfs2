@@ -1,21 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+use crate::config::SharedConfig;
 use crate::config::AppConfig;
 use super::{VersionCache, PluginVersionProvider};
 
 /// 版本更新器 - 负责后台定时更新版本缓存
 pub struct VersionUpdater {
-    config: Arc<RwLock<AppConfig>>,
+    config: SharedConfig,
     version_cache: Arc<VersionCache>,
     plugin_provider: Arc<PluginVersionProvider>,
 }
 
 impl VersionUpdater {
     pub fn new(
-        config: Arc<RwLock<AppConfig>>,
+        config: SharedConfig,
         version_cache: Arc<VersionCache>,
         plugin_provider: Arc<PluginVersionProvider>,
     ) -> Self {
@@ -53,7 +53,7 @@ impl VersionUpdater {
     
     /// 执行版本更新检查
     async fn update_versions(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let config = self.config.read().await;
+        let config = self.config.load();
         let mut update_count = 0;
         let mut resource_index = 0;
         
@@ -170,7 +170,7 @@ impl VersionUpdater {
         info!("Immediate version update requested for: {}", resource_id);
         
         // 获取资源配置
-        let config = self.config.read().await;
+        let config = self.config.load();
         let resource = config.get_resource(resource_id)
             .ok_or_else(|| crate::error::DfsError::resource_not_found(resource_id))?;
         
@@ -201,7 +201,7 @@ impl VersionUpdater {
     
     /// 获取版本更新统计信息
     pub async fn get_update_stats(&self) -> UpdateStats {
-        let config = self.config.read().await;
+        let config = self.config.load();
         let total_resources = config.resources.len();
         let resources_with_providers = config.resources.iter()
             .filter(|(_, resource)| resource.version_provider.is_some())
@@ -289,9 +289,9 @@ mod tests {
     use std::collections::HashMap;
     use crate::config::{ResourceConfig, VersionProviderConfig};
     use crate::config::DownloadPolicy;
-    use crate::app_state::create_data_store;
+    use modules::storage::app_state::create_data_store;
     
-    async fn create_test_updater() -> (Arc<VersionUpdater>, Arc<RwLock<AppConfig>>) {
+    async fn create_test_updater() -> (Arc<VersionUpdater>, SharedConfig) {
         let mut resources = HashMap::new();
         
         resources.insert(

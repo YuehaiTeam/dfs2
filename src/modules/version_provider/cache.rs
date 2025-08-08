@@ -1,7 +1,7 @@
 use std::time::{SystemTime, Duration};
 use tracing::{debug, error, warn};
 
-use crate::data_store::DataStore;
+use crate::modules::storage::data_store::DataStore;
 use crate::error::{DfsError, DfsResult};
 use super::VersionInfo;
 
@@ -151,30 +151,12 @@ impl VersionCache {
         debug!("Marked version update time for {}: {}", resource_id, timestamp);
         Ok(())
     }
-    
-    /// 清除资源的所有缓存
-    pub async fn clear_cache(&self, resource_id: &str) -> DfsResult<()> {
-        let keys = vec![
-            format!("version_cache:{}", resource_id),
-            format!("version_info:{}", resource_id),
-            format!("version_update_time:{}", resource_id),
-        ];
-        
-        for key in keys {
-            if let Err(e) = self.redis.delete(&key).await {
-                warn!("Failed to delete cache key {}: {}", key, e);
-            }
-        }
-        
-        debug!("Cleared version cache for {}", resource_id);
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::create_data_store;
+    use modules::storage::app_state::create_data_store;
     
     async fn setup_cache() -> VersionCache {
         let data_store = create_data_store().await.expect("Failed to create data store");

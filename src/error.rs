@@ -349,6 +349,14 @@ impl From<&str> for DfsError {
     }
 }
 
+impl From<Box<dyn std::error::Error + Send + Sync>> for DfsError {
+    fn from(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::InternalError {
+            reason: err.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

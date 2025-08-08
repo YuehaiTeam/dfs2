@@ -1,24 +1,22 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
-// use tokio::time::sleep;
 use tracing::{error, info};
 
-use crate::app_state::DataStore;
-use crate::config::AppConfig;
-use crate::analytics::SessionLogger;
+use crate::config::SharedConfig;
+use crate::modules::analytics::SessionLogger;
+use crate::modules::storage::data_store::DataStore;
 
 pub struct SessionCleanupTask {
-    config: Arc<RwLock<AppConfig>>,
+    config: SharedConfig,
     redis: DataStore,
     logger: SessionLogger,
 }
 
 impl SessionCleanupTask {
-    pub fn new(config: Arc<RwLock<AppConfig>>, redis: DataStore) -> Self {
+    pub fn new(config: SharedConfig, redis: DataStore) -> Self {
         let logger = SessionLogger::new(config.clone(), redis.clone());
-        
+
         Self {
             config,
             redis,
@@ -34,14 +32,17 @@ impl SessionCleanupTask {
         }
 
         let interval_minutes = self.get_cleanup_interval();
-        info!("Starting session cleanup task with interval: {} minutes", interval_minutes);
+        info!(
+            "Starting session cleanup task with interval: {} minutes",
+            interval_minutes
+        );
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_minutes * 60));
-            
+
             loop {
                 interval.tick().await;
-                
+
                 if let Err(e) = self.run_cleanup().await {
                     error!("Session cleanup task failed: {}", e);
                 } else {
@@ -57,7 +58,7 @@ impl SessionCleanupTask {
 
         // 获取所有过期的会话ID
         let expired_sessions = self.find_expired_sessions().await?;
-        
+
         if expired_sessions.is_empty() {
             info!("No expired sessions found");
             return Ok(());
@@ -67,7 +68,10 @@ impl SessionCleanupTask {
 
         // 处理每个过期的会话
         for (session_id, resource_id, client_ip) in expired_sessions {
-            if let Err(e) = self.process_expired_session(&session_id, &resource_id, client_ip).await {
+            if let Err(e) = self
+                .process_expired_session(&session_id, &resource_id, client_ip)
+                .await
+            {
                 error!("Failed to process expired session {}: {}", session_id, e);
             } else {
                 info!("Processed expired session: {}", session_id);
@@ -81,9 +85,12 @@ impl SessionCleanupTask {
     async fn find_expired_sessions(&self) -> Result<Vec<(String, String, IpAddr)>, String> {
         let timeout_hours = self._get_session_timeout_hours();
         let timeout_seconds = timeout_hours * 3600;
-        
-        info!("Scanning for expired sessions with timeout: {} hours ({} seconds)", timeout_hours, timeout_seconds);
-        
+
+        info!(
+            "Scanning for expired sessions with timeout: {} hours ({} seconds)",
+            timeout_hours, timeout_seconds
+        );
+
         // 使用数据存储后端的扫描方法
         match self.redis.scan_expired_sessions(timeout_seconds).await {
             Ok(sessions) => {
@@ -105,7 +112,11 @@ impl SessionCleanupTask {
         client_ip: IpAddr,
     ) -> Result<(), String> {
         // 记录超时日志
-        if let Err(e) = self.logger.log_session_timeout(session_id, resource_id, client_ip, None).await {
+        if let Err(e) = self
+            .logger
+            .log_session_timeout(session_id, resource_id, client_ip, None)
+            .await
+        {
             error!("Failed to log timeout for session {}: {}", session_id, e);
         }
 

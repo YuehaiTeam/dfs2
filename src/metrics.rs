@@ -1,15 +1,13 @@
 use prometheus::{Counter, CounterVec, Gauge, GaugeVec, Histogram, Opts, Registry, TextEncoder};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use axum::{
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use tracing::{error, debug};
-use chrono;
-use crate::config::AppConfig;
-use crate::data_store::DataStore;
+use crate::config::SharedConfig;
+use crate::modules::storage::data_store::DataStore;
 
 /// DFS2 Prometheus Metrics
 #[derive(Clone)]
@@ -57,11 +55,11 @@ pub struct Metrics {
     pub cached_requests_per_resource: CounterVec,       // 资源缓存请求数
     
     // 配置引用（用于实时获取ID列表）
-    pub config: Arc<RwLock<AppConfig>>,
+    pub config: SharedConfig,
 }
 
 impl Metrics {
-    pub fn new(config: Arc<RwLock<AppConfig>>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+    pub fn new(config: SharedConfig) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let registry = Arc::new(Registry::new());
         
         // Request metrics
@@ -330,7 +328,7 @@ impl Metrics {
         
         // 实时从配置获取资源ID并更新流量
         let resource_ids: Vec<String> = {
-            let config = self.config.read().await;
+            let config = self.config.load();
             config.resources.keys().cloned().collect()
         };
         
@@ -344,7 +342,7 @@ impl Metrics {
         
         // 实时从配置获取服务器ID并更新流量
         let server_ids: Vec<String> = {
-            let config = self.config.read().await;
+            let config = self.config.load();
             config.servers.keys().cloned().collect()
         };
         

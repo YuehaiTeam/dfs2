@@ -1,6 +1,6 @@
-use crate::app_state::REQWEST_CLIENT;
+use crate::container::REQWEST_CLIENT;
 use crate::config::AppConfig;
-use crate::data_store::{CacheMetadata, DataStoreBackend};
+use crate::modules::storage::data_store::{CacheMetadata, DataStoreBackend};
 use std::sync::Arc;
 use tracing::warn;
 use xxhash_rust::xxh3::xxh3_64;

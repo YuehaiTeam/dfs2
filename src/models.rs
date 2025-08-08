@@ -17,6 +17,7 @@ pub struct Session {
     pub resource_id: String,
     pub version: String,
     pub chunks: Vec<String>,
+    pub sub_path: Option<String>,     // 新增：前缀资源的子路径
     pub cdn_records: HashMap<String, Vec<CdnRecord>>, // chunk_id -> Vec<CdnRecord>
     #[serde(default = "default_empty_json")]
     pub extras: serde_json::Value, // 额外的用户自定义数据
@@ -32,6 +33,8 @@ pub struct CreateSessionRequest {
     pub challenge: String,
     #[serde(default = "default_version")]
     pub version: String,
+    #[serde(default)]
+    pub sub_path: Option<String>,     // 新增：支持前缀资源的sub_path
     #[serde(default = "default_empty_json")]
     pub extras: serde_json::Value,
 }
@@ -69,4 +72,40 @@ pub struct PluginMetadata {
 pub struct DeleteSessionRequest {
     #[serde(default)]
     pub insights: Option<InsightData>,
+}
+
+// Flow上下文结构体 (从domain/flow_context.rs合并)
+use std::net::IpAddr;
+
+/// 目标资源信息 - "我要访问什么"
+#[derive(Debug, Clone)]
+pub struct FlowTarget {
+    pub resource_id: String,
+    pub version: String,
+    pub sub_path: Option<String>,          // 前缀资源的子路径
+    pub file_size: Option<u64>,            // 由外部传入的文件大小
+    pub ranges: Option<Vec<(u32, u32)>>,   // 目标字节范围（由外部解析）
+}
+
+/// 请求上下文信息 - "在什么情况下访问"
+#[derive(Debug, Clone)]  
+pub struct FlowContext {
+    pub client_ip: Option<IpAddr>,
+    pub session_id: Option<String>,
+    pub extras: serde_json::Value,
+}
+
+/// 执行选项 - "如何访问"
+#[derive(Debug, Clone)]
+pub struct FlowOptions {
+    pub cdn_full_range: bool,
+}
+
+/// Flow执行结果
+#[derive(Debug, Clone)]
+pub struct FlowResult {
+    pub url: String,                       // 主要返回值：最终URL
+    pub selected_server_id: Option<String>,
+    pub selected_server_weight: Option<u32>,
+    pub plugin_server_mapping: HashMap<String, (Option<String>, bool)>,  // 插件元数据映射
 }

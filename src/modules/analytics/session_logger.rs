@@ -1,30 +1,28 @@
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Arc;
 use tokio::fs::{OpenOptions, create_dir_all};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::RwLock;
 use tracing::{error, warn};
-use chrono::{DateTime, Utc};
 
-use crate::app_state::DataStore;
-use crate::config::AppConfig;
+use crate::config::SharedConfig;
 use crate::models::InsightData;
-use crate::data_store::SessionStats;
-use crate::analytics::models::*;
+use crate::modules::analytics::models::*;
+use crate::modules::storage::data_store::DataStore;
+use crate::modules::storage::data_store::SessionStats;
 
 pub struct SessionLogger {
-    config: Arc<RwLock<AppConfig>>,
+    config: SharedConfig,
     redis: DataStore,
     log_path: String,
 }
 
 impl SessionLogger {
-    pub fn new(config: Arc<RwLock<AppConfig>>, redis: DataStore) -> Self {
-        let log_path = std::env::var("SESSION_LOG_PATH")
-            .unwrap_or_else(|_| "logs/sessions".to_string());
-        
+    pub fn new(config: SharedConfig, redis: DataStore) -> Self {
+        let log_path =
+            std::env::var("SESSION_LOG_PATH").unwrap_or_else(|_| "logs/sessions".to_string());
+
         Self {
             config,
             redis,
@@ -41,20 +39,25 @@ impl SessionLogger {
         user_agent: Option<String>,
         insights: Option<InsightData>,
     ) -> Result<(), String> {
-        let session_stats = self.redis.get_session_stats(session_id).await
+        let session_stats = self
+            .redis
+            .get_session_stats(session_id)
+            .await
             .map_err(|e| format!("Failed to get session stats: {}", e))?;
 
         if let Some(stats) = session_stats {
-            let session_log = self.build_session_log(
-                "session_completed",
-                Some(session_id.to_string()),
-                resource_id,
-                client_ip,
-                user_agent,
-                &stats,
-                insights,
-                "client_terminated",
-            ).await?;
+            let session_log = self
+                .build_session_log(
+                    "session_completed",
+                    Some(session_id.to_string()),
+                    resource_id,
+                    client_ip,
+                    user_agent,
+                    &stats,
+                    insights,
+                    "client_terminated",
+                )
+                .await?;
 
             self.write_log(&session_log).await
         } else {
@@ -70,24 +73,32 @@ impl SessionLogger {
         client_ip: IpAddr,
         user_agent: Option<String>,
     ) -> Result<(), String> {
-        let session_stats = self.redis.get_session_stats(session_id).await
+        let session_stats = self
+            .redis
+            .get_session_stats(session_id)
+            .await
             .map_err(|e| format!("Failed to get session stats: {}", e))?;
 
         if let Some(stats) = session_stats {
-            let session_log = self.build_session_log(
-                "session_timeout",
-                Some(session_id.to_string()),
-                resource_id,
-                client_ip,
-                user_agent,
-                &stats,
-                None,
-                "timeout",
-            ).await?;
+            let session_log = self
+                .build_session_log(
+                    "session_timeout",
+                    Some(session_id.to_string()),
+                    resource_id,
+                    client_ip,
+                    user_agent,
+                    &stats,
+                    None,
+                    "timeout",
+                )
+                .await?;
 
             self.write_log(&session_log).await
         } else {
-            warn!("Session {} not found when trying to log timeout", session_id);
+            warn!(
+                "Session {} not found when trying to log timeout",
+                session_id
+            );
             Ok(())
         }
     }
@@ -186,7 +197,7 @@ impl SessionLogger {
         let chunk = ChunkLog {
             range: "full_file".to_string(),
             download_attempts: 0, // 缓存命中无需下载尝试
-            cdn_records: vec![], // 缓存命中不记录CDN记录
+            cdn_records: vec![],  // 缓存命中不记录CDN记录
         };
 
         let session_log = SessionLog {
@@ -220,8 +231,9 @@ impl SessionLogger {
         insights: Option<InsightData>,
         completion_reason: &str,
     ) -> Result<SessionLog, String> {
-        let config_guard = self.config.read().await;
-        let resource_config = config_guard.get_resource(resource_id)
+        let config_guard = self.config.load();
+        let resource_config = config_guard
+            .get_resource(resource_id)
             .ok_or_else(|| format!("Resource {} not found", resource_id))?;
 
         let now = Utc::now();
@@ -238,13 +250,24 @@ impl SessionLogger {
 
         let session_stats = SessionStatsLog {
             created_at: created_at.clone(),
-            completed_at: if log_type == "session_timeout" { None } else { Some(now.to_rfc3339()) },
-            timeout_at: if log_type == "session_timeout" { Some(now.to_rfc3339()) } else { None },
+            completed_at: if log_type == "session_timeout" {
+                None
+            } else {
+                Some(now.to_rfc3339())
+            },
+            timeout_at: if log_type == "session_timeout" {
+                Some(now.to_rfc3339())
+            } else {
+                None
+            },
             duration_ms: 0, // 暂时设为0，后续可以计算实际时长
             total_chunks,
             successful_downloads,
             failed_downloads,
-            success_rate: SessionStatsLog::calculate_success_rate(successful_downloads, total_chunks),
+            success_rate: SessionStatsLog::calculate_success_rate(
+                successful_downloads,
+                total_chunks,
+            ),
             completion_reason: completion_reason.to_string(),
         };
 
@@ -257,23 +280,34 @@ impl SessionLogger {
             let empty_records = Vec::new();
             let cdn_records = stats.cdn_records.get(chunk_id).unwrap_or(&empty_records);
 
-            let cdn_record_logs: Vec<CdnRecordLog> = cdn_records.iter().map(|record| {
-                // 统计服务器使用
-                if let Some(server_id) = &record.server_id {
-                    *server_usage.entry(server_id.clone()).or_insert(0) += 1;
-                }
+            let cdn_record_logs: Vec<CdnRecordLog> = cdn_records
+                .iter()
+                .map(|record| {
+                    // 统计服务器使用
+                    if let Some(server_id) = &record.server_id {
+                        *server_usage.entry(server_id.clone()).or_insert(0) += 1;
+                    }
 
-                CdnRecordLog {
-                    url: record.url.clone(),
-                    server_id: record.server_id.clone().unwrap_or_else(|| "unknown".to_string()),
-                    server_weight: record.weight,
-                    timestamp: DateTime::from_timestamp(record.timestamp as i64, 0)
-                        .unwrap_or_else(|| Utc::now())
-                        .to_rfc3339(),
-                    skip_penalty: record.skip_penalty,
-                    selection_reason: if record.skip_penalty { "retry_fallback" } else { "flow_selected" }.to_string(),
-                }
-            }).collect();
+                    CdnRecordLog {
+                        url: record.url.clone(),
+                        server_id: record
+                            .server_id
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        server_weight: record.weight,
+                        timestamp: DateTime::from_timestamp(record.timestamp as i64, 0)
+                            .unwrap_or_else(|| Utc::now())
+                            .to_rfc3339(),
+                        skip_penalty: record.skip_penalty,
+                        selection_reason: if record.skip_penalty {
+                            "retry_fallback"
+                        } else {
+                            "flow_selected"
+                        }
+                        .to_string(),
+                    }
+                })
+                .collect();
 
             chunks.push(ChunkLog {
                 range: chunk_id.clone(),
@@ -293,7 +327,8 @@ impl SessionLogger {
             crate::config::DownloadPolicy::Enabled => "enabled",
             crate::config::DownloadPolicy::Free => "free",
             crate::config::DownloadPolicy::Disabled => "disabled",
-        }.to_string();
+        }
+        .to_string();
 
         Ok(SessionLog {
             timestamp: now.to_rfc3339(),

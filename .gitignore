@@ -2,6 +2,7 @@ target/
 config.yaml
 plugins/private*
 data_store/
+logs/*
 *.yaml
 *.mmdb
 *.toml

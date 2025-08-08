@@ -1,5 +1,5 @@
 use super::*;
-use crate::data_store::{DataStore, FileDataStore};
+use crate::modules::storage::data_store::{DataStore, FileDataStore};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tempdir::TempDir;
@@ -23,28 +23,27 @@ fn create_test_config() -> Arc<RwLock<crate::config::AppConfig>> {
     };
 
     // 添加测试插件 - 参数顺序匹配实际插件签名 (options, resourceId, extras)
-    config.plugin_code.insert("version_provider_test".to_string(), r#"
-        exports = async function(options, resourceId, extras) {
-            if (resourceId === "test_resource") {
-                return {
-                    version: "1.0.0",
-                    changelog: "## Test Release v1.0.0\n- Initial release\n- Basic functionality",
-                    metadata: {
-                        release_name: "Test Release",
-                        published_at: "2023-01-01T00:00:00Z"
-                    }
-                };
-            } else if (resourceId === "error_resource") {
-                throw new Error("Test error");
-            } else {
-                return {
-                    version: "0.0.0",
-                    changelog: null,
-                    metadata: null
-                };
-            }
-        };
-    "#.to_string());
+    config.plugin_code.insert("version_provider_test".to_string(),
+        "exports = async function(options, resourceId, extras) {\
+            if (resourceId === \"test_resource\") {\
+                return {\
+                    version: \"1.0.0\",\
+                    changelog: \"## Test Release v1.0.0\\n- Initial release\\n- Basic functionality\",\
+                    metadata: {\
+                        release_name: \"Test Release\",\
+                        published_at: \"2023-01-01T00:00:00Z\"\
+                    }\
+                };\
+            } else if (resourceId === \"error_resource\") {\
+                throw new Error(\"Test error\");\
+            } else {\
+                return {\
+                    version: \"0.0.0\",\
+                    changelog: null,\
+                    metadata: null\
+                };\
+            }\
+        };".to_string());
 
     Arc::new(RwLock::new(config))
 }
@@ -179,7 +178,7 @@ async fn test_updater_error_handling() {
     let js_runner = crate::modules::qjs::JsRunner::new(config.clone(), data_store.clone()).await;
     let provider = Arc::new(PluginVersionProvider::new(js_runner, config.clone()));
     let cache = Arc::new(VersionCache::new(data_store));
-    let updater = VersionUpdater::new(provider, cache, config);
+    let updater = VersionUpdater::new(config, cache, provider);
 
     // 测试不存在的资源
     let result = updater.update_resource_immediately("nonexistent_resource").await;

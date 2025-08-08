@@ -1,11 +1,10 @@
 use bytes::Bytes;
 use serde_json::{Value, json};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 
-use crate::app_state::REQWEST_CLIENT;
-use crate::config::AppConfig;
-use crate::modules::flow::runner::{FlowRunner, RunFlowParams};
+use crate::container::REQWEST_CLIENT;
+use crate::config::SharedConfig;
+use crate::services::FlowService;
+use crate::models::{FlowTarget, FlowContext, FlowOptions};
 
 /// KachinaInstaller 解析结果
 #[derive(Debug)]
@@ -159,14 +158,14 @@ pub fn parse_file_header(data: &[u8]) -> Result<Value, String> {
 /// # Returns
 /// 返回 Result<Bytes, String>，成功时包含文件字节数据，失败时包含错误信息
 pub async fn fetch_file_range(
-    config: &Arc<RwLock<AppConfig>>,
-    runner: &FlowRunner,
+    shared_config: &SharedConfig,
+    flow_service: &FlowService,
     resid: &str,
     version: Option<&str>,
     ranges: Option<Vec<(u32, u32)>>,
 ) -> Result<Bytes, String> {
     // 读锁访问配置
-    let config_guard = config.read().await;
+    let config_guard = shared_config.load();
 
     // 检查资源是否存在
     let resource_config = match config_guard.get_resource(resid) {
@@ -184,15 +183,21 @@ pub async fn fetch_file_range(
         return Err(E_VERSION_NOT_FOUND.to_string());
     }
 
-    // 获取版本对应的路径
-    let path = match config_guard.get_version_path(resid, target_version, None) {
-        Some(p) => p,
+    // 获取版本对应的路径（简化版本）
+    let path = if let Some(version_map) = resource_config.versions.get(target_version) {
+        version_map.get("default")
+    } else {
+        resource_config.versions.get("default").and_then(|default_template| default_template.get("default"))
+    };
+    
+    let path = match path {
+        Some(p) => p.replace("${version}", target_version),
         None => {
             return Err(E_PATH_NOT_FOUND.to_string());
         }
     };
 
-    // 使用 FlowRunner 获取文件的下载 URL
+    // 使用 FlowService 获取文件的下载 URL
     let flow_list = &resource_config.flow;
     // 根据range计算文件大小
     let request_file_size = if let Some(ref ranges) = ranges {
@@ -201,27 +206,29 @@ pub async fn fetch_file_range(
         None // 没有range时不知道文件大小
     };
 
-    let mut params = RunFlowParams {
+    // 构建新的Flow参数结构
+    let target = FlowTarget {
+        resource_id: resid.to_string(),
+        version: target_version.to_string(),
+        sub_path: None, // Kachina解析时不处理子路径
         ranges: ranges.clone(),
-        extras: serde_json::json!({}),
-        session_id: None,
+        file_size: request_file_size,
+    };
+
+    let context = FlowContext {
         client_ip: None, // Kachina解析通常不需要客户端IP信息
-        file_size: request_file_size, // 使用请求的range大小
-        plugin_server_mapping: std::collections::HashMap::new(), // 初始化插件服务器映射
-        resource_id: resid.to_string(),                         // 新增：资源ID
-        version: target_version.to_string(),                    // 使用确定的版本
-        sub_path: None,                                         // Kachina解析时不处理子路径
-        selected_server_id: None,                               // 初始化为None，由poolize函数设置
-        selected_server_weight: None,                        // 初始化为None，由poolize函数设置
+        session_id: None,
+        extras: serde_json::json!({}),
+    };
+
+    let options = FlowOptions {
         cdn_full_range: false, // Kachina解析不使用全范围模式
     };
 
-    let cdn_url = match runner.run_flow(flow_list, &mut params).await {
-        Ok(url) => url,
-        Err(e) => {
-            return Err(format!("{}: {}", E_FLOW_EXECUTION_FAILED, e));
-        }
-    };
+    // 执行Flow获取URL
+    let flow_result = flow_service.execute_flow(&target, &context, &options, flow_list, vec![]).await
+        .map_err(|e| format!("{}: {}", E_FLOW_EXECUTION_FAILED, e))?;
+    let cdn_url = flow_result.url;
 
     // 构建 Range 头部
     let range_header = if let Some(ranges) = &ranges {
@@ -420,14 +427,14 @@ pub fn parse_index_data(index_data: &[u8], index_start: u32) -> Value {
 /// # Returns
 /// 返回 Result<Option<KachinaMetadata>, String>，成功时返回解析结果，None表示不是KachinaInstaller文件
 pub async fn parse_kachina_metadata(
-    config: &Arc<RwLock<AppConfig>>,
-    runner: &FlowRunner,
+    shared_config: &SharedConfig,
+    flow_service: &FlowService,
     resid: &str,
     version: Option<&str>,
 ) -> Result<Option<KachinaMetadata>, String> {
     // 获取文件的前256字节
     let header_bytes =
-        fetch_file_range(config, runner, resid, version, Some(vec![(0, 255)])).await?;
+        fetch_file_range(shared_config, flow_service, resid, version, Some(vec![(0, 255)])).await?;
 
     // 解析文件头部信息
     let parsed_header = parse_file_header(&header_bytes)?;
@@ -461,8 +468,8 @@ pub async fn parse_kachina_metadata(
 
     // 下载索引数据
     let index_data = fetch_file_range(
-        config,
-        runner,
+        shared_config,
+        flow_service,
         resid,
         version,
         Some(vec![(index_start, data_end - 1)]),

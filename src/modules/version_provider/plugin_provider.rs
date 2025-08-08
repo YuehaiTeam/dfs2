@@ -1,27 +1,25 @@
 use serde_json::json;
-use std::sync::Arc;
-use tokio::sync::RwLock;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use super::{VersionInfo, VersionProvider};
-use crate::config::AppConfig;
+use crate::config::SharedConfig;
 use crate::error::{DfsError, DfsResult};
 use crate::modules::qjs::JsRunner;
 
 /// 基于插件的版本提供者
 pub struct PluginVersionProvider {
     js_runner: JsRunner,
-    config: Arc<RwLock<AppConfig>>,
+    config: SharedConfig,
 }
 
 impl PluginVersionProvider {
-    pub fn new(js_runner: JsRunner, config: Arc<RwLock<AppConfig>>) -> Self {
+    pub fn new(js_runner: JsRunner, config: SharedConfig) -> Self {
         Self { js_runner, config }
     }
 
     /// 通过插件获取资源版本
     pub async fn fetch_version(&self, resource_id: &str) -> DfsResult<String> {
-        let config_guard = self.config.read().await;
+        let config_guard = self.config.load();
 
         // 获取资源配置
         let resource = config_guard
@@ -79,7 +77,7 @@ impl PluginVersionProvider {
 
     /// 通过插件获取详细版本信息
     pub async fn fetch_version_info(&self, resource_id: &str) -> DfsResult<VersionInfo> {
-        let config_guard = self.config.read().await;
+        let config_guard = self.config.load();
 
         // 获取资源配置
         let resource = config_guard
@@ -179,8 +177,8 @@ impl JsRunner {
         extras: &serde_json::Value,
     ) -> DfsResult<serde_json::Value> {
         // 验证插件存在
-        let config = self.get_config();
-        let config_guard = config.read().await;
+        let config = self.get_shared_config();
+        let config_guard = config.load();
         let plugin_code = config_guard
             .plugin_code
             .get(plugin_name)

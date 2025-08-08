@@ -1,4 +1,4 @@
-use crate::data_store::{DataStoreBackend, SessionStats, CacheMetadata};
+use crate::modules::storage::data_store::{DataStoreBackend, SessionStats, CacheMetadata};
 use crate::models::{Session, CdnRecord};
 use crate::modules::server::HealthInfo;
 use redis::{AsyncCommands, Client};
@@ -48,6 +48,11 @@ impl DataStoreBackend for RedisDataStore {
             )
             .hset(
                 &session_key,
+                "sub_path",
+                serde_json::to_string(&session.sub_path).map_err(|e| e.to_string())?,
+            )
+            .hset(
+                &session_key,
                 "cdn_records",
                 serde_json::to_string(&session.cdn_records).map_err(|e| e.to_string())?,
             )
@@ -78,12 +83,13 @@ impl DataStoreBackend for RedisDataStore {
         let key = self.redis_key("session", sid);
 
         // 使用Pipeline一次获取所有字段
-        let (resource_id, version, chunks, cdn_records, extras): (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) =
+        let (resource_id, version, chunks, sub_path, cdn_records, extras): (Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>) =
             redis::pipe()
                 .atomic()
                 .hget(&key, "resource_id")
                 .hget(&key, "version")
                 .hget(&key, "chunks")
+                .hget(&key, "sub_path")
                 .hget(&key, "cdn_records")
                 .hget(&key, "extras")
                 .query_async(&mut conn)
@@ -95,6 +101,8 @@ impl DataStoreBackend for RedisDataStore {
                 let chunks: Vec<String> = serde_json::from_str(&chunks_json).unwrap_or_default();
                 let cdn_records: HashMap<String, Vec<CdnRecord>> =
                     serde_json::from_str(&cdn_records_json).unwrap_or_default();
+                let sub_path_value: Option<String> = sub_path
+                    .and_then(|s| serde_json::from_str(&s).ok());
                 let extras: serde_json::Value = extras
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_else(|| serde_json::json!({}));
@@ -102,6 +110,7 @@ impl DataStoreBackend for RedisDataStore {
                     resource_id,
                     version,
                     chunks,
+                    sub_path: sub_path_value,
                     cdn_records,
                     extras,
                 }))
@@ -179,18 +188,6 @@ impl DataStoreBackend for RedisDataStore {
     }
 
 
-    async fn update_session_chunks(&self, sid: &str, chunks: &[String]) -> Result<bool, String> {
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| e.to_string())?;
-        let key = self.redis_key("session", sid);
-
-        let chunks_json = serde_json::to_string(chunks).map_err(|e| e.to_string())?;
-        let exists: bool = conn.hset(&key, "chunks", chunks_json).await.map_err(|e| e.to_string())?;
-        if exists {
-            let _: () = conn.expire(&key, 3600).await.map_err(|e| e.to_string())?;
-        }
-        Ok(exists)
-    }
 
 
     async fn update_cdn_record_v2(&self, sid: &str, chunk: &str, record: CdnRecord) -> Result<(), String> {
@@ -556,7 +553,7 @@ impl DataStoreBackend for RedisDataStore {
         Ok(result.and_then(|s| s.parse().ok()).unwrap_or(0))
     }
     
-    async fn update_bandwidth_batch(&self, batch: crate::data_store::BandwidthUpdateBatch) -> Result<(), String> {
+    async fn update_bandwidth_batch(&self, batch: crate::modules::storage::data_store::BandwidthUpdateBatch) -> Result<(), String> {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| e.to_string())?;
         

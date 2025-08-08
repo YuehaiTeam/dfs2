@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use rquickjs::{AsyncContext, AsyncRuntime, Context, FromJs, Promise, Runtime, Value, async_with};
-use tokio::sync::RwLock;
 use tracing::{error, warn};
 
-use crate::{app_state::DataStore, config::AppConfig};
 use llrt_modules::module_builder::ModuleBuilder;
+
+use crate::{config::SharedConfig, modules::storage::data_store::DataStore};
 thread_local! {
     static JS_CONTEXT: Context = {
         let runtime = Runtime::new()
@@ -25,7 +23,7 @@ thread_local! {
 
 #[derive(Clone)]
 pub struct JsRunner {
-    config: Arc<RwLock<AppConfig>>,
+    config: SharedConfig,
     redis: DataStore,
     context: AsyncContext,
 }
@@ -91,7 +89,7 @@ pub async fn js_dfsnodesign(
 }
 
 impl JsRunner {
-    pub async fn new(config: Arc<RwLock<AppConfig>>, redis: DataStore) -> Self {
+    pub async fn new(config: SharedConfig, redis: DataStore) -> Self {
         let runtime = AsyncRuntime::new()
             .map_err(|e| {
                 error!("Failed to create async JS runtime: {}", e);
@@ -157,16 +155,16 @@ impl JsRunner {
             redis,
         }
     }
-    pub fn get_config(&self) -> Arc<RwLock<AppConfig>> {
+    pub fn get_shared_config(&self) -> SharedConfig {
         self.config.clone()
     }
-    
+
     pub async fn execute_async(&self, code: &str) -> anyhow::Result<serde_json::Value> {
         self.eval(code.to_string()).await
     }
-    
+
     pub async fn eval(&self, code: String) -> anyhow::Result<serde_json::Value> {
-        let config = self.config.read().await.clone();
+        let config = (**self.config.load()).clone(); // 双重解包：Arc<AppConfig> -> AppConfig
         let ret = async_with!(self.context => |ctx| {
             let globals = ctx.globals();
             globals.set("_dfs_config", config)?;
@@ -194,6 +192,76 @@ impl JsRunner {
         })
         .await?;
         Ok(ret)
+    }
+
+    /// 运行挑战验证插件
+    pub async fn run_challenge_plugin(
+        &self,
+        plugin_id: &str,
+        context: &str,
+        challenge_data: serde_json::Value,
+        extras: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        if let Some(code) = self
+            .get_challenge_plugin_code(plugin_id, context, challenge_data, extras)
+            .await
+        {
+            let result = self.eval(code).await?;
+            Ok(result)
+        } else {
+            Err(anyhow::anyhow!("Challenge plugin {} not found", plugin_id))
+        }
+    }
+
+    /// 获取挑战插件代码
+    async fn get_challenge_plugin_code(
+        &self,
+        id: &str,
+        context: &str, // "generate" or "verify"
+        challenge_data: serde_json::Value,
+        extras: serde_json::Value,
+    ) -> Option<String> {
+        let config = self.config.load();
+        let plugin_options = config.plugins.get(id);
+        if let Some(code) = config.plugin_code.get(id) {
+            return Some(format!(
+                r#"
+            (async (context, challengeData, options, extras, exports) => {{
+                /* USER CODE START */
+                {}
+                /* USER CODE END */
+                let ret = await exports?.(context, challengeData, options, extras);
+                return ret;
+            }})({}, {}, {}, {})"#,
+                code,
+                serde_json::to_string(context)
+                    .map_err(|e| {
+                        tracing::error!("Failed to serialize context: {}", e);
+                        e
+                    })
+                    .unwrap_or_else(|_| "\"\"".to_string()),
+                serde_json::to_string(&challenge_data)
+                    .map_err(|e| {
+                        tracing::error!("Failed to serialize challenge data: {}", e);
+                        e
+                    })
+                    .unwrap_or_else(|_| "{}".to_string()),
+                serde_json::to_string(&plugin_options.unwrap_or(&serde_json::Value::Null))
+                    .map_err(|e| {
+                        tracing::error!("Failed to serialize plugin options: {}", e);
+                        e
+                    })
+                    .unwrap_or_else(|_| "null".to_string()),
+                serde_json::to_string(&extras)
+                    .map_err(|e| {
+                        tracing::error!("Failed to serialize extras: {}", e);
+                        e
+                    })
+                    .unwrap_or_else(|_| "{}".to_string()),
+            ));
+        }
+        tracing::warn!("Challenge plugin {} not found", id);
+        None
     }
 }
 
@@ -273,8 +341,9 @@ impl From<JsonValue> for serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::DataStore;
+    use crate::modules::storage::data_store::DataStore;
     use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
 
     async fn create_test_js_runner() -> JsRunner {
         let config = Arc::new(RwLock::new(crate::config::AppConfig {
@@ -287,7 +356,9 @@ mod tests {
             challenge: crate::config::ChallengeConfig::default(),
         }));
 
-        let redis_store = crate::data_store::FileDataStore::new().await.expect("Failed to create test data store");
+        let redis_store = crate::modules::storage::data_store::FileDataStore::new()
+            .await
+            .expect("Failed to create test data store");
         let data_store = std::sync::Arc::new(redis_store) as DataStore;
 
         JsRunner::new(config, data_store).await
@@ -296,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn test_js_runner_creation() {
         let js_runner = create_test_js_runner().await;
-        
+
         // Verify the runner was created (we can't access private field, so just check it exists)
         assert!(std::ptr::addr_of!(js_runner.redis) as *const _ != std::ptr::null());
     }
@@ -358,12 +429,12 @@ mod tests {
 
         let result = js_runner.eval(test_code.to_string()).await;
         assert!(result.is_ok());
-        
+
         let json_result = result.unwrap();
         if let Some(error) = json_result.get("error") {
             panic!("Redis integration test failed: {}", error);
         }
-        
+
         // The test should succeed whether Redis is available or not
         assert_eq!(json_result["success"], true);
         assert_eq!(json_result["functions_exist"], true);
@@ -401,14 +472,14 @@ mod tests {
 
         let result = js_runner.eval(plugin_code.to_string()).await;
         assert!(result.is_ok());
-        
+
         let json_result = result.unwrap();
         // The result should be an array with [false, result_object]
         assert!(json_result.is_array());
         let result_array = json_result.as_array().unwrap();
         assert_eq!(result_array.len(), 2);
         assert_eq!(result_array[0], serde_json::json!(false));
-        
+
         let result_obj = &result_array[1];
         assert_eq!(result_obj["pool_length"], 2);
         assert_eq!(result_obj["indirect_type"], "string");
@@ -434,7 +505,7 @@ mod tests {
 
         let result = js_runner.eval(s3_test_code.to_string()).await;
         assert!(result.is_ok());
-        
+
         let json_result = result.unwrap();
         assert_eq!(json_result["function_exists"], true);
         assert_eq!(json_result["result_type"], "string");
@@ -458,7 +529,7 @@ mod tests {
 
         let result = js_runner.eval(dfs_test_code.to_string()).await;
         assert!(result.is_ok());
-        
+
         let json_result = result.unwrap();
         assert_eq!(json_result["function_exists"], true);
         assert_eq!(json_result["result_type"], "string");

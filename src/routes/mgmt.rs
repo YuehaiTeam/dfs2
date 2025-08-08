@@ -8,15 +8,14 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use crate::app_state::DataStore;
-use crate::config::AppConfig;
+use crate::config::SharedConfig;
+use crate::container::AppContext;
 use crate::error::{DfsError, DfsResult};
-use crate::modules::geolocation;
+use crate::modules::external::geolocation;
+use crate::modules::storage::data_store::DataStore;
 use crate::responses::{ApiResponse, EmptyResponse, ErrorResponse};
 
 /// 管理接口鉴权中间件
@@ -102,15 +101,12 @@ pub async fn ping() -> impl IntoResponse {
         (status = 401, description = "Unauthorized - invalid or missing management token")
     )
 )]
-#[tracing::instrument(skip(config, redis))]
-pub async fn health_check(
-    Extension(config): Extension<Arc<RwLock<AppConfig>>>,
-    Extension(redis): Extension<DataStore>,
-) -> impl IntoResponse {
+#[tracing::instrument(skip(ctx))]
+pub async fn health_check(Extension(ctx): Extension<AppContext>) -> impl IntoResponse {
     info!("Health check requested");
 
     // 检查Redis连接状态
-    let redis_status = match test_redis_connection(&redis).await {
+    let redis_status = match test_redis_connection(&ctx.data_store).await {
         Ok(_) => "connected".to_string(),
         Err(e) => {
             warn!("Redis connection check failed: {}", e);
@@ -119,7 +115,7 @@ pub async fn health_check(
     };
 
     // 读取配置信息
-    let config_guard = config.read().await;
+    let config_guard = ctx.get_config();
     let plugin_count = config_guard.plugin_code.len();
     let server_count = config_guard.servers.len();
 
@@ -163,16 +159,11 @@ pub async fn health_check(
         (status = 401, description = "Unauthorized - invalid or missing management token")
     )
 )]
-pub async fn reload_config(
-    Extension(config): Extension<Arc<RwLock<AppConfig>>>,
-) -> impl IntoResponse {
+pub async fn reload_config(Extension(ctx): Extension<AppContext>) -> impl IntoResponse {
     info!("Configuration reload requested");
 
-    match AppConfig::load().await {
-        Ok(new_config) => {
-            // 获取写锁并更新配置
-            let mut write_lock = config.write().await;
-            *write_lock = new_config;
+    match ctx.shared_config.reload_from_file().await {
+        Ok(()) => {
             info!("Configuration reloaded successfully");
             (
                 StatusCode::OK,
@@ -202,12 +193,9 @@ pub async fn reload_config(
     )
 )]
 #[axum::debug_handler]
-pub async fn metrics_handler(
-    Extension(metrics): Extension<Arc<crate::metrics::Metrics>>,
-    Extension(redis): Extension<DataStore>,
-) -> impl IntoResponse {
+pub async fn metrics_handler(Extension(ctx): Extension<AppContext>) -> impl IntoResponse {
     use axum::extract::State;
-    crate::metrics::metrics_handler(State(metrics), State(redis)).await
+    crate::metrics::metrics_handler(State(ctx.metrics), State(ctx.data_store)).await
 }
 
 /// IP地理位置查询参数
@@ -310,25 +298,27 @@ async fn test_redis_connection(redis: &DataStore) -> DfsResult<()> {
 pub async fn refresh_version(
     Path(resource_id): Path<String>,
     headers: HeaderMap,
-    Extension(config): Extension<Arc<RwLock<AppConfig>>>,
-    Extension(version_updater): Extension<Arc<crate::modules::version_provider::VersionUpdater>>,
-    Extension(version_cache): Extension<Arc<crate::modules::version_provider::VersionCache>>,
+    Extension(ctx): Extension<AppContext>,
 ) -> impl IntoResponse {
     info!("Version refresh requested for resource: {}", resource_id);
 
     // 双重鉴权检查
-    if let Err(status) = validate_refresh_token(&headers, &resource_id, &config).await {
-        return (status, Json(ApiResponse::error("Unauthorized access".to_string()))).into_response();
+    if let Err(status) = validate_refresh_token(&headers, &resource_id, &ctx.shared_config).await {
+        return (
+            status,
+            Json(ApiResponse::error("Unauthorized access".to_string())),
+        )
+            .into_response();
     }
 
-    // 获取当前缓存的版本
-    let old_version = version_cache.get_cached_version(&resource_id).await;
+    // 获取当前缓存的版本 - 使用ResourceService保持架构层次
+    let old_version = ctx.resource_service.get_cached_version(&resource_id).await;
 
-    // 执行版本刷新
-    match version_updater.update_resource_immediately(&resource_id).await {
+    // 执行版本刷新 - 使用ResourceService保持架构层次
+    match ctx.resource_service.refresh_version(&resource_id).await {
         Ok(new_version) => {
             let updated = old_version.as_ref().map_or(true, |old| old != &new_version);
-            
+
             let response = VersionRefreshResponse {
                 resource_id: resource_id.clone(),
                 old_version,
@@ -338,11 +328,14 @@ pub async fn refresh_version(
                     format!("Version updated to {}", new_version)
                 } else {
                     format!("Version {} is already current", new_version)
-                }
+                },
             };
 
-            info!("Version refresh completed for {}: {}", resource_id, 
-                  if updated { "updated" } else { "no change" });
+            info!(
+                "Version refresh completed for {}: {}",
+                resource_id,
+                if updated { "updated" } else { "no change" }
+            );
 
             (StatusCode::OK, Json(response)).into_response()
         }
@@ -350,8 +343,9 @@ pub async fn refresh_version(
             error!("Version refresh failed for {}: {}", resource_id, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(format!("Version refresh failed: {}", e)))
-            ).into_response()
+                Json(ApiResponse::error(format!("Version refresh failed: {}", e))),
+            )
+                .into_response()
         }
     }
 }
@@ -360,15 +354,16 @@ pub async fn refresh_version(
 async fn validate_refresh_token(
     headers: &HeaderMap,
     resource_id: &str,
-    config: &Arc<RwLock<AppConfig>>,
+    config: &SharedConfig,
 ) -> Result<(), StatusCode> {
     // 提取Authorization头
-    let auth_header = headers.get("Authorization")
+    let auth_header = headers
+        .get("Authorization")
         .and_then(|h| h.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    let config_guard = config.read().await;
+    let config_guard = config.load();
 
     // 方式1: 检查全局管理token
     if let Ok(mgmt_token) = std::env::var("MGMT_API_TOKEN") {
@@ -390,16 +385,18 @@ async fn validate_refresh_token(
         }
     }
 
-    warn!("Unauthorized version refresh attempt for resource: {}", resource_id);
+    warn!(
+        "Unauthorized version refresh attempt for resource: {}",
+        resource_id
+    );
     Err(StatusCode::UNAUTHORIZED)
 }
 
 /// 创建管理路由，包含鉴权中间件
 pub fn routes() -> Router {
     // 版本刷新端点 - 使用独立的双重鉴权，不经过mgmt中间件
-    let version_routes = Router::new()
-        .route("/refresh/{resource_id}", post(refresh_version));
-    
+    let version_routes = Router::new().route("/refresh/{resource_id}", post(refresh_version));
+
     // 其他管理端点 - 使用标准mgmt鉴权中间件
     let mgmt_routes = Router::new()
         .route("/mgmt/ping", get(ping))
@@ -408,7 +405,7 @@ pub fn routes() -> Router {
         .route("/mgmt/metrics", get(metrics_handler))
         .route("/mgmt/geoip", get(geoip_lookup))
         .layer(middleware::from_fn(mgmt_auth_middleware));
-    
+
     // 合并路由
     version_routes.merge(mgmt_routes)
 }

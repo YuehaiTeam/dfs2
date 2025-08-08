@@ -1,41 +1,42 @@
-mod app_state;
-mod analytics;
-mod cache;
-mod challenge;
 mod config;
-mod data_store;
-mod docs;
+mod container;
 mod error;
-mod legacy_client;
 mod metrics;
 mod models;
 mod modules;
-mod redis_data_store;
 mod responses;
 mod routes;
+mod services;
 mod validation;
 
-use app_state::create_data_store;
-use axum::{Router, routing::get, http::Request, middleware::{self, Next}, response::Response, extract::ConnectInfo, body::Body};
+use axum::{
+    Router,
+    body::Body,
+    extract::ConnectInfo,
+    http::Request,
+    middleware::{self, Next},
+    response::Response,
+};
 use clap::Parser;
-use config::AppConfig;
-use docs::{create_docs_router, is_openapi_docs_enabled};
-use metrics::Metrics;
+use container::AppContainer;
 use dotenv::dotenv;
 use error::{DfsError, DfsResult};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validation::ConfigValidator;
+
+use crate::modules::{analytics, network::RealConnectInfo};
 
 /// DFS2 - Distributed File System Server
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Validate configuration and plugins only, then exit
-    #[arg(long, help = "Validate configuration and plugins, then exit without starting the server")]
+    #[arg(
+        long,
+        help = "Validate configuration and plugins, then exit without starting the server"
+    )]
     validate_only: bool,
 }
 
@@ -55,8 +56,6 @@ fn init_tracing() -> DfsResult<()> {
     Ok(())
 }
 
-use dfs2::RealConnectInfo;
-
 // 中间件函数来处理真实IP提取
 async fn real_ip_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -65,17 +64,17 @@ async fn real_ip_middleware(
 ) -> Response {
     // 从请求头中提取真实IP
     let real_connect_info = RealConnectInfo::from_headers_and_addr(req.headers(), addr);
-    
+
     // 将真实连接信息添加到请求扩展中
     req.extensions_mut().insert(real_connect_info);
-    
+
     next.run(req).await
 }
 
 #[tokio::main]
 async fn main() -> DfsResult<()> {
     dotenv().ok();
-    
+
     // 解析命令行参数
     let args = Args::parse();
 
@@ -88,34 +87,22 @@ async fn main() -> DfsResult<()> {
         info!("Starting DFS2 server...");
     }
 
-    // 加载配置
-    let config = match AppConfig::load().await {
-        Ok(config) => {
-            info!("Configuration loaded successfully");
-            Arc::new(RwLock::new(config))
+    // 使用AppContainer初始化所有组件
+    let app_container = match AppContainer::new().await {
+        Ok(container) => {
+            info!("Application container initialized successfully");
+            container
         }
         Err(e) => {
-            error!("Failed to load configuration: {}", e);
-            return Err(DfsError::config_load_failed(e.to_string()));
-        }
-    };
-
-    // 初始化数据存储后端
-    let data_store = match create_data_store().await {
-        Ok(store) => {
-            info!("Data store backend initialized successfully");
-            store
-        }
-        Err(e) => {
-            error!("Failed to initialize data store backend: {}", e);
-            return Err(DfsError::internal_error(format!("Data store initialization failed: {}", e)));
+            error!("Failed to initialize application container: {}", e);
+            return Err(e);
         }
     };
 
     // 如果是验证模式，执行验证后退出
     if args.validate_only {
-        let config_guard = config.read().await;
-        match ConfigValidator::validate_full(&config_guard, &data_store).await {
+        let config_guard = app_container.shared_config.load();
+        match ConfigValidator::validate_full(&config_guard, &app_container.data_store).await {
             Ok(report) => {
                 report.print_report();
                 std::process::exit(if report.is_valid() { 0 } else { 1 });
@@ -127,89 +114,76 @@ async fn main() -> DfsResult<()> {
         }
     }
 
-    // 创建JavaScript运行时
-    let jsrunner = modules::qjs::JsRunner::new(config.clone(), data_store.clone()).await;
-    info!("JavaScript runtime initialized");
-
-    // 创建流程运行器
-    let flowrunner = modules::flow::runner::FlowRunner {
-        redis: data_store.clone(),
-        jsrunner: jsrunner.clone(),
-        config: config.clone(),
-    };
-    info!("Flow runner initialized");
-
-    // 初始化Prometheus指标
-    let metrics = match Metrics::new(config.clone()) {
-        Ok(metrics) => {
-            info!("Prometheus metrics initialized");
-            Arc::new(metrics)
-        }
-        Err(e) => {
-            error!("Failed to initialize metrics: {}", e);
-            return Err(DfsError::internal_error(format!("Metrics initialization failed: {}", e)));
-        }
-    };
+    // 创建统一的AppContext
+    let app_context = app_container.create_app_context();
+    info!("Application context created");
 
     // 更新初始指标
     {
-        let config_read = config.read().await;
-        metrics.set_plugins_loaded(config_read.plugins.len() as u64);
-        metrics.set_server_health(config_read.servers.len() as u64, config_read.servers.len() as u64);
+        let config_guard = app_container.shared_config.load();
+        app_container
+            .metrics
+            .set_plugins_loaded(config_guard.plugins.len() as u64);
+        app_container.metrics.set_server_health(
+            config_guard.servers.len() as u64,
+            config_guard.servers.len() as u64,
+        );
     }
 
-    // 初始化版本提供者系统
-    let version_cache = Arc::new(modules::version_provider::VersionCache::new(data_store.clone()));
-    let plugin_provider = Arc::new(modules::version_provider::PluginVersionProvider::new(
-        jsrunner.clone(),
-        config.clone(),
-    ));
-    let version_updater = Arc::new(modules::version_provider::VersionUpdater::new(
-        config.clone(),
-        version_cache.clone(),
-        plugin_provider.clone(),
-    ));
-    
     // 初始化版本缓存
     {
-        let config_guard = config.read().await;
+        let config_guard = app_container.shared_config.load();
         match modules::version_provider::updater::initialize_version_system(
-            &config_guard, 
-            version_cache.clone(),
-            plugin_provider.clone()
-        ).await {
+            &config_guard,
+            app_container.version_cache.clone(),
+            std::sync::Arc::new(modules::version_provider::PluginVersionProvider::new(
+                app_container.js_runner.clone(),
+                app_container.shared_config.clone(),
+            )),
+        )
+        .await
+        {
             Ok(init_count) => {
-                info!("Version provider system initialized for {} resources", init_count);
+                info!(
+                    "Version provider system initialized for {} resources",
+                    init_count
+                );
             }
             Err(e) => {
                 warn!("Failed to initialize version provider system: {}", e);
             }
         }
     }
-    
-    // 启动版本更新后台任务
-    version_updater.clone().start_background_task().await;
+
+    // 启动后台任务
+    let version_updater = modules::version_provider::VersionUpdater::new(
+        app_container.shared_config.clone(),
+        app_container.version_cache.clone(),
+        std::sync::Arc::new(modules::version_provider::PluginVersionProvider::new(
+            app_container.js_runner.clone(),
+            app_container.shared_config.clone(),
+        )),
+    );
+    std::sync::Arc::new(version_updater)
+        .start_background_task()
+        .await;
     info!("Version updater background task started");
-    
+
     // 启动会话清理任务
-    let cleanup_task = Arc::new(analytics::SessionCleanupTask::new(config.clone(), data_store.clone()));
-    cleanup_task.clone().start_background_task().await;
+    let cleanup_task = std::sync::Arc::new(analytics::SessionCleanupTask::new(
+        app_container.shared_config.clone(),
+        app_container.data_store.clone(),
+    ));
+    cleanup_task.start_background_task().await;
     info!("Session cleanup task started");
 
-    // 构建路由
+    // 构建路由 - 使用统一的AppContext
     let app = Router::new()
         .merge(routes::resource::routes())
         .merge(routes::static_files::routes())
         .merge(routes::mgmt::routes())
-        .merge(create_docs_router())
         .layer(middleware::from_fn(real_ip_middleware))
-        .layer(axum::Extension(data_store))
-        .layer(axum::Extension(jsrunner))
-        .layer(axum::Extension(flowrunner))
-        .layer(axum::Extension(config))
-        .layer(axum::Extension(metrics))
-        .layer(axum::Extension(version_cache))
-        .layer(axum::Extension(version_updater));
+        .layer(axum::Extension(app_context));
 
     // 获取绑定地址
     let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
@@ -218,13 +192,6 @@ async fn main() -> DfsResult<()> {
     })?;
 
     info!("Starting HTTP server on {}", addr);
-    
-    // 记录OpenAPI文档状态
-    if is_openapi_docs_enabled() {
-        info!("OpenAPI documentation enabled at /docs and /api-docs/openapi.json");
-    } else {
-        info!("OpenAPI documentation disabled (set ENABLE_OPENAPI_DOCS=true to enable)");
-    }
 
     // 启动服务器
     match axum::serve(

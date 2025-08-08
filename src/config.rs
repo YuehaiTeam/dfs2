@@ -1,9 +1,11 @@
+use arc_swap::{ArcSwap, Guard};
 use rquickjs::IntoJs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing::{error, info};
 
-use crate::challenge::ChallengeType;
+use crate::modules::auth::challenge::ChallengeType;
 use crate::modules::{flow::FlowItem, server::ServerImpl};
 
 /// Challenge configuration for individual resources or global settings
@@ -67,17 +69,17 @@ fn default_cache_max_age() -> u32 {
 pub struct VersionProviderConfig {
     /// Provider type: "plugin"
     pub r#type: String,
-    
+
     /// Plugin name (must start with "version_provider_")
     pub plugin_name: String,
-    
+
     /// Cache TTL in seconds (default: 300)
     #[serde(default)]
     pub cache_ttl: Option<u32>,
-    
+
     /// Webhook token for manual refresh (optional)
     pub webhook_token: Option<String>,
-    
+
     /// Provider-specific options
     #[serde(default)]
     pub options: serde_json::Value,
@@ -429,124 +431,43 @@ impl AppConfig {
         self.resources.get(id)
     }
 
-    pub fn get_version_path(
-        &self,
-        resid: &str,
-        version: &str,
-        server_id: Option<&str>,
-    ) -> Option<String> {
-        let resource = self.get_resource(resid)?;
-
-        // 首先尝试获取特定版本的配置
-        let path = if let Some(version_map) = resource.versions.get(version) {
-            // 版本存在，获取路径
-            if let Some(server_id) = server_id {
-                version_map
-                    .get(server_id)
-                    .or_else(|| version_map.get("default"))
-            } else {
-                version_map.get("default")
-            }
-        } else {
-            // 版本不存在，尝试使用default模板
-            None
-        };
-
-        // 如果没有找到路径，尝试使用default模板
-        let path = path.or_else(|| {
-            let default_template = resource.versions.get("default")?;
-            if let Some(server_id) = server_id {
-                default_template
-                    .get(server_id)
-                    .or_else(|| default_template.get("default"))
-            } else {
-                default_template.get("default")
-            }
-        })?;
-
-        // 执行版本号占位符替换
-        Some(path.replace("${version}", version))
-    }
-
-    /// Get version path with optional sub-path for prefix resources
-    pub fn get_version_path_with_sub(
-        &self,
-        resid: &str,
-        version: &str,
-        server_id: Option<&str>,
-        sub_path: Option<&str>,
-    ) -> Option<String> {
-        let resource = self.get_resource(resid)?;
-        let base_path = self.get_version_path(resid, version, server_id)?;
-
-        match resource.resource_type.as_str() {
-            "prefix" => {
-                if let Some(sub) = sub_path {
-                    Some(combine_prefix_path(&base_path, sub))
-                } else {
-                    None // 前缀资源必须提供子路径
-                }
-            }
-            _ => Some(base_path), // 文件资源忽略子路径
-        }
-    }
-    
-    /// Get effective version for a resource with version cache support
-    pub async fn get_effective_version_with_cache(
-        &self, 
-        resource_id: &str,
-        version_cache: Option<&crate::modules::version_provider::VersionCache>
-    ) -> String {
-        if let Some(resource) = self.get_resource(resource_id) {
-            // Check if resource has version provider configured
-            if resource.version_provider.is_some() {
-                // Try to get cached version
-                if let Some(cache) = version_cache {
-                    if let Some(cached_version) = cache.get_cached_version(resource_id).await {
-                        return cached_version;
-                    }
-                }
-            }
-            
-            // Fallback to static latest version
-            if !resource.latest.is_empty() {
-                resource.latest.clone()
-            } else {
-                "latest".to_string()
-            }
-        } else {
-            "latest".to_string()
-        }
-    }
-    
-    /// Check if resource has dynamic version provider configured
-    pub fn has_version_provider(&self, resource_id: &str) -> bool {
-        self.get_resource(resource_id)
-            .map(|resource| resource.version_provider.is_some())
-            .unwrap_or(false)
-    }
 }
 
-/// 安全地组合前缀路径和子路径
-fn combine_prefix_path(prefix: &str, sub_path: &str) -> String {
-    let normalized_sub = normalize_path(sub_path);
-    let clean_prefix = prefix.trim_end_matches('/');
-    format!("{}{}", clean_prefix, normalized_sub)
+/// 使用 ArcSwap 实现的共享配置，支持热重载且无锁读取
+#[derive(Clone)]
+pub struct SharedConfig {
+    config: Arc<ArcSwap<AppConfig>>,
 }
 
-/// 标准化和验证路径安全性
-fn normalize_path(path: &str) -> String {
-    // 防止目录遍历攻击
-    let cleaned = path
-        .replace("../", "")
-        .replace("..\\", "")
-        .replace("\\", "/");
+impl SharedConfig {
+    pub fn new(initial_config: AppConfig) -> Self {
+        Self {
+            config: Arc::new(ArcSwap::from_pointee(initial_config)),
+        }
+    }
 
-    // 确保以斜杠开头
-    if !cleaned.starts_with('/') {
-        format!("/{}", cleaned)
-    } else {
-        cleaned
+    /// 无锁获取配置的引用
+    pub fn load(&self) -> Guard<Arc<AppConfig>> {
+        self.config.load()
+    }
+
+    /// 热重载配置（原子操作）
+    pub fn reload(&self, new_config: AppConfig) {
+        let old_config = self.config.swap(Arc::new(new_config));
+        tracing::info!("Configuration reloaded successfully, old config dropped");
+        drop(old_config); // 显式释放旧配置
+    }
+
+    /// 获取内部ArcSwap的克隆（用于传递给其他组件）
+    pub fn clone_inner(&self) -> Arc<ArcSwap<AppConfig>> {
+        self.config.clone()
+    }
+
+    /// 更新配置的便捷方法（用于替换config.write().await的使用场景）
+    pub async fn reload_from_file(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let new_config = AppConfig::load().await?;
+        self.reload(new_config);
+        Ok(())
     }
 }
 
@@ -651,23 +572,23 @@ mod tests {
         let config = create_test_config();
 
         // 测试默认路径
-        let path = config.get_version_path("test_app", "1.0", None);
+        let path = config.get_version_path("test_app", "1.0", None, None);
         assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
 
         // 测试特定服务器路径
-        let path = config.get_version_path("test_app", "1.0", Some("s3_server"));
+        let path = config.get_version_path("test_app", "1.0", Some("s3_server"), None);
         assert_eq!(path, Some("/releases/v1.0/app.exe".to_string()));
 
         // 测试不存在的版本
-        let path = config.get_version_path("test_app", "2.0", None);
+        let path = config.get_version_path("test_app", "2.0", None, None);
         assert!(path.is_none());
 
         // 测试不存在的资源
-        let path = config.get_version_path("nonexistent", "1.0", None);
+        let path = config.get_version_path("nonexistent", "1.0", None, None);
         assert!(path.is_none());
 
         // 测试不存在的服务器，应该回退到默认
-        let path = config.get_version_path("test_app", "1.0", Some("nonexistent_server"));
+        let path = config.get_version_path("test_app", "1.0", Some("nonexistent_server"), None);
         assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
     }
 
@@ -693,15 +614,15 @@ mod tests {
         }
 
         // 测试版本占位符替换 - 默认路径
-        let path = config.get_version_path("test_app", "2.0", None);
+        let path = config.get_version_path("test_app", "2.0", None, None);
         assert_eq!(path, Some("/releases/2.0/app.exe".to_string()));
 
         // 测试版本占位符替换 - 特定服务器路径
-        let path = config.get_version_path("test_app", "2.0", Some("s3_server"));
+        let path = config.get_version_path("test_app", "2.0", Some("s3_server"), None);
         assert_eq!(path, Some("/s3-bucket/2.0/installer.exe".to_string()));
 
         // 测试不存在占位符的路径不受影响
-        let path = config.get_version_path("test_app", "1.0", None);
+        let path = config.get_version_path("test_app", "1.0", None, None);
         assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
 
         // 测试复杂版本号的替换
@@ -717,7 +638,7 @@ mod tests {
                 .insert("1.2.3-beta".to_string(), complex_version);
         }
 
-        let path = config.get_version_path("test_app", "1.2.3-beta", None);
+        let path = config.get_version_path("test_app", "1.2.3-beta", None, None);
         assert_eq!(path, Some("/apps/1.2.3-beta/final/dist.zip".to_string()));
     }
 
@@ -743,15 +664,15 @@ mod tests {
         }
 
         // 测试使用default模板 - 不存在的版本应该使用default模板
-        let path = config.get_version_path("test_app", "3.0.0", None);
+        let path = config.get_version_path("test_app", "3.0.0", None, None);
         assert_eq!(path, Some("/releases/3.0.0/app.exe".to_string()));
 
         // 测试使用default模板 - 特定服务器
-        let path = config.get_version_path("test_app", "3.0.0", Some("s3_server"));
+        let path = config.get_version_path("test_app", "3.0.0", Some("s3_server"), None);
         assert_eq!(path, Some("/s3-releases/3.0.0/installer.exe".to_string()));
 
         // 测试特定版本优先级高于default模板
-        let path = config.get_version_path("test_app", "1.0", None);
+        let path = config.get_version_path("test_app", "1.0", None, None);
         assert_eq!(path, Some("/app/v1.0/app.exe".to_string())); // 仍然使用特定版本配置
 
         // 添加一个只有部分服务器配置的版本
@@ -768,13 +689,13 @@ mod tests {
         }
 
         // 测试混合使用：特定版本有部分配置，缺失的回退到default模板
-        let path = config.get_version_path("test_app", "4.0.0", Some("direct_server"));
+        let path = config.get_version_path("test_app", "4.0.0", Some("direct_server"), None);
         assert_eq!(path, Some("/direct/v4.0.0/app.exe".to_string())); // 使用特定配置
 
-        let path = config.get_version_path("test_app", "4.0.0", None);
+        let path = config.get_version_path("test_app", "4.0.0", None, None);
         assert_eq!(path, Some("/releases/4.0.0/app.exe".to_string())); // default服务器使用模板
 
-        let path = config.get_version_path("test_app", "4.0.0", Some("s3_server"));
+        let path = config.get_version_path("test_app", "4.0.0", Some("s3_server"), None);
         assert_eq!(path, Some("/s3-releases/4.0.0/installer.exe".to_string())); // s3_server使用模板
     }
 
@@ -884,19 +805,18 @@ mod tests {
         );
 
         // 测试文件资源（忽略子路径）
-        let path = config.get_version_path_with_sub("test_app", "1.0", None, Some("ignored"));
+        let path = config.get_version_path("test_app", "1.0", None, Some("ignored"));
         assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
 
         // 测试前缀资源（需要子路径）
-        let path = config.get_version_path_with_sub("app_suite", "1.0", None, None);
+        let path = config.get_version_path("app_suite", "1.0", None, None);
         assert!(path.is_none()); // 前缀资源必须提供子路径
 
-        let path =
-            config.get_version_path_with_sub("app_suite", "1.0", None, Some("windows/app.exe"));
+        let path = config.get_version_path("app_suite", "1.0", None, Some("windows/app.exe"));
         assert_eq!(path, Some("/releases/v1.0/windows/app.exe".to_string()));
 
         // 测试不存在的资源
-        let path = config.get_version_path_with_sub("nonexistent", "1.0", None, Some("file"));
+        let path = config.get_version_path("nonexistent", "1.0", None, Some("file"));
         assert!(path.is_none());
     }
 }

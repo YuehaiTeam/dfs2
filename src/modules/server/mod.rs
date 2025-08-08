@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tracing::warn;
-use serde::{Deserialize, Serialize};
 
 use crate::config::ServerConfig;
 
@@ -29,9 +29,10 @@ fn extract_file_size_from_response(response: &reqwest::Response) -> Option<u64> 
             }
         }
     }
-    
+
     // 如果是完整文件响应，从Content-Length获取
-    response.headers()
+    response
+        .headers()
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok())
@@ -72,7 +73,7 @@ impl ServerImpl {
         path: &str,
         ranges: Option<Vec<(u32, u32)>>,
         session_id: Option<&str>,
-        data_store: Option<&crate::data_store::DataStore>,
+        data_store: Option<&crate::modules::storage::data_store::DataStore>,
     ) -> anyhow::Result<String> {
         match self {
             ServerImpl::Direct(url) => Ok(format!(
@@ -113,7 +114,7 @@ impl ServerImpl {
         &self,
         server_id: &str,
         path: &str,
-        redis: Option<&crate::app_state::DataStore>,
+        redis: Option<&crate::modules::storage::data_store::DataStore>,
     ) -> bool {
         // Check cache first if Redis store is available
         if let Some(redis_store) = redis {
@@ -135,12 +136,14 @@ impl ServerImpl {
                         file_size: None,
                         last_check: chrono::Utc::now().timestamp() as u64,
                     };
-                    let _ = redis_store.set_health_info(server_id, path, &health_info).await;
+                    let _ = redis_store
+                        .set_health_info(server_id, path, &health_info)
+                        .await;
                 }
                 return false;
             }
         };
-        let ret = crate::app_state::REQWEST_CLIENT
+        let ret = crate::container::REQWEST_CLIENT
             .get(check_url.clone())
             .header("range", "bytes=0-255")
             .send()
@@ -156,7 +159,9 @@ impl ServerImpl {
                         file_size: None,
                         last_check: chrono::Utc::now().timestamp() as u64,
                     };
-                    let _ = redis_store.set_health_info(server_id, path, &health_info).await;
+                    let _ = redis_store
+                        .set_health_info(server_id, path, &health_info)
+                        .await;
                 }
                 return false;
             }
@@ -164,7 +169,11 @@ impl ServerImpl {
         let is_alive = ret.status().is_success();
 
         if !is_alive {
-            warn!("Keepalive check failed for URL {}: status {}", check_url, ret.status());
+            warn!(
+                "Keepalive check failed for URL {}: status {}",
+                check_url,
+                ret.status()
+            );
         }
 
         // 从响应中提取文件大小信息
@@ -182,7 +191,9 @@ impl ServerImpl {
         };
 
         if let Some(redis_store) = redis {
-            let _ = redis_store.set_health_info(server_id, path, &health_info).await;
+            let _ = redis_store
+                .set_health_info(server_id, path, &health_info)
+                .await;
         }
 
         is_alive

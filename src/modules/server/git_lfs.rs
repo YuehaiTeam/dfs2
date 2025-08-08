@@ -98,7 +98,7 @@ impl GitLfsSigner {
     pub async fn generate_url(
         &self, 
         path: &str, 
-        data_store: &crate::data_store::DataStore
+        data_store: &crate::modules::storage::data_store::DataStore
     ) -> Result<String> {
         let cache_key_file = format!("git_lfs_file:{}:{}", self.repo_url, path);
         
@@ -138,12 +138,12 @@ impl GitLfsSigner {
         &self,
         path: &str,
         cache_key: &str,
-        data_store: &crate::data_store::DataStore
+        data_store: &crate::modules::storage::data_store::DataStore
     ) -> Result<(String, u64)> {
         let raw_url = format!("{}{}", self.raw_url_prefix, path.trim_start_matches('/'));
         debug!("Fetching LFS pointer from: {}", raw_url);
         
-        let response = crate::app_state::REQWEST_CLIENT
+        let response = crate::container::REQWEST_CLIENT
             .get(&raw_url)
             .send()
             .await?;
@@ -204,7 +204,7 @@ impl GitLfsSigner {
         
         debug!("Making LFS batch request to: {}", self.lfs_endpoint);
         
-        let response = crate::app_state::REQWEST_CLIENT
+        let response = crate::container::REQWEST_CLIENT
             .post(&format!("{}/objects/batch", self.lfs_endpoint))
             .header("Accept", "application/vnd.git-lfs+json")
             .header("Content-Type", "application/vnd.git-lfs+json")

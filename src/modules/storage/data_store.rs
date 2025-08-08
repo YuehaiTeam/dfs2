@@ -50,7 +50,6 @@ pub trait DataStoreBackend: Send + Sync {
     async fn increment_download_count(&self, sid: &str, chunk: &str) -> Result<Option<u32>, String>;
     async fn refresh_session(&self, sid: &str) -> Result<(), String>;
     async fn get_download_counts(&self, sid: &str) -> Result<HashMap<String, u32>, String>;
-    async fn update_session_chunks(&self, sid: &str, chunks: &[String]) -> Result<bool, String>;
     async fn update_cdn_record_v2(&self, sid: &str, chunk: &str, record: CdnRecord) -> Result<(), String>;
     async fn get_cdn_records(&self, sid: &str, chunk: &str) -> Result<Vec<CdnRecord>, String>;
     async fn get_session_stats(&self, sid: &str) -> Result<Option<SessionStats>, String>;
@@ -317,17 +316,6 @@ impl DataStoreBackend for FileDataStore {
         // 为了简化，先返回空HashMap，后续可以通过文件系统扫描实现
         let _ = sid;
         Ok(HashMap::new())
-    }
-
-
-    async fn update_session_chunks(&self, sid: &str, chunks: &[String]) -> Result<bool, String> {
-        if let Some(mut session) = self.get_session(sid).await? {
-            session.chunks = chunks.to_vec();
-            self.store_session(sid, &session).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
     }
 
 
@@ -667,7 +655,7 @@ pub async fn create_data_store() -> Result<DataStore, String> {
             // 创建Redis客户端
             let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
             let client = redis::Client::open(redis_url).map_err(|e| format!("Failed to create Redis client: {}", e))?;
-            let redis_store = crate::redis_data_store::RedisDataStore::new(client);
+            let redis_store = crate::modules::storage::redis_data_store::RedisDataStore::new(client);
             Ok(Arc::new(redis_store))
         }
         "file" | _ => {
