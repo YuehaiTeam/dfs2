@@ -66,7 +66,7 @@ impl<'de> Deserialize<'de> for FlowUse {
             };
             Ok(FlowUse::Plugin { id, indirect })
         } else {
-            Err(serde::de::Error::custom(format!("Invalid FlowUse: {}", s)))
+            Err(serde::de::Error::custom(format!("Invalid FlowUse: {s}")))
         }
     }
 }
@@ -81,16 +81,16 @@ impl Serialize for FlowUse {
             FlowUse::Poolize => serializer.serialize_str("poolize"),
             FlowUse::Server { id, weight } => {
                 if *weight > 0 {
-                    serializer.serialize_str(&format!("server {}[{}]", id, weight))
+                    serializer.serialize_str(&format!("server {id}[{weight}]"))
                 } else {
-                    serializer.serialize_str(&format!("server {}", id))
+                    serializer.serialize_str(&format!("server {id}"))
                 }
             }
             FlowUse::Plugin { id, indirect } => {
                 if !indirect.is_empty() {
-                    serializer.serialize_str(&format!("plugin {}[{}]", id, indirect))
+                    serializer.serialize_str(&format!("plugin {id}[{indirect}]"))
                 } else {
-                    serializer.serialize_str(&format!("plugin {}", id))
+                    serializer.serialize_str(&format!("plugin {id}"))
                 }
             }
         }
@@ -118,7 +118,7 @@ impl std::str::FromStr for FlowComp {
             ">=" => Ok(FlowComp::Ge),
             "<" => Ok(FlowComp::Lt),
             "<=" => Ok(FlowComp::Le),
-            _ => Err(format!("Invalid FlowComp: {}", s)),
+            _ => Err(format!("Invalid FlowComp: {s}")),
         }
     }
 }
@@ -149,7 +149,7 @@ impl<'de> Deserialize<'de> for FlowComp {
             ">=" => Ok(FlowComp::Ge),
             "<" => Ok(FlowComp::Lt),
             "<=" => Ok(FlowComp::Le),
-            _ => Err(serde::de::Error::custom(format!("Invalid FlowComp: {}", s))),
+            _ => Err(serde::de::Error::custom(format!("Invalid FlowComp: {s}"))),
         }
     }
 }
@@ -184,7 +184,7 @@ pub enum FlowCond {
     Extras(String),
     Size(FlowComp, Size),
     ResourceBwDaily(ResourcePattern, FlowComp, Size), // 资源级别的日流量限制
-    ServerBwDaily(String, FlowComp, Size), // 服务器级别的日流量限制，必须指定server_id
+    ServerBwDaily(String, FlowComp, Size),            // 服务器级别的日流量限制，必须指定server_id
     Time(FlowComp, chrono::NaiveTime),
     GeoIp(String), // geoip关键词匹配
 }
@@ -233,7 +233,11 @@ impl<'de> Deserialize<'de> for FlowCond {
                     // 旧格式：bw_daily <comp> <size> - 视为当前资源
                     let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
                     let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
-                    Ok(FlowCond::ResourceBwDaily(ResourcePattern::Current, comp, size))
+                    Ok(FlowCond::ResourceBwDaily(
+                        ResourcePattern::Current,
+                        comp,
+                        size,
+                    ))
                 } else if parts.len() == 4 {
                     // 新格式：bw_daily <resource> <comp> <size>
                     let resource_pattern = match parts[1] {
@@ -246,14 +250,14 @@ impl<'de> Deserialize<'de> for FlowCond {
                     Ok(FlowCond::ResourceBwDaily(resource_pattern, comp, size))
                 } else {
                     return Err(serde::de::Error::custom(
-                        "bw_daily requires format: bw_daily [resource] {comp} {size}"
+                        "bw_daily requires format: bw_daily [resource] {comp} {size}",
                     ));
                 }
             }
             "server_bw_daily" => {
                 if parts.len() != 4 {
                     return Err(serde::de::Error::custom(
-                        "server_bw_daily requires format: server_bw_daily {server_id} {comp} {size}"
+                        "server_bw_daily requires format: server_bw_daily {server_id} {comp} {size}",
                     ));
                 }
                 let server_id = parts[1].to_string();
@@ -267,7 +271,7 @@ impl<'de> Deserialize<'de> for FlowCond {
                     .map_err(serde::de::Error::custom)?;
                 Ok(FlowCond::Time(comp, time))
             }
-            _ => Err(serde::de::Error::custom(format!("Invalid FlowCond: {}", s))),
+            _ => Err(serde::de::Error::custom(format!("Invalid FlowCond: {s}"))),
         }
     }
 }
@@ -390,30 +394,26 @@ impl Serialize for FlowCond {
         S: serde::Serializer,
     {
         match self {
-            FlowCond::CnIp(value) => serializer.serialize_str(&format!("cnip {}", value)),
+            FlowCond::CnIp(value) => serializer.serialize_str(&format!("cnip {value}")),
             FlowCond::IpVersion(version) => {
-                serializer.serialize_str(&format!("ipversion {}", version))
+                serializer.serialize_str(&format!("ipversion {version}"))
             }
-            FlowCond::Cidr(cidr) => serializer.serialize_str(&format!("cidr {}", cidr)),
-            FlowCond::Extras(extras) => serializer.serialize_str(&format!("extras {}", extras)),
-            FlowCond::GeoIp(keyword) => serializer.serialize_str(&format!("geoip {}", keyword)),
-            FlowCond::Size(comp, size) => {
-                serializer.serialize_str(&format!("size {} {}", comp, size))
-            }
+            FlowCond::Cidr(cidr) => serializer.serialize_str(&format!("cidr {cidr}")),
+            FlowCond::Extras(extras) => serializer.serialize_str(&format!("extras {extras}")),
+            FlowCond::GeoIp(keyword) => serializer.serialize_str(&format!("geoip {keyword}")),
+            FlowCond::Size(comp, size) => serializer.serialize_str(&format!("size {comp} {size}")),
             FlowCond::ResourceBwDaily(pattern, comp, size) => {
                 let pattern_str = match pattern {
                     ResourcePattern::Global => "*",
                     ResourcePattern::Current => "$",
                     ResourcePattern::Specific(resource_id) => resource_id,
                 };
-                serializer.serialize_str(&format!("bw_daily {} {} {}", pattern_str, comp, size))
+                serializer.serialize_str(&format!("bw_daily {pattern_str} {comp} {size}"))
             }
             FlowCond::ServerBwDaily(server_id, comp, size) => {
-                serializer.serialize_str(&format!("server_bw_daily {} {} {}", server_id, comp, size))
+                serializer.serialize_str(&format!("server_bw_daily {server_id} {comp} {size}"))
             }
-            FlowCond::Time(comp, time) => {
-                serializer.serialize_str(&format!("time {} {}", comp, time))
-            }
+            FlowCond::Time(comp, time) => serializer.serialize_str(&format!("time {comp} {time}")),
         }
     }
 }

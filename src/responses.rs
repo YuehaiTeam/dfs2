@@ -1,20 +1,30 @@
-use serde::Serialize;
-use serde_json::Value;
-use utoipa::ToSchema;
 use axum::{
     Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use serde::Serialize;
+use serde_json::Value;
+use utoipa::ToSchema;
 
 #[derive(Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum ApiResponse {
     Success(ResponseData),
-    Error { message: String },
-    Redirect { url: String },
-    Raw { content: Vec<u8>, headers: std::collections::HashMap<String, String> },
-    CustomStatus { status_code: u16, data: ResponseData },
+    Error {
+        message: String,
+    },
+    Redirect {
+        url: String,
+    },
+    Raw {
+        content: Vec<u8>,
+        headers: std::collections::HashMap<String, String>,
+    },
+    CustomStatus {
+        status_code: u16,
+        data: ResponseData,
+    },
 }
 
 #[allow(dead_code)]
@@ -159,7 +169,6 @@ pub struct HealthMetrics {
 
 // Additional request types
 
-
 impl ApiResponse {
     pub fn success(data: ResponseData) -> Self {
         Self::Success(data)
@@ -178,11 +187,17 @@ impl ApiResponse {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
             .collect();
-        Self::Raw { content, headers: headers_map }
+        Self::Raw {
+            content,
+            headers: headers_map,
+        }
     }
 
     pub fn custom_status(status_code: StatusCode, data: ResponseData) -> Self {
-        Self::CustomStatus { status_code: status_code.as_u16(), data }
+        Self::CustomStatus {
+            status_code: status_code.as_u16(),
+            data,
+        }
     }
 }
 
@@ -198,7 +213,7 @@ impl IntoResponse for ApiResponse {
                 for (key, value) in headers {
                     if let (Ok(header_name), Ok(header_value)) = (
                         axum::http::HeaderName::from_bytes(key.as_bytes()),
-                        axum::http::HeaderValue::from_str(&value)
+                        axum::http::HeaderValue::from_str(&value),
                     ) {
                         header_map.insert(header_name, header_value);
                     }
@@ -206,13 +221,12 @@ impl IntoResponse for ApiResponse {
                 (StatusCode::OK, header_map, content).into_response()
             }
             ApiResponse::CustomStatus { status_code, data } => {
-                let status = StatusCode::from_u16(status_code)
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let status =
+                    StatusCode::from_u16(status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let response = ApiResponse::Success(data);
                 (status, Json(response)).into_response()
             }
-            _ => (StatusCode::OK, Json(self)).into_response()
+            _ => (StatusCode::OK, Json(self)).into_response(),
         }
     }
 }
-

@@ -1,12 +1,11 @@
-use lazy_static::lazy_static;
 use ipdb::Reader;
+use lazy_static::lazy_static;
 use std::net::IpAddr;
 use tracing::{error, info, warn};
 
 lazy_static! {
     pub static ref IPDB: Option<Reader> = {
-        let path =
-            std::env::var("IPDB_PATH").unwrap_or_else(|_| "ipipfree.ipdb".to_string());
+        let path = std::env::var("IPDB_PATH").unwrap_or_else(|_| "ipipfree.ipdb".to_string());
         match Reader::open_file(&path) {
             Ok(reader) => {
                 info!("IPIP database loaded from: {}", path);
@@ -28,7 +27,7 @@ pub fn is_global_ip(ip: IpAddr) -> bool {
         match ipdb.find_city_info(&ip.to_string(), "CN") {
             Ok(city_info) => {
                 // 直接检查country_code字段，精确判断
-                let is_cn = city_info.country_code.eq_ignore_ascii_case("CN") 
+                let is_cn = city_info.country_code.eq_ignore_ascii_case("CN")
                     || city_info.country_code.eq_ignore_ascii_case("CHN");
                 !is_cn // 返回是否为全球IP（非中国IP）
             }
@@ -64,10 +63,7 @@ pub fn get_ip_location_data(ip: IpAddr) -> Option<String> {
 
 /// 判断IP是否为IPv6
 pub fn is_ipv6(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(_) => false,
-        IpAddr::V6(_) => true,
-    }
+    ip.is_ipv6()
 }
 
 /// 获取客户端IP地址（从请求中提取）

@@ -93,7 +93,7 @@ pub async fn handle_create_session_unified(
         .store_session(&req.sid, &session)
         .await
         .map_err(|e| DfsError::SessionCreationFailed {
-            reason: format!("Failed to store session: {}", e),
+            reason: format!("Failed to store session: {e}"),
         })?;
 
     // 生成服务器尝试列表
@@ -263,7 +263,7 @@ pub async fn delete_session(
         }
         None => {
             return Err(crate::error::DfsError::ResourceNotFound {
-                resource_id: format!("session:{}", sessionid),
+                resource_id: format!("session:{sessionid}"),
             });
         }
     }

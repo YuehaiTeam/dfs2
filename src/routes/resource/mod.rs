@@ -43,14 +43,13 @@ pub fn calculate_actual_bytes_from_range(range_str: Option<&str>, full_file_size
             ranges
                 .iter()
                 .map(|(start, end)| {
-                    let end_byte = if *end == u32::MAX {
+                    if *end == u32::MAX {
                         // "X-" 格式，从start到文件结尾
                         full_file_size.saturating_sub(*start as u64)
                     } else {
                         // "X-Y" 格式，计算范围大小
                         (*end as u64).saturating_sub(*start as u64) + 1
-                    };
-                    end_byte
+                    }
                 })
                 .sum()
         } else {

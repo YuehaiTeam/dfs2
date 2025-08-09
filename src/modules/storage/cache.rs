@@ -1,5 +1,5 @@
-use crate::container::REQWEST_CLIENT;
 use crate::config::AppConfig;
+use crate::container::REQWEST_CLIENT;
 use crate::modules::storage::data_store::{CacheMetadata, DataStoreBackend};
 use std::sync::Arc;
 use tracing::warn;
@@ -8,7 +8,7 @@ use xxhash_rust::xxh3::xxh3_64;
 /// 生成ETag（使用xxhash）
 pub fn generate_etag(content: &[u8]) -> String {
     let hash = xxh3_64(content);
-    format!("\"{}\"", hash)
+    format!("\"{hash}\"")
 }
 
 /// 下载内容并缓存到Redis
@@ -25,10 +25,13 @@ pub async fn download_and_cache(
         .get(cdn_url)
         .send()
         .await
-        .map_err(|e| format!("Download failed: {}", e))?;
+        .map_err(|e| format!("Download failed: {e}"))?;
 
     if !response.status().is_success() {
-        return Err(format!("Download failed with status: {}", response.status()));
+        return Err(format!(
+            "Download failed with status: {}",
+            response.status()
+        ));
     }
 
     // 提取Content-Type
@@ -41,7 +44,7 @@ pub async fn download_and_cache(
     let content = response
         .bytes()
         .await
-        .map_err(|e| format!("Failed to read content: {}", e))?
+        .map_err(|e| format!("Failed to read content: {e}"))?
         .to_vec();
 
     // 生成ETag（使用xxhash）

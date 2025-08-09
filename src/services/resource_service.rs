@@ -1,4 +1,7 @@
-use crate::{config::SharedConfig, error::{DfsError, DfsResult}};
+use crate::{
+    config::SharedConfig,
+    error::{DfsError, DfsResult},
+};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -10,28 +13,37 @@ pub struct ResourceService {
 
 impl ResourceService {
     pub fn new(
-        shared_config: SharedConfig, 
+        shared_config: SharedConfig,
         version_cache: Arc<crate::modules::version_provider::VersionCache>,
-        version_updater: Arc<crate::modules::version_provider::VersionUpdater>
+        version_updater: Arc<crate::modules::version_provider::VersionUpdater>,
     ) -> Self {
-        Self { shared_config, version_cache, version_updater }
+        Self {
+            shared_config,
+            version_cache,
+            version_updater,
+        }
     }
 
     /// 统一资源验证逻辑，支持前缀资源验证
     /// sub_path: None = 常规资源，Some = 前缀资源（必须验证resource_type == "prefix"）
-    pub async fn validate_resource_and_version(&self, resource_id: &str, version: &str, sub_path: Option<&str>) -> DfsResult<(String, String)> {
+    pub async fn validate_resource_and_version(
+        &self,
+        resource_id: &str,
+        version: &str,
+        sub_path: Option<&str>,
+    ) -> DfsResult<(String, String)> {
         let config = self.shared_config.load();
-        let resource_config = config.resources.get(resource_id)
+        let resource_config = config
+            .resources
+            .get(resource_id)
             .ok_or_else(|| DfsError::resource_not_found(resource_id))?;
 
         // 前缀资源类型验证
-        if let Some(_) = sub_path {
-            if resource_config.resource_type != "prefix" {
-                return Err(DfsError::download_not_allowed(
-                    resource_id,
-                    "resource is not a prefix type",
-                ));
-            }
+        if sub_path.is_some() && resource_config.resource_type != "prefix" {
+            return Err(DfsError::download_not_allowed(
+                resource_id,
+                "resource is not a prefix type",
+            ));
         }
 
         let effective_version = if version.is_empty() || version == "latest" {
@@ -41,8 +53,9 @@ impl ResourceService {
         };
 
         // 验证版本存在性
-        if !resource_config.versions.contains_key(&effective_version) 
-            && !resource_config.versions.contains_key("default") {
+        if !resource_config.versions.contains_key(&effective_version)
+            && !resource_config.versions.contains_key("default")
+        {
             return Err(DfsError::version_not_found(resource_id, &effective_version));
         }
 
@@ -67,7 +80,13 @@ impl ResourceService {
         }
     }
 
-    pub fn get_version_path(&self, resource_id: &str, version: &str, server_id: Option<&str>, sub_path: Option<&str>) -> Option<String> {
+    pub fn get_version_path(
+        &self,
+        resource_id: &str,
+        version: &str,
+        server_id: Option<&str>,
+        sub_path: Option<&str>,
+    ) -> Option<String> {
         let config = self.shared_config.load();
         let resource = config.get_resource(resource_id)?;
 
@@ -112,18 +131,23 @@ impl ResourceService {
     /// 获取资源changelog，优先使用版本提供者的结果
     pub async fn get_resource_changelog(&self, resource_id: &str) -> Option<String> {
         // 先尝试从版本缓存获取
-        if let Some(version_info) = self.version_cache.get_cached_version_info(resource_id).await {
+        if let Some(version_info) = self
+            .version_cache
+            .get_cached_version_info(resource_id)
+            .await
+        {
             if let Some(changelog) = version_info.changelog {
                 return Some(changelog);
             }
         }
-        
+
         // 回退到静态配置
         let config = self.shared_config.load();
-        config.resources.get(resource_id)
+        config
+            .resources
+            .get(resource_id)
             .and_then(|resource| resource.changelog.clone())
     }
-
 
     /// Get currently cached version for a resource
     pub async fn get_cached_version(&self, resource_id: &str) -> Option<String> {
@@ -132,7 +156,9 @@ impl ResourceService {
 
     /// Refresh version cache for a specific resource
     pub async fn refresh_version(&self, resource_id: &str) -> crate::error::DfsResult<String> {
-        self.version_updater.update_resource_immediately(resource_id).await
+        self.version_updater
+            .update_resource_immediately(resource_id)
+            .await
     }
 }
 
@@ -140,7 +166,7 @@ impl ResourceService {
 fn combine_prefix_path(prefix: &str, sub_path: &str) -> String {
     let normalized_sub = normalize_path(sub_path);
     let clean_prefix = prefix.trim_end_matches('/');
-    format!("{}{}", clean_prefix, normalized_sub)
+    format!("{clean_prefix}{normalized_sub}")
 }
 
 /// 标准化和验证路径安全性
@@ -153,7 +179,7 @@ fn normalize_path(path: &str) -> String {
 
     // 确保以斜杠开头
     if !cleaned.starts_with('/') {
-        format!("/{}", cleaned)
+        format!("/{cleaned}")
     } else {
         cleaned
     }
@@ -162,13 +188,15 @@ fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     #[tokio::test]
     async fn test_normalize_path_security() {
         // 测试路径遍历攻击防护
         assert_eq!(normalize_path("../../../etc/passwd"), "/etc/passwd");
-        assert_eq!(normalize_path("..\\..\\windows\\system32"), "/windows/system32");
+        assert_eq!(
+            normalize_path("..\\..\\windows\\system32"),
+            "/windows/system32"
+        );
         assert_eq!(normalize_path("normal/path"), "/normal/path");
         assert_eq!(normalize_path("/already/absolute"), "/already/absolute");
     }
@@ -176,8 +204,17 @@ mod tests {
     #[tokio::test]
     async fn test_combine_prefix_path() {
         // 测试前缀路径组合
-        assert_eq!(combine_prefix_path("/games/base", "assets/texture.png"), "/games/base/assets/texture.png");
-        assert_eq!(combine_prefix_path("/games/base/", "/assets/model.obj"), "/games/base/assets/model.obj");
-        assert_eq!(combine_prefix_path("/games/base", "../../../hack"), "/games/base/hack");
+        assert_eq!(
+            combine_prefix_path("/games/base", "assets/texture.png"),
+            "/games/base/assets/texture.png"
+        );
+        assert_eq!(
+            combine_prefix_path("/games/base/", "/assets/model.obj"),
+            "/games/base/assets/model.obj"
+        );
+        assert_eq!(
+            combine_prefix_path("/games/base", "../../../hack"),
+            "/games/base/hack"
+        );
     }
 }

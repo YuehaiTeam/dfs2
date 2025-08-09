@@ -71,7 +71,7 @@ impl S3Signer {
             .to_string();
         // append port
         if let Some(port) = parsed_url.port() {
-            host.push_str(&format!(":{}", port));
+            host.push_str(&format!(":{port}"));
         }
 
         let mut canonical_headers = String::from("host:");
@@ -99,9 +99,9 @@ impl S3Signer {
         );
         let key_without_first_slash = key.trim_start_matches('/');
         let canonical_uri = if self.path_mode {
-            format!("/{}/{}", bucket, key_without_first_slash)
+            format!("/{bucket}/{key_without_first_slash}")
         } else {
-            format!("/{}", key_without_first_slash)
+            format!("/{key_without_first_slash}")
         };
 
         let mut canonical_query_string = String::new();
@@ -117,8 +117,7 @@ impl S3Signer {
         }
 
         let canonical_request = format!(
-            "GET\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
-            canonical_uri, canonical_query_string, canonical_headers, signed_headers_str
+            "GET\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n{signed_headers_str}\nUNSIGNED-PAYLOAD"
         );
 
         let string_to_sign = format!(
@@ -139,11 +138,11 @@ impl S3Signer {
         let signing_key = self.sign(&k_service, b"aws4_request");
 
         let signature = hex::encode(self.sign(&signing_key, string_to_sign.as_bytes()));
-        canonical_query_string.push_str(&format!("&X-Amz-Signature={}", signature));
+        canonical_query_string.push_str(&format!("&X-Amz-Signature={signature}"));
 
         let endpoint_without_last_slash = self.endpoint.trim_end_matches('/').to_string();
 
-        let mut url = Url::parse(&format!("{}{}", endpoint_without_last_slash, canonical_uri))?;
+        let mut url = Url::parse(&format!("{endpoint_without_last_slash}{canonical_uri}"))?;
         url.set_query(Some(&canonical_query_string));
 
         Ok(url.to_string())

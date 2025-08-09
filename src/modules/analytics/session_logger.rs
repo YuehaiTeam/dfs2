@@ -43,7 +43,7 @@ impl SessionLogger {
             .redis
             .get_session_stats(session_id)
             .await
-            .map_err(|e| format!("Failed to get session stats: {}", e))?;
+            .map_err(|e| format!("Failed to get session stats: {e}"))?;
 
         if let Some(stats) = session_stats {
             let session_log = self
@@ -61,7 +61,7 @@ impl SessionLogger {
 
             self.write_log(&session_log).await
         } else {
-            Err(format!("Session {} not found", session_id))
+            Err(format!("Session {session_id} not found"))
         }
     }
 
@@ -77,7 +77,7 @@ impl SessionLogger {
             .redis
             .get_session_stats(session_id)
             .await
-            .map_err(|e| format!("Failed to get session stats: {}", e))?;
+            .map_err(|e| format!("Failed to get session stats: {e}"))?;
 
         if let Some(stats) = session_stats {
             let session_log = self
@@ -234,7 +234,7 @@ impl SessionLogger {
         let config_guard = self.config.load();
         let resource_config = config_guard
             .get_resource(resource_id)
-            .ok_or_else(|| format!("Resource {} not found", resource_id))?;
+            .ok_or_else(|| format!("Resource {resource_id} not found"))?;
 
         let now = Utc::now();
         let created_at = now.to_rfc3339(); // 暂时使用当前时间，后续可以从 Redis 获取创建时间
@@ -242,11 +242,7 @@ impl SessionLogger {
         // 构建会话统计
         let total_chunks = stats.chunks.len() as u32;
         let successful_downloads = stats.download_counts.len() as u32;
-        let failed_downloads = if total_chunks >= successful_downloads {
-            total_chunks - successful_downloads
-        } else {
-            0
-        };
+        let failed_downloads = total_chunks.saturating_sub(successful_downloads);
 
         let session_stats = SessionStatsLog {
             created_at: created_at.clone(),
@@ -296,7 +292,7 @@ impl SessionLogger {
                             .unwrap_or_else(|| "unknown".to_string()),
                         server_weight: record.weight,
                         timestamp: DateTime::from_timestamp(record.timestamp as i64, 0)
-                            .unwrap_or_else(|| Utc::now())
+                            .unwrap_or_else(Utc::now)
                             .to_rfc3339(),
                         skip_penalty: record.skip_penalty,
                         selection_reason: if record.skip_penalty {
@@ -356,19 +352,19 @@ impl SessionLogger {
         // 创建日志目录
         if let Err(e) = create_dir_all(&self.log_path).await {
             error!("Failed to create log directory {}: {}", self.log_path, e);
-            return Err(format!("Failed to create log directory: {}", e));
+            return Err(format!("Failed to create log directory: {e}"));
         }
 
         // 生成日志文件名（按日期分割）
         let date = Utc::now().format("%Y-%m-%d").to_string();
-        let log_file = Path::new(&self.log_path).join(format!("sessions.{}.log", date));
+        let log_file = Path::new(&self.log_path).join(format!("sessions.{date}.log"));
 
         // 序列化为 JSON
         let log_json = match serde_json::to_string(session_log) {
             Ok(json) => json,
             Err(e) => {
                 error!("Failed to serialize session log: {}", e);
-                return Err(format!("Failed to serialize log: {}", e));
+                return Err(format!("Failed to serialize log: {e}"));
             }
         };
 
@@ -380,9 +376,9 @@ impl SessionLogger {
             .await
         {
             Ok(mut file) => {
-                if let Err(e) = file.write_all(format!("{}\n", log_json).as_bytes()).await {
+                if let Err(e) = file.write_all(format!("{log_json}\n").as_bytes()).await {
                     error!("Failed to write to log file {:?}: {}", log_file, e);
-                    return Err(format!("Failed to write to log file: {}", e));
+                    return Err(format!("Failed to write to log file: {e}"));
                 }
                 if let Err(e) = file.sync_all().await {
                     warn!("Failed to sync log file {:?}: {}", log_file, e);
@@ -390,7 +386,7 @@ impl SessionLogger {
             }
             Err(e) => {
                 error!("Failed to open log file {:?}: {}", log_file, e);
-                return Err(format!("Failed to open log file: {}", e));
+                return Err(format!("Failed to open log file: {e}"));
             }
         }
 

@@ -115,19 +115,15 @@ impl Default for ChallengeConfig {
 /// Download policy for resources
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum DownloadPolicy {
     /// Download disabled (default)
+    #[default]
     Disabled,
     /// Download enabled with session validation
     Enabled,
     /// Download freely available without session
     Free,
-}
-
-impl Default for DownloadPolicy {
-    fn default() -> Self {
-        DownloadPolicy::Disabled
-    }
 }
 
 impl ChallengeConfig {
@@ -455,7 +451,7 @@ mod tests {
     #[test]
     fn test_challenge_config_resource_override() {
         use std::collections::HashMap;
-        
+
         // 创建全局配置
         let global_challenge = ChallengeConfig {
             challenge_type: "md5".to_string(),
@@ -509,8 +505,14 @@ mod tests {
             version_provider: None,
         };
 
-        resources.insert("resource_with_challenge".to_string(), resource_with_challenge);
-        resources.insert("resource_without_challenge".to_string(), resource_without_challenge);
+        resources.insert(
+            "resource_with_challenge".to_string(),
+            resource_with_challenge,
+        );
+        resources.insert(
+            "resource_without_challenge".to_string(),
+            resource_without_challenge,
+        );
 
         let config = AppConfig {
             servers: HashMap::new(),

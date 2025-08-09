@@ -88,7 +88,7 @@ impl ServerImpl {
                         // S3 supports multiple ranges in a single Range header
                         let range_specs: Vec<String> = ranges_vec
                             .iter()
-                            .map(|(start, end)| format!("{}-{}", start, end))
+                            .map(|(start, end)| format!("{start}-{end}"))
                             .collect();
                         let range_header = format!("bytes={}", range_specs.join(","));
                         headers.insert("range".to_string(), range_header);

@@ -37,7 +37,7 @@ impl ChallengeService {
         self.data_store
             .store_challenge(sid, challenge_data)
             .await
-            .map_err(|e| DfsError::internal_error(format!("Failed to store challenge: {}", e)))
+            .map_err(|e| DfsError::internal_error(format!("Failed to store challenge: {e}")))
     }
 
     /// 获取challenge数据
@@ -45,7 +45,7 @@ impl ChallengeService {
         self.data_store
             .get_challenge(sid)
             .await
-            .map_err(|e| DfsError::internal_error(format!("Failed to get challenge: {}", e)))
+            .map_err(|e| DfsError::internal_error(format!("Failed to get challenge: {e}")))
     }
 
     /// 移除challenge数据
@@ -53,7 +53,7 @@ impl ChallengeService {
         self.data_store
             .remove_challenge(sid)
             .await
-            .map_err(|e| DfsError::internal_error(format!("Failed to remove challenge: {}", e)))
+            .map_err(|e| DfsError::internal_error(format!("Failed to remove challenge: {e}")))
     }
 
     /// 生成并存储challenge，统一处理所有类型的challenge
@@ -68,9 +68,9 @@ impl ChallengeService {
 
         // 构造base_data
         let base_data = if let Some(sub_path) = sub_path {
-            format!("data/{}/{}/{}", resource_id, sub_path, sid)
+            format!("data/{resource_id}/{sub_path}/{sid}")
         } else {
-            format!("data/{}/{}", resource_id, sid)
+            format!("data/{resource_id}/{sid}")
         };
 
         let challenge_type = challenge_config.get_effective_type();
@@ -234,7 +234,7 @@ impl ChallengeService {
 
         let challenge_json: serde_json::Value =
             serde_json::from_str(&challenge_data).map_err(|e| {
-                DfsError::internal_error(format!("Failed to parse challenge data: {}", e))
+                DfsError::internal_error(format!("Failed to parse challenge data: {e}"))
             })?;
 
         let challenge_str = challenge_json["type"].as_str().unwrap_or("md5");
@@ -391,7 +391,7 @@ impl ChallengeService {
         use uuid::Uuid;
 
         let client_id = Uuid::new_v4().to_string();
-        let base_data = format!("legacy:{}:{}", resid, client_id);
+        let base_data = format!("legacy:{resid}:{client_id}");
         let challenge = Challenge::generate_md5(&base_data);
 
         // 计算预期的响应值

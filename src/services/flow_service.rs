@@ -345,12 +345,12 @@ impl FlowService {
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                 let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
                     if !prefix.is_empty() {
-                        format!("{}:server_bw_daily:{}:{}", prefix, server_id, today)
+                        format!("{prefix}:server_bw_daily:{server_id}:{today}")
                     } else {
-                        format!("server_bw_daily:{}:{}", server_id, today)
+                        format!("server_bw_daily:{server_id}:{today}")
                     }
                 } else {
-                    format!("server_bw_daily:{}:{}", server_id, today)
+                    format!("server_bw_daily:{server_id}:{today}")
                 };
 
                 if let Ok(Some(usage_str)) = self.data_store.get_string(&cache_key).await {
@@ -423,11 +423,11 @@ impl FlowService {
 
             let result =
                 self.js_runner.eval(js_code).await.map_err(|e| {
-                    DfsError::internal_error(format!("Plugin execution failed: {}", e))
+                    DfsError::internal_error(format!("Plugin execution failed: {e}"))
                 })?;
             Ok(result)
         } else {
-            Err(DfsError::internal_error(format!("Plugin {} not found", id)))
+            Err(DfsError::internal_error(format!("Plugin {id} not found")))
         }
     }
 
@@ -459,7 +459,7 @@ impl FlowService {
             // 兼容旧格式
             let (_should_break, basic_pool): (bool, Vec<(String, u32)>) =
                 serde_json::from_value(result).map_err(|e| {
-                    DfsError::internal_error(format!("Failed to parse plugin result: {}", e))
+                    DfsError::internal_error(format!("Failed to parse plugin result: {e}"))
                 })?;
             pool.clear();
             pool.extend(basic_pool);
@@ -468,7 +468,7 @@ impl FlowService {
     }
 
     /// 应用惩罚到pool（降低权重而不是移除）
-    fn apply_penalty_to_pool(&self, pool: &mut Vec<(String, u32)>, penalty_servers: &[String]) {
+    fn apply_penalty_to_pool(&self, pool: &mut [(String, u32)], penalty_servers: &[String]) {
         if penalty_servers.is_empty() {
             return;
         }
@@ -600,7 +600,7 @@ impl FlowService {
                 ("prefix", Some(sub)) => {
                     let normalized_sub = normalize_path_simple(sub);
                     let clean_prefix = base_path.trim_end_matches('/');
-                    format!("{}{}", clean_prefix, normalized_sub)
+                    format!("{clean_prefix}{normalized_sub}")
                 }
                 ("prefix", None) => {
                     return Err(DfsError::path_not_found(
@@ -625,7 +625,7 @@ impl FlowService {
                     Some(&self.data_store),
                 )
                 .await
-                .map_err(|e| DfsError::internal_error(format!("URL generation failed: {}", e)))
+                .map_err(|e| DfsError::internal_error(format!("URL generation failed: {e}")))
         } else {
             Err(DfsError::server_unavailable(&server.0))
         }
@@ -642,7 +642,7 @@ fn normalize_path_simple(path: &str) -> String {
 
     // 确保以斜杠开头
     if !cleaned.starts_with('/') {
-        format!("/{}", cleaned)
+        format!("/{cleaned}")
     } else {
         cleaned
     }

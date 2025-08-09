@@ -15,7 +15,6 @@ use crate::modules::storage::data_store::{
 use crate::modules::version_provider::{PluginVersionProvider, VersionCache, VersionUpdater};
 use crate::services::{ChallengeService, FlowService, ResourceService, SessionService};
 
-
 /// 统一的测试环境，包含所有必要的服务和Mock
 pub struct TestEnvironment {
     pub data_store: crate::modules::storage::data_store::DataStore,
@@ -121,15 +120,18 @@ impl MockDataStore {
             file_size: Some(1024),
             last_check: chrono::Utc::now().timestamp() as u64,
         };
-        
+
         // 为各种测试资源路径预设健康信息
         health_info.insert("test_server_1:/test/file.bin".to_string(), healthy.clone());
         health_info.insert("test_server_2:/test/file.bin".to_string(), healthy.clone());
         health_info.insert("test_server_1:/md5/file.bin".to_string(), healthy.clone());
-        health_info.insert("test_server_1:/sha256/file.bin".to_string(), healthy.clone());
+        health_info.insert(
+            "test_server_1:/sha256/file.bin".to_string(),
+            healthy.clone(),
+        );
         health_info.insert("test_server_1:/web/file.bin".to_string(), healthy.clone());
         health_info.insert("test_server_1:/game/v3/".to_string(), healthy.clone());
-        
+
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             challenges: Arc::new(RwLock::new(HashMap::new())),

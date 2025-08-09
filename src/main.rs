@@ -211,7 +211,7 @@ async fn main() -> DfsResult<()> {
         }
         Err(e) => {
             error!("Server error: {}", e);
-            Err(DfsError::internal_error(format!("Server error: {}", e)))
+            Err(DfsError::internal_error(format!("Server error: {e}")))
         }
     }
 }

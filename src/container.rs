@@ -30,7 +30,7 @@ lazy_static::lazy_static! {
         .build()
         .map_err(|e| {
             // Use panic here since this is a startup critical error
-            panic!("Failed to build reqwest client: {}", e);
+            panic!("Failed to build reqwest client: {e}");
         })
         .unwrap();
 }

@@ -40,7 +40,7 @@ impl SessionService {
         self.data_store
             .store_session(session_id, session)
             .await
-            .map_err(|e| DfsError::internal_error(format!("Failed to store session: {}", e)))
+            .map_err(|e| DfsError::internal_error(format!("Failed to store session: {e}")))
     }
 
     /// 统一的下载次数检查逻辑
@@ -82,9 +82,9 @@ impl SessionService {
                 .iter()
                 .map(|(start, end)| {
                     if *end == u32::MAX {
-                        format!("{}-", start)
+                        format!("{start}-")
                     } else {
-                        format!("{}-{}", start, end)
+                        format!("{start}-{end}")
                     }
                 })
                 .collect::<Vec<_>>()
@@ -101,15 +101,15 @@ impl SessionService {
         // 为每个range生成字符串，检查是否在allowed_chunks中
         for (start, end) in requested_ranges {
             let range_str = if *end == u32::MAX {
-                format!("{}-", start)
+                format!("{start}-")
             } else {
-                format!("{}-{}", start, end)
+                format!("{start}-{end}")
             };
 
             if !allowed_chunks.contains(&range_str) {
                 return Err(DfsError::invalid_input(
                     "range",
-                    format!("Range '{}' not allowed in session", range_str),
+                    format!("Range '{range_str}' not allowed in session"),
                 ));
             }
         }
@@ -150,7 +150,7 @@ impl SessionService {
         self.data_store
             .update_cdn_record_v2(session_id, chunk_key, record)
             .await
-            .map_err(|e| DfsError::internal_error(format!("Failed to record CDN selection: {}", e)))
+            .map_err(|e| DfsError::internal_error(format!("Failed to record CDN selection: {e}")))
     }
 
     /// 删除session，统一封装删除逻辑
@@ -158,7 +158,7 @@ impl SessionService {
         self.data_store
             .remove_session(session_id)
             .await
-            .map_err(|e| DfsError::internal_error(format!("Failed to remove session: {}", e)))
+            .map_err(|e| DfsError::internal_error(format!("Failed to remove session: {e}")))
     }
 
     /// 刷新session过期时间
@@ -166,7 +166,7 @@ impl SessionService {
         self.data_store
             .refresh_session(session_id)
             .await
-            .map_err(|e| DfsError::internal_error(format!("Failed to refresh session: {}", e)))
+            .map_err(|e| DfsError::internal_error(format!("Failed to refresh session: {e}")))
     }
 
     /// 获取session统计信息
@@ -177,7 +177,7 @@ impl SessionService {
         self.data_store
             .get_session_stats(session_id)
             .await
-            .map_err(|e| DfsError::internal_error(format!("Failed to get session stats: {}", e)))
+            .map_err(|e| DfsError::internal_error(format!("Failed to get session stats: {e}")))
     }
 
     /// Session场景的Flow执行包装函数

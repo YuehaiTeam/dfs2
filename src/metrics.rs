@@ -382,7 +382,7 @@ pub async fn metrics_handler(
     let output = encoder.encode_to_string(&metric_families).map_err(|e| {
         error!("Failed to encode metrics: {}", e);
         crate::error::DfsError::InternalError {
-            reason: format!("Failed to encode metrics: {}", e),
+            reason: format!("Failed to encode metrics: {e}"),
         }
     })?;
 

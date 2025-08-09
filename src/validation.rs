@@ -181,8 +181,7 @@ impl ConfigValidator {
             for server_id in &resource.server {
                 if !config.servers.contains_key(server_id) {
                     report.add_error(format!(
-                        "资源 '{}' 引用了不存在的服务器 '{}'",
-                        resource_id, server_id
+                        "资源 '{resource_id}' 引用了不存在的服务器 '{server_id}'"
                     ));
                     report.config_valid = false;
                 }
@@ -192,8 +191,7 @@ impl ConfigValidator {
             for server_id in &resource.tries {
                 if !config.servers.contains_key(server_id) {
                     report.add_error(format!(
-                        "资源 '{}' 的tries列表中引用了不存在的服务器 '{}'",
-                        resource_id, server_id
+                        "资源 '{resource_id}' 的tries列表中引用了不存在的服务器 '{server_id}'"
                     ));
                     report.config_valid = false;
                 }
@@ -248,13 +246,11 @@ impl ConfigValidator {
                 if let Some(cache_ttl) = version_provider.cache_ttl {
                     if cache_ttl < 60 {
                         report.add_warning(format!(
-                            "资源 '{}' 的缓存TTL ({}) 小于60秒，可能导致API调用过于频繁",
-                            resource_id, cache_ttl
+                            "资源 '{resource_id}' 的缓存TTL ({cache_ttl}) 小于60秒，可能导致API调用过于频繁"
                         ));
                     } else if cache_ttl > 86400 {
                         report.add_warning(format!(
-                            "资源 '{}' 的缓存TTL ({}) 大于24小时，版本更新可能不及时",
-                            resource_id, cache_ttl
+                            "资源 '{resource_id}' 的缓存TTL ({cache_ttl}) 大于24小时，版本更新可能不及时"
                         ));
                     }
                 }
@@ -263,8 +259,7 @@ impl ConfigValidator {
                 if let Some(ref webhook_token) = version_provider.webhook_token {
                     if webhook_token.len() < 16 {
                         report.add_warning(format!(
-                            "资源 '{}' 的webhook token 长度过短，建议至少16个字符以确保安全性",
-                            resource_id
+                            "资源 '{resource_id}' 的webhook token 长度过短，建议至少16个字符以确保安全性"
                         ));
                     }
                 }
@@ -307,7 +302,7 @@ impl ConfigValidator {
                         var exports; // 使用var允许重定义
                         
                         /* USER CODE START */
-                        {}
+                        {plugin_code}
                         /* USER CODE END */
                         
                         // 检查是否正确设置了exports
@@ -322,8 +317,7 @@ impl ConfigValidator {
                         return {{ success: false, error: e.message }};
                     }}
                 }})()
-                "#,
-                plugin_code
+                "#
             );
 
             match js_runner.eval(test_code).await {
@@ -340,23 +334,21 @@ impl ConfigValidator {
                                     .get("error")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("未知错误");
-                                report.add_error(format!(
-                                    "插件 '{}' 语法错误: {}",
-                                    plugin_id, error_msg
-                                ));
+                                report
+                                    .add_error(format!("插件 '{plugin_id}' 语法错误: {error_msg}"));
                                 report.plugins_valid = false;
                             }
                         } else {
-                            report.add_error(format!("插件 '{}' 语法检查结果格式错误", plugin_id));
+                            report.add_error(format!("插件 '{plugin_id}' 语法检查结果格式错误"));
                             report.plugins_valid = false;
                         }
                     } else {
-                        report.add_error(format!("插件 '{}' 语法检查结果无法解析", plugin_id));
+                        report.add_error(format!("插件 '{plugin_id}' 语法检查结果无法解析"));
                         report.plugins_valid = false;
                     }
                 }
                 Err(e) => {
-                    report.add_error(format!("插件 '{}' 执行失败: {}", plugin_id, e));
+                    report.add_error(format!("插件 '{plugin_id}' 执行失败: {e}"));
                     report.plugins_valid = false;
                 }
             }
@@ -402,16 +394,12 @@ impl ConfigValidator {
                     } else {
                         // 服务器连接失败只是警告，不影响配置验证结果
                         report.add_warning(format!(
-                            "服务器 '{}' 连接失败或不可用 (测试路径: {})",
-                            server_id, health_check_path
+                            "服务器 '{server_id}' 连接失败或不可用 (测试路径: {health_check_path})"
                         ));
                     }
                 } else {
                     // 服务器配置错误是致命问题
-                    report.add_error(format!(
-                        "服务器 '{}' 配置错误，无法创建服务器实现",
-                        server_id
-                    ));
+                    report.add_error(format!("服务器 '{server_id}' 配置错误，无法创建服务器实现"));
                     report.servers_valid = false;
                 }
             } else {
@@ -468,13 +456,13 @@ impl ConfigValidator {
                             report.redis_valid = false;
                         }
                         Err(e) => {
-                            report.add_error(format!("Redis连接测试失败：读取失败 - {}", e));
+                            report.add_error(format!("Redis连接测试失败：读取失败 - {e}"));
                             report.redis_valid = false;
                         }
                     }
                 }
                 Err(e) => {
-                    report.add_error(format!("Redis连接测试失败：写入失败 - {}", e));
+                    report.add_error(format!("Redis连接测试失败：写入失败 - {e}"));
                     report.redis_valid = false;
                 }
             }
@@ -618,17 +606,14 @@ impl ConfigValidator {
                 }
                 Ok(_) => {
                     if required {
-                        report.add_error(format!("环境变量 {} 为空", var_name));
+                        report.add_error(format!("环境变量 {var_name} 为空"));
                     } else {
-                        report.add_warning(format!("环境变量 {} 为空，将使用默认值", var_name));
+                        report.add_warning(format!("环境变量 {var_name} 为空，将使用默认值"));
                     }
                 }
                 Err(_) => {
                     if required {
-                        report.add_error(format!(
-                            "缺少必需的环境变量 {} ({})",
-                            var_name, description
-                        ));
+                        report.add_error(format!("缺少必需的环境变量 {var_name} ({description})"));
                     } else {
                         info!(
                             "环境变量 {} 未设置，将使用默认值 ({})",
@@ -641,10 +626,8 @@ impl ConfigValidator {
 
         // 特殊检查：如果使用Redis，确保REDIS_URL已设置
         let store_type = std::env::var("DATA_STORE_TYPE").unwrap_or_else(|_| "file".to_string());
-        if store_type == "redis" {
-            if std::env::var("REDIS_URL").is_err() {
-                report.add_warning("使用Redis存储但未设置REDIS_URL，将使用默认值".to_string());
-            }
+        if store_type == "redis" && std::env::var("REDIS_URL").is_err() {
+            report.add_warning("使用Redis存储但未设置REDIS_URL，将使用默认值".to_string());
         }
     }
 }

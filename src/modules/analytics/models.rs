@@ -40,7 +40,7 @@ pub struct ChunkLog {
     pub cdn_records: Vec<CdnRecordLog>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientInsightsLog {
     pub bandwidth_stats: Option<HashMap<String, String>>,
     pub ttfb_stats: Option<HashMap<String, String>>,
@@ -49,7 +49,7 @@ pub struct ClientInsightsLog {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionLog {
     pub timestamp: String, // ISO 8601 format
-    pub log_type: String, // "session_completed", "session_timeout", "direct_download"
+    pub log_type: String,  // "session_completed", "session_timeout", "direct_download"
     pub session_id: Option<String>,
     pub resource_id: String,
     pub version: String,
@@ -74,7 +74,11 @@ impl GeoInfo {
         };
 
         GeoInfo {
-            country: if is_china_ip { "CN".to_string() } else { "Unknown".to_string() },
+            country: if is_china_ip {
+                "CN".to_string()
+            } else {
+                "Unknown".to_string()
+            },
             city: None, // 暂时不实现城市解析
             is_china_ip,
             ip_version,
@@ -88,15 +92,6 @@ impl SessionStatsLog {
             0.0
         } else {
             successful as f64 / total as f64
-        }
-    }
-}
-
-impl Default for ClientInsightsLog {
-    fn default() -> Self {
-        Self {
-            bandwidth_stats: None,
-            ttfb_stats: None,
         }
     }
 }

@@ -55,7 +55,7 @@ async fn handle_metadata_request_unified(
 
     // 生成响应中的name字段
     let response_name = if let Some(ref sub_path_val) = sub_path {
-        format!("{}/{}", resid, sub_path_val)
+        format!("{resid}/{sub_path_val}")
     } else {
         resid.clone()
     };
@@ -83,9 +83,9 @@ async fn handle_metadata_request_unified(
         Some(p) => p,
         None => {
             let resource_path = if let Some(ref sub_path_val) = sub_path {
-                format!("{}/{}", resid, sub_path_val)
+                format!("{resid}/{sub_path_val}")
             } else {
-                format!("{}:{}", resid, effective_version)
+                format!("{resid}:{effective_version}")
             };
             return Err(crate::error::DfsError::ResourceNotFound {
                 resource_id: resource_path,
@@ -95,12 +95,12 @@ async fn handle_metadata_request_unified(
 
     let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
         if !prefix.is_empty() {
-            format!("{}:kachina_meta:{}", prefix, path)
+            format!("{prefix}:kachina_meta:{path}")
         } else {
-            format!("kachina_meta:{}", path)
+            format!("kachina_meta:{path}")
         }
     } else {
-        format!("kachina_meta:{}", path)
+        format!("kachina_meta:{path}")
     };
 
     drop(config_guard); // 释放配置锁

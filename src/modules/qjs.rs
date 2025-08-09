@@ -367,14 +367,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_js_runner_creation() {
-        let js_runner = create_test_js_runner().await;
-
-        // Verify the runner was created (we can't access private field, so just check it exists)
-        assert!(std::ptr::addr_of!(js_runner.redis) as *const _ != std::ptr::null());
-    }
-
-    #[tokio::test]
     async fn test_javascript_basic_execution() {
         let js_runner = create_test_js_runner().await;
 

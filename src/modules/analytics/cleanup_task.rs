@@ -16,10 +16,7 @@ impl SessionCleanupTask {
     pub fn new(config: SharedConfig, redis: DataStore) -> Self {
         let logger = SessionLogger::new(config.clone(), redis.clone());
 
-        Self {
-            redis,
-            logger,
-        }
+        Self { redis, logger }
     }
 
     /// 启动清理任务（后台运行）

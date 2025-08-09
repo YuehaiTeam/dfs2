@@ -44,19 +44,19 @@ impl Challenge {
 
         // Calculate MD5 hash of original data (first hash)
         let first_hash = format!("{:x}", md5::compute(&original_data));
-        
+
         // Calculate MD5 hash of the first hash (second hash - this is the complete challenge)
         let second_hash = format!("{:x}", md5::compute(first_hash.as_bytes()));
-        
+
         // Remove last 1 byte (2 hex characters) from FIRST hash as partial data
         let partial_first_hash = first_hash[..first_hash.len() - 2].to_string();
 
         Challenge {
             challenge_type: ChallengeType::Md5,
-            hash: second_hash,          // Complete second hash
+            hash: second_hash,                // Complete second hash
             partial_data: partial_first_hash, // Partial first hash (missing last 2 chars)
-            missing_bytes: 1, // 1 byte = 2 hex characters
-            original_data: original_data,
+            missing_bytes: 1,                 // 1 byte = 2 hex characters
+            original_data,
         }
     }
 
@@ -71,20 +71,20 @@ impl Challenge {
 
         // Calculate SHA256 hash of original data (first hash)
         let first_hash = format!("{:x}", Sha256::digest(&original_data));
-        
+
         // Calculate SHA256 hash of the first hash (second hash - this is the complete challenge)
         let second_hash = format!("{:x}", Sha256::digest(first_hash.as_bytes()));
-        
+
         // Remove last N bytes (2N hex characters) from FIRST hash as partial data
         let chars_to_remove = (difficulty as usize) * 2; // difficulty bytes = difficulty*2 hex chars
         let partial_first_hash = first_hash[..first_hash.len() - chars_to_remove].to_string();
 
         Challenge {
             challenge_type: ChallengeType::Sha256,
-            hash: second_hash,          // Complete second hash
+            hash: second_hash,                // Complete second hash
             partial_data: partial_first_hash, // Partial first hash (missing last N bytes)
             missing_bytes: difficulty,
-            original_data: original_data,
+            original_data,
         }
     }
 
@@ -111,15 +111,15 @@ impl Challenge {
         if response.len() != 32 {
             return false;
         }
-        
+
         // Check if response contains only valid hex characters
         if !response.chars().all(|c| c.is_ascii_hexdigit()) {
             return false;
         }
-        
+
         // Calculate second MD5 hash of the submitted first hash
         let double_hash = format!("{:x}", md5::compute(response.to_lowercase().as_bytes()));
-        
+
         // Verify the double hash matches our stored hash
         double_hash == self.hash
     }
@@ -129,15 +129,15 @@ impl Challenge {
         if response.len() != 64 {
             return false;
         }
-        
+
         // Check if response contains only valid hex characters
         if !response.chars().all(|c| c.is_ascii_hexdigit()) {
             return false;
         }
-        
+
         // Calculate second SHA256 hash of the submitted first hash
         let double_hash = format!("{:x}", Sha256::digest(response.to_lowercase().as_bytes()));
-        
+
         // Verify the double hash matches our stored hash
         double_hash == self.hash
     }
@@ -150,7 +150,7 @@ impl Challenge {
                 // self.hash contains the complete second hash
                 // self.partial_data contains the partial first hash
                 format!("{}/{}", self.hash, self.partial_data)
-            },
+            }
             _ => {
                 // For other types, use the original format
                 format!("{}/{}", self.hash, self.partial_data)
@@ -164,11 +164,11 @@ impl Challenge {
             ChallengeType::Md5 => {
                 // For MD5: client should submit the complete first hash
                 format!("{:x}", md5::compute(&self.original_data))
-            },
+            }
             ChallengeType::Sha256 => {
                 // For SHA256: client should submit the complete first hash
                 format!("{:x}", Sha256::digest(&self.original_data))
-            },
+            }
             _ => {
                 // For other types: client should submit the original data in hex
                 hex::encode(&self.original_data)

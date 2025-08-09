@@ -31,13 +31,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         return None;
     }
 
-    for i in 0..=(haystack.len() - needle.len()) {
-        if &haystack[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-    }
-
-    None
+    (0..=(haystack.len() - needle.len())).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 /// 解析文件头部信息，查找 KachinaInstaller 标识符并提取索引信息
@@ -111,8 +105,7 @@ pub fn parse_file_header(data: &[u8]) -> Result<Value, String> {
         || metadata_sz > MAX_REASONABLE_SIZE
     {
         return Err(format!(
-            "Unreasonable size values detected: index_sz={}, config_sz={}, theme_sz={}, metadata_sz={}",
-            index_sz, config_sz, theme_sz, metadata_sz
+            "Unreasonable size values detected: index_sz={index_sz}, config_sz={config_sz}, theme_sz={theme_sz}, metadata_sz={metadata_sz}"
         ));
     }
 
@@ -123,8 +116,7 @@ pub fn parse_file_header(data: &[u8]) -> Result<Value, String> {
         .and_then(|sum| sum.checked_add(theme_sz))
         .and_then(|sum| sum.checked_add(metadata_sz))
         .ok_or_else(|| format!(
-            "Integer overflow when calculating data_end: index_start={}, index_sz={}, config_sz={}, theme_sz={}, metadata_sz={}",
-            index_start, index_sz, config_sz, theme_sz, metadata_sz
+            "Integer overflow when calculating data_end: index_start={index_start}, index_sz={index_sz}, config_sz={config_sz}, theme_sz={theme_sz}, metadata_sz={metadata_sz}"
         ))?;
 
     Ok(json!({
@@ -175,16 +167,12 @@ pub async fn fetch_file_range(
     // 使用 FlowService 获取文件的下载 URL
     let flow_list = &resource_config.flow;
     // 根据range计算文件大小
-    let request_file_size = if let Some(ref ranges) = ranges {
-        Some(
-            ranges
-                .iter()
-                .map(|(start, end)| (end - start + 1) as u64)
-                .sum(),
-        )
-    } else {
-        None // 没有range时不知道文件大小
-    };
+    let request_file_size = ranges.as_ref().map(|ranges| {
+        ranges
+            .iter()
+            .map(|(start, end)| (end - start + 1) as u64)
+            .sum()
+    });
 
     // 构建新的Flow参数结构
     let target = FlowTarget {
@@ -218,7 +206,7 @@ pub async fn fetch_file_range(
         } else {
             let range_parts: Vec<String> = ranges
                 .iter()
-                .map(|(start, end)| format!("{}-{}", start, end))
+                .map(|(start, end)| format!("{start}-{end}"))
                 .collect();
             format!("bytes={}", range_parts.join(","))
         }

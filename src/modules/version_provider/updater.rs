@@ -58,7 +58,6 @@ impl VersionUpdater {
     async fn update_versions(&self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let config = self.config.load();
         let mut update_count = 0;
-        let mut resource_index = 0;
 
         // 收集需要检查的资源
         let resources_to_check: Vec<(String, u32)> = config
@@ -79,7 +78,8 @@ impl VersionUpdater {
 
         debug!("Checking {} resources for version updates", total_resources);
 
-        for (resource_id, cache_ttl) in resources_to_check {
+        for (resource_index, (resource_id, cache_ttl)) in resources_to_check.into_iter().enumerate()
+        {
             // 错开检查时间，避免所有资源同时请求API
             if resource_index > 0 {
                 let stagger_delay = (resource_index * 1000) / total_resources; // 在1秒内分散
@@ -109,8 +109,6 @@ impl VersionUpdater {
             } else {
                 debug!("Skipping update for {} (cache still fresh)", resource_id);
             }
-
-            resource_index += 1;
         }
 
         if update_count > 0 {

@@ -74,7 +74,7 @@ async fn serve_challenge_page(Path(challenge_type): Path<String>) -> impl IntoRe
     let static_dir = std::env::var("STATIC_DIR").unwrap_or_else(|_| "static".to_string());
     let template_path = PathBuf::from(&static_dir)
         .join("challenge")
-        .join(format!("{}.html", challenge_type));
+        .join(format!("{challenge_type}.html"));
 
     match fs::read_to_string(&template_path) {
         Ok(template) => {
@@ -96,12 +96,11 @@ async fn serve_challenge_page(Path(challenge_type): Path<String>) -> impl IntoRe
 </head>
 <body>
     <h1 class="error">Challenge Type Not Supported</h1>
-    <p>The requested challenge type '{}' is not available.</p>
+    <p>The requested challenge type '{challenge_type}' is not available.</p>
     <p>Please contact the administrator if this error persists.</p>
 </body>
 </html>
-                "#,
-                challenge_type
+                "#
             );
             (StatusCode::NOT_FOUND, Html(error_html)).into_response()
         }
@@ -110,7 +109,7 @@ async fn serve_challenge_page(Path(challenge_type): Path<String>) -> impl IntoRe
 
 /// 根据文件扩展名确定Content-Type
 fn get_content_type(file_path: &str) -> &'static str {
-    let extension = file_path.split('.').last().unwrap_or("");
+    let extension = file_path.split('.').next_back().unwrap_or("");
     match extension {
         "html" | "htm" => "text/html; charset=utf-8",
         "css" => "text/css",

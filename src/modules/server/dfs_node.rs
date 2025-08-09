@@ -43,12 +43,12 @@ impl DfsNodeSigner {
         ranges: Option<&[(u32, u32)]>,
     ) -> String {
         // Build HMAC message: {uuid}\n/path/to/file\n{4byte hex unix过期时间}\n{ranges...}
-        let mut message = format!("{}\n{}\n{:08x}\n", uuid, path, expire_time);
+        let mut message = format!("{uuid}\n{path}\n{expire_time:08x}\n");
 
         // Add ranges if provided
         if let Some(ranges) = ranges {
             for (start, end) in ranges {
-                message.push_str(&format!("{}-{}\n", start, end));
+                message.push_str(&format!("{start}-{end}\n"));
             }
         }
 
@@ -58,7 +58,7 @@ impl DfsNodeSigner {
             Ok(mac) => mac,
             Err(e) => {
                 error!("Failed to create HMAC: {}", e);
-                return format!("error_hmac_creation");
+                return "error_hmac_creation".to_string();
             }
         };
         mac.update(message.as_bytes());
@@ -69,12 +69,12 @@ impl DfsNodeSigner {
         let hmac_hex = hex::encode(hmac_bytes);
 
         // Build final signature: {uuid}{expire_time}{hmac}{ranges...}
-        let mut signature = format!("{}{:08x}{}", uuid, expire_time, hmac_hex);
+        let mut signature = format!("{uuid}{expire_time:08x}{hmac_hex}");
 
         // Append ranges to signature
         if let Some(ranges) = ranges {
             for (start, end) in ranges {
-                signature.push_str(&format!("{}-{}", start, end));
+                signature.push_str(&format!("{start}-{end}"));
             }
         }
 
@@ -128,7 +128,7 @@ impl DfsNodeSigner {
         uuid: &str,
         ranges: Option<Vec<(u32, u32)>>,
     ) -> Result<String> {
-        let ranges_slice = ranges.as_ref().map(|v| v.as_slice());
+        let ranges_slice = ranges.as_deref();
         let url = self.generate_signed_url(path, uuid, None, ranges_slice);
         Ok(url)
     }
@@ -143,11 +143,8 @@ impl DfsNodeSigner {
         let mut expire_seconds = 3600; // Default 1 hour
 
         for (key, value) in url.query_pairs() {
-            match key.as_ref() {
-                "expire_seconds" => {
-                    expire_seconds = value.parse().unwrap_or(3600);
-                }
-                _ => {}
+            if key.as_ref() == "expire_seconds" {
+                expire_seconds = value.parse().unwrap_or(3600);
             }
         }
 

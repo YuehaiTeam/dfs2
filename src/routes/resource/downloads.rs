@@ -85,7 +85,7 @@ pub async fn handle_download_request_unified(
                 if !session.chunks.contains(requested_range) {
                     return Err(DfsError::download_not_allowed(
                         &resid,
-                        &format!("session does not allow range '{}'", requested_range),
+                        format!("session does not allow range '{requested_range}'"),
                     ));
                 }
             } else {
@@ -183,13 +183,11 @@ pub async fn handle_download_request_unified(
 
                 let cache_debug_msg = if sub_path.is_some() {
                     format!(
-                        "Prefix cache hit: file_size={}, resource_id={}, server_id={}, sub_path={:?}",
-                        file_size, resid, server_id, sub_path
+                        "Prefix cache hit: file_size={file_size}, resource_id={resid}, server_id={server_id}, sub_path={sub_path:?}"
                     )
                 } else {
                     format!(
-                        "Cache hit: file_size={}, resource_id={}, server_id={}",
-                        file_size, resid, server_id
+                        "Cache hit: file_size={file_size}, resource_id={resid}, server_id={server_id}"
                     )
                 };
                 debug!("{}", cache_debug_msg);
@@ -317,7 +315,7 @@ pub async fn handle_download_request_unified(
             .await
             .map_err(|e| {
                 error!("Failed to run flow for session in download: {}", e);
-                DfsError::internal_error(format!("Failed to generate download URL: {}", e))
+                DfsError::internal_error(format!("Failed to generate download URL: {e}"))
             })?
     } else {
         // Free模式：无session，直接使用FlowService
@@ -332,14 +330,14 @@ pub async fn handle_download_request_unified(
             .await
             .map_err(|e| {
                 error!("Failed to run flow for download: {}", e);
-                DfsError::internal_error(format!("Failed to generate download URL: {}", e))
+                DfsError::internal_error(format!("Failed to generate download URL: {e}"))
             })?
     };
     let cdn_url = flow_result.url;
 
     // 记录调度结果日志
     let resource_path = if let Some(ref sub_path_val) = sub_path {
-        format!("{}/{}", resid, sub_path_val)
+        format!("{resid}/{sub_path_val}")
     } else {
         resid.clone()
     };
@@ -510,13 +508,11 @@ pub async fn handle_download_request_unified(
 
                 let debug_msg = if sub_path.is_some() {
                     format!(
-                        "Updated prefix download bandwidth stats: actual_bytes={}, full_file_size={}, range={:?}, server_id={}, session_id={:?}",
-                        actual_bytes, full_file_size, range, server_id, original_session_id
+                        "Updated prefix download bandwidth stats: actual_bytes={actual_bytes}, full_file_size={full_file_size}, range={range:?}, server_id={server_id}, session_id={original_session_id:?}"
                     )
                 } else {
                     format!(
-                        "Updated bandwidth stats: actual_bytes={}, full_file_size={}, range={:?}, resource_id={}, server_id={}",
-                        actual_bytes, full_file_size, range, resid, server_id
+                        "Updated bandwidth stats: actual_bytes={actual_bytes}, full_file_size={full_file_size}, range={range:?}, resource_id={resid}, server_id={server_id}"
                     )
                 };
                 debug!("{}", debug_msg);
@@ -563,7 +559,7 @@ pub async fn download_redirect(
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
 
     // 获取 session 参数
-    let session_id = params.get("session").map(|s| s.clone());
+    let session_id = params.get("session").cloned();
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -582,7 +578,7 @@ pub async fn download_redirect(
             let mut headers = HeaderMap::new();
             headers.insert(
                 "cache-control",
-                format!("public, max-age={}", remaining_max_age)
+                format!("public, max-age={remaining_max_age}")
                     .parse()
                     .unwrap(),
             );
@@ -638,7 +634,7 @@ pub async fn download_json(
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
 
     // 提取 range 参数（历史客户端支持）
-    let range = params.get("range").map(|s| s.clone());
+    let range = params.get("range").cloned();
 
     // 统一从 sid 参数获取，支持历史客户端
     let session_id = {
@@ -675,7 +671,7 @@ pub async fn download_json(
                     }
                     Err(e) => {
                         return Err(crate::error::DfsError::InternalError {
-                            reason: format!("LEGACY_ERROR: {}", e.to_string()),
+                            reason: format!("LEGACY_ERROR: {e}"),
                         });
                     }
                 }
@@ -685,7 +681,7 @@ pub async fn download_json(
             }
         } else {
             // 新客户端：使用 sid 参数
-            params.get("sid").map(|s| s.clone())
+            params.get("sid").cloned()
         }
     };
 
@@ -748,7 +744,7 @@ pub async fn download_prefix_redirect(
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
 
     // 获取 session 参数
-    let session_id = params.get("session").map(|s| s.clone());
+    let session_id = params.get("session").cloned();
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -771,7 +767,7 @@ pub async fn download_prefix_redirect(
             let mut headers = HeaderMap::new();
             headers.insert(
                 "cache-control",
-                format!("public, max-age={}", remaining_max_age)
+                format!("public, max-age={remaining_max_age}")
                     .parse()
                     .unwrap(),
             );
@@ -828,7 +824,7 @@ pub async fn download_prefix_json(
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
 
     // 提取 range 参数（历史客户端支持）
-    let range = params.get("range").map(|s| s.clone());
+    let range = params.get("range").cloned();
 
     // 统一从 sid 参数获取，支持历史客户端
     let session_id = {
@@ -861,7 +857,7 @@ pub async fn download_prefix_json(
                     }
                     Err(e) => {
                         return Err(crate::error::DfsError::InternalError {
-                            reason: format!("LEGACY_ERROR: {}", e.to_string()),
+                            reason: format!("LEGACY_ERROR: {e}"),
                         });
                     }
                 }
@@ -871,7 +867,7 @@ pub async fn download_prefix_json(
             }
         } else {
             // 新客户端：使用 sid 参数
-            params.get("sid").map(|s| s.clone())
+            params.get("sid").cloned()
         }
     };
 

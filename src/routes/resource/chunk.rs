@@ -74,20 +74,20 @@ pub async fn get_cdn(
                 let start = start_str.parse::<u32>().map_err(|_| {
                     DfsError::invalid_input(
                         "range",
-                        format!("Invalid range format in part: {}", range_part),
+                        format!("Invalid range format in part: {range_part}"),
                     )
                 })?;
                 let end = end_str.parse::<u32>().map_err(|_| {
                     DfsError::invalid_input(
                         "range",
-                        format!("Invalid range format in part: {}", range_part),
+                        format!("Invalid range format in part: {range_part}"),
                     )
                 })?;
                 parsed_ranges.push((start, end));
             } else {
                 return Err(DfsError::invalid_input(
                     "range",
-                    format!("Invalid range format in part: {}", range_part),
+                    format!("Invalid range format in part: {range_part}"),
                 ));
             }
         }
@@ -139,7 +139,7 @@ pub async fn get_cdn(
 
     // 记录调度结果日志
     let resource_path = if let Some(ref sub_path_val) = session.sub_path {
-        format!("{}/{}", resid, sub_path_val)
+        format!("{resid}/{sub_path_val}")
     } else {
         resid.clone()
     };
