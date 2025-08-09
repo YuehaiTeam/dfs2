@@ -5,11 +5,11 @@ use utoipa::ToSchema;
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CdnRecord {
     pub url: String,
-    pub server_id: Option<String>,  // 服务器ID
-    pub skip_penalty: bool,         // 是否跳过惩罚机制
-    pub timestamp: u64,             // 调度时间戳
-    pub weight: u32,                // 实际使用的权重
-    pub size: Option<u64>,          // 实际下载的字节数
+    pub server_id: Option<String>, // 服务器ID
+    pub skip_penalty: bool,        // 是否跳过惩罚机制
+    pub timestamp: u64,            // 调度时间戳
+    pub weight: u32,               // 实际使用的权重
+    pub size: Option<u64>,         // 实际下载的字节数
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -17,13 +17,13 @@ pub struct Session {
     pub resource_id: String,
     pub version: String,
     pub chunks: Vec<String>,
-    pub sub_path: Option<String>,     // 新增：前缀资源的子路径
+    pub sub_path: Option<String>, // 新增：前缀资源的子路径
     pub cdn_records: HashMap<String, Vec<CdnRecord>>, // chunk_id -> Vec<CdnRecord>
     #[serde(default = "default_empty_json")]
     pub extras: serde_json::Value, // 额外的用户自定义数据
 }
 
-#[derive(Deserialize, ToSchema)]
+#[derive(Deserialize, ToSchema, Debug)]
 pub struct CreateSessionRequest {
     #[serde(default)]
     pub chunks: Vec<String>,
@@ -34,7 +34,7 @@ pub struct CreateSessionRequest {
     #[serde(default = "default_version")]
     pub version: String,
     #[serde(default)]
-    pub sub_path: Option<String>,     // 新增：支持前缀资源的sub_path
+    pub sub_path: Option<String>, // 新增：支持前缀资源的sub_path
     #[serde(default = "default_empty_json")]
     pub extras: serde_json::Value,
 }
@@ -82,13 +82,13 @@ use std::net::IpAddr;
 pub struct FlowTarget {
     pub resource_id: String,
     pub version: String,
-    pub sub_path: Option<String>,          // 前缀资源的子路径
-    pub file_size: Option<u64>,            // 由外部传入的文件大小
-    pub ranges: Option<Vec<(u32, u32)>>,   // 目标字节范围（由外部解析）
+    pub sub_path: Option<String>,        // 前缀资源的子路径
+    pub file_size: Option<u64>,          // 由外部传入的文件大小
+    pub ranges: Option<Vec<(u32, u32)>>, // 目标字节范围（由外部解析）
 }
 
 /// 请求上下文信息 - "在什么情况下访问"
-#[derive(Debug, Clone)]  
+#[derive(Debug, Clone)]
 pub struct FlowContext {
     pub client_ip: Option<IpAddr>,
     pub session_id: Option<String>,
@@ -104,8 +104,8 @@ pub struct FlowOptions {
 /// Flow执行结果
 #[derive(Debug, Clone)]
 pub struct FlowResult {
-    pub url: String,                       // 主要返回值：最终URL
+    pub url: String, // 主要返回值：最终URL
     pub selected_server_id: Option<String>,
     pub selected_server_weight: Option<u32>,
-    pub plugin_server_mapping: HashMap<String, (Option<String>, bool)>,  // 插件元数据映射
+    pub plugin_server_mapping: HashMap<String, (Option<String>, bool)>, // 插件元数据映射
 }

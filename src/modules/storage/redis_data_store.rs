@@ -349,22 +349,6 @@ impl DataStoreBackend for RedisDataStore {
         }
     }
 
-    async fn get_alive_status(&self, server_id: &str, path: &str) -> Result<Option<bool>, String> {
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| e.to_string())?;
-        let cache_key = self.redis_key("alive", &format!("{}:{}", server_id, path));
-        let result: Option<String> = conn.get(&cache_key).await.map_err(|e| e.to_string())?;
-        Ok(result.and_then(|s| s.parse::<bool>().ok()))
-    }
-
-    async fn set_alive_status(&self, server_id: &str, path: &str, is_alive: bool) -> Result<(), String> {
-        let mut conn = self.client.get_multiplexed_async_connection().await
-            .map_err(|e| e.to_string())?;
-        let cache_key = self.redis_key("alive", &format!("{}:{}", server_id, path));
-        // Cache for 5 minutes (300 seconds)
-        conn.set_ex(cache_key, is_alive.to_string(), 300).await.map_err(|e| e.to_string())
-    }
-
     async fn get_health_info(&self, server_id: &str, path: &str) -> Result<Option<HealthInfo>, String> {
         let mut conn = self.client.get_multiplexed_async_connection().await
             .map_err(|e| e.to_string())?;

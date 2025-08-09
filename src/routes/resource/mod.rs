@@ -1,8 +1,7 @@
 use axum::{
     Router,
-    routing::{delete, get, post},
+    routing::get,
 };
-use rand::RngCore;
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 

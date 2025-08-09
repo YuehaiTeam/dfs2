@@ -524,7 +524,6 @@ impl FlowService {
     ) -> DfsResult<bool> {
         let config = self.shared_config.load();
         if let Some(server_impl) = config.get_server(&server.0) {
-            // 简化版路径获取，直接访问配置
             let resource = config
                 .get_resource(&target.resource_id)
                 .ok_or_else(|| DfsError::resource_not_found(&target.resource_id))?;

@@ -6,11 +6,10 @@ use utoipa::ToSchema;
 #[serde(untagged)]
 pub enum ApiResponse {
     Success(ResponseData),
-    Error { 
-        message: String 
-    },
+    Error { message: String },
 }
 
+#[allow(dead_code)]
 #[derive(Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseData {
@@ -26,7 +25,7 @@ pub enum ResponseData {
         sid: String,
     },
     LegacyChallengeResponse {
-        challenge: String,  // 直接存储 "hash/source" 格式
+        challenge: String, // 直接存储 "hash/source" 格式
     },
     Session {
         tries: Vec<String>,
@@ -39,7 +38,7 @@ pub enum ResponseData {
         url: String,
     },
     Json(Value),
-    Raw(Value),
+    Raw(String),
     Empty,
 }
 
@@ -51,7 +50,7 @@ pub struct SessionCreatedResponse {
     pub sid: String,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ChallengeResponse {
     pub challenge: String,
     pub data: String,
@@ -66,7 +65,7 @@ pub struct MetadataResponse {
     pub data: Value,
 }
 
-#[derive(Serialize, ToSchema)]  
+#[derive(Serialize, ToSchema)]
 pub struct CdnUrlResponse {
     pub url: String,
 }
@@ -152,17 +151,6 @@ pub struct HealthMetrics {
 
 // Additional request types
 
-use serde::Deserialize;
-
-#[derive(Deserialize, ToSchema)]
-pub struct GetCdnRequest {
-    pub chunk: String,
-}
-
-#[derive(Deserialize, ToSchema)]
-pub struct VerifyRequest {
-    pub response: String,
-}
 
 impl ApiResponse {
     pub fn success(data: ResponseData) -> Self {

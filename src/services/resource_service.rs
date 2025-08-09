@@ -124,13 +124,6 @@ impl ResourceService {
             .and_then(|resource| resource.changelog.clone())
     }
 
-    /// Check if resource has dynamic version provider configured
-    pub fn has_version_provider(&self, resource_id: &str) -> bool {
-        let config = self.shared_config.load();
-        config.get_resource(resource_id)
-            .map(|resource| resource.version_provider.is_some())
-            .unwrap_or(false)
-    }
 
     /// Get currently cached version for a resource
     pub async fn get_cached_version(&self, resource_id: &str) -> Option<String> {
@@ -163,5 +156,28 @@ fn normalize_path(path: &str) -> String {
         format!("/{}", cleaned)
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+
+    #[tokio::test]
+    async fn test_normalize_path_security() {
+        // 测试路径遍历攻击防护
+        assert_eq!(normalize_path("../../../etc/passwd"), "/etc/passwd");
+        assert_eq!(normalize_path("..\\..\\windows\\system32"), "/windows/system32");
+        assert_eq!(normalize_path("normal/path"), "/normal/path");
+        assert_eq!(normalize_path("/already/absolute"), "/already/absolute");
+    }
+
+    #[tokio::test]
+    async fn test_combine_prefix_path() {
+        // 测试前缀路径组合
+        assert_eq!(combine_prefix_path("/games/base", "assets/texture.png"), "/games/base/assets/texture.png");
+        assert_eq!(combine_prefix_path("/games/base/", "/assets/model.obj"), "/games/base/assets/model.obj");
+        assert_eq!(combine_prefix_path("/games/base", "../../../hack"), "/games/base/hack");
     }
 }

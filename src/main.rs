@@ -9,6 +9,9 @@ mod routes;
 mod services;
 mod validation;
 
+#[cfg(test)]
+mod tests;
+
 use axum::{
     Router,
     body::Body,

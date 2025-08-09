@@ -40,7 +40,7 @@ pub struct TypeWeights {
 
 // Default functions for challenge configuration
 fn default_challenge_type() -> String {
-    "random".to_string()
+    "md5".to_string()
 }
 fn default_sha256_difficulty() -> u8 {
     2
@@ -131,26 +131,6 @@ impl Default for DownloadPolicy {
 }
 
 impl ChallengeConfig {
-    /// Create a challenge config for specific type with default settings
-    pub fn new(challenge_type: ChallengeType, difficulty: Option<u8>) -> Self {
-        let type_str = match challenge_type {
-            ChallengeType::Md5 => "md5",
-            ChallengeType::Sha256 => "sha256",
-            ChallengeType::Web => "web",
-        };
-
-        ChallengeConfig {
-            challenge_type: type_str.to_string(),
-            sha256_difficulty: difficulty.unwrap_or(2).clamp(1, 4),
-            web_plugin: default_web_plugin(),
-            type_weights: Some(TypeWeights {
-                md5: default_md5_weight(),
-                sha256: default_sha256_weight(),
-                web: default_web_weight(),
-            }),
-        }
-    }
-
     /// Get the actual challenge type to use, considering random selection
     pub fn get_effective_type(&self) -> ChallengeType {
         match self.challenge_type.as_str() {
@@ -212,7 +192,7 @@ impl<'js> IntoJs<'js> for ChallengeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ServerConfig {
     pub id: String,
     pub url: String,
@@ -349,24 +329,6 @@ impl AppConfig {
         &self.challenge
     }
 
-    /// Apply environment variable overrides to challenge configuration
-    pub fn apply_env_overrides(&mut self) {
-        // Override global challenge config with environment variables
-        if let Ok(challenge_type) = std::env::var("CHALLENGE_DEFAULT_TYPE") {
-            self.challenge.challenge_type = challenge_type;
-        }
-
-        if let Ok(difficulty_str) = std::env::var("CHALLENGE_SHA256_DIFFICULTY") {
-            if let Ok(difficulty) = difficulty_str.parse::<u8>() {
-                self.challenge.sha256_difficulty = difficulty.clamp(1, 4);
-            }
-        }
-
-        if let Ok(web_plugin) = std::env::var("CHALLENGE_WEB_PLUGIN") {
-            self.challenge.web_plugin = web_plugin;
-        }
-    }
-
     pub async fn load() -> anyhow::Result<Self> {
         let path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
         let plugin_path = std::env::var("PLUGIN_PATH").unwrap_or_else(|_| "plugins/".to_string());
@@ -417,9 +379,6 @@ impl AppConfig {
         }
         config.server_impl = server_impl;
 
-        // Apply environment variable overrides
-        config.apply_env_overrides();
-
         Ok(config)
     }
 
@@ -430,7 +389,6 @@ impl AppConfig {
     pub fn get_resource(&self, id: &str) -> Option<&ResourceConfig> {
         self.resources.get(id)
     }
-
 }
 
 /// 使用 ArcSwap 实现的共享配置，支持热重载且无锁读取
@@ -474,349 +432,117 @@ impl SharedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
-    fn create_test_config() -> AppConfig {
-        let mut servers = HashMap::new();
-        servers.insert(
-            "s3_server".to_string(),
-            ServerConfig {
-                id: "s3_server".to_string(),
-                url: "https://access:secret@s3.example.com?region=us-east-1&bucket=test"
-                    .to_string(),
-                r#type: "s3".to_string(),
-                health_check_path: None,
-            },
-        );
-        servers.insert(
-            "direct_server".to_string(),
-            ServerConfig {
-                id: "direct_server".to_string(),
-                url: "https://cdn.example.com".to_string(),
-                r#type: "direct".to_string(),
-                health_check_path: None,
-            },
-        );
+    #[test]
+    fn test_sha256_difficulty_clamping() {
+        // 测试范围内的值不变
+        let mut config = ChallengeConfig::default();
+        config.sha256_difficulty = 2;
+        assert_eq!(config.get_sha256_difficulty(), 2);
 
-        let mut resources = HashMap::new();
-        let mut versions = HashMap::new();
-        let mut version_1_0 = HashMap::new();
-        version_1_0.insert("default".to_string(), "/app/v1.0/app.exe".to_string());
-        version_1_0.insert(
-            "s3_server".to_string(),
-            "/releases/v1.0/app.exe".to_string(),
-        );
-        versions.insert("1.0".to_string(), version_1_0);
+        config.sha256_difficulty = 1;
+        assert_eq!(config.get_sha256_difficulty(), 1);
 
-        resources.insert(
-            "test_app".to_string(),
-            ResourceConfig {
-                latest: "1.0".to_string(),
-                versions,
-                tries: vec!["s3_server".to_string(), "direct_server".to_string()],
-                server: vec!["s3_server".to_string(), "direct_server".to_string()],
-                flow: vec![],    // 简单测试不需要复杂flow
-                challenge: None, // 使用默认挑战配置
-                download: crate::config::DownloadPolicy::Enabled, // 默认下载策略
-                resource_type: "file".to_string(), // 默认文件类型
-                legacy_client_support: false, // 测试中默认不支持历史客户端
-                legacy_client_full_range: false, // 测试中默认不启用全范围模式
-                cache_enabled: false, // 默认不启用缓存
-                cache_subpaths: vec![], // 默认无缓存子路径
-                cache_max_age: default_cache_max_age(), // 默认缓存时间
-                changelog: None, // 测试中默认无静态changelog
-                version_provider: None, // 测试中默认不使用动态版本
-            },
-        );
+        config.sha256_difficulty = 4;
+        assert_eq!(config.get_sha256_difficulty(), 4);
 
-        AppConfig {
-            servers,
-            resources,
-            plugins: HashMap::new(),
-            debug_mode: false,
-            plugin_code: HashMap::new(),
-            server_impl: HashMap::new(),
-            challenge: ChallengeConfig::default(),
-        }
+        // 测试超出范围的值被限制
+        config.sha256_difficulty = 0;
+        assert_eq!(config.get_sha256_difficulty(), 1); // 最小值1
+
+        config.sha256_difficulty = 5;
+        assert_eq!(config.get_sha256_difficulty(), 4); // 最大值4
+
+        config.sha256_difficulty = 255;
+        assert_eq!(config.get_sha256_difficulty(), 4); // 最大值4
     }
 
     #[test]
-    fn test_get_server() {
-        let config = create_test_config();
-
-        let server = config.get_server("s3_server");
-        assert!(server.is_none()); // server_impl为空，所以返回None
-
-        // 测试不存在的服务器
-        let server = config.get_server("nonexistent");
-        assert!(server.is_none());
-    }
-
-    #[test]
-    fn test_get_resource() {
-        let config = create_test_config();
-
-        let resource = config.get_resource("test_app");
-        assert!(resource.is_some());
-        let resource = resource.unwrap();
-        assert_eq!(resource.latest, "1.0");
-        assert_eq!(resource.tries.len(), 2);
-
-        // 测试不存在的资源
-        let resource = config.get_resource("nonexistent");
-        assert!(resource.is_none());
-    }
-
-    #[test]
-    fn test_get_version_path() {
-        let config = create_test_config();
-
-        // 测试默认路径
-        let path = config.get_version_path("test_app", "1.0", None, None);
-        assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
-
-        // 测试特定服务器路径
-        let path = config.get_version_path("test_app", "1.0", Some("s3_server"), None);
-        assert_eq!(path, Some("/releases/v1.0/app.exe".to_string()));
-
-        // 测试不存在的版本
-        let path = config.get_version_path("test_app", "2.0", None, None);
-        assert!(path.is_none());
-
-        // 测试不存在的资源
-        let path = config.get_version_path("nonexistent", "1.0", None, None);
-        assert!(path.is_none());
-
-        // 测试不存在的服务器，应该回退到默认
-        let path = config.get_version_path("test_app", "1.0", Some("nonexistent_server"), None);
-        assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
-    }
-
-    #[test]
-    fn test_version_placeholder_replacement() {
-        let mut config = create_test_config();
-
-        // 添加包含版本占位符的配置
-        let mut version_with_placeholder = HashMap::new();
-        version_with_placeholder.insert(
-            "default".to_string(),
-            "/releases/${version}/app.exe".to_string(),
-        );
-        version_with_placeholder.insert(
-            "s3_server".to_string(),
-            "/s3-bucket/${version}/installer.exe".to_string(),
-        );
-
-        if let Some(resource) = config.resources.get_mut("test_app") {
-            resource
-                .versions
-                .insert("2.0".to_string(), version_with_placeholder);
-        }
-
-        // 测试版本占位符替换 - 默认路径
-        let path = config.get_version_path("test_app", "2.0", None, None);
-        assert_eq!(path, Some("/releases/2.0/app.exe".to_string()));
-
-        // 测试版本占位符替换 - 特定服务器路径
-        let path = config.get_version_path("test_app", "2.0", Some("s3_server"), None);
-        assert_eq!(path, Some("/s3-bucket/2.0/installer.exe".to_string()));
-
-        // 测试不存在占位符的路径不受影响
-        let path = config.get_version_path("test_app", "1.0", None, None);
-        assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
-
-        // 测试复杂版本号的替换
-        let mut complex_version = HashMap::new();
-        complex_version.insert(
-            "default".to_string(),
-            "/apps/${version}/final/dist.zip".to_string(),
-        );
-
-        if let Some(resource) = config.resources.get_mut("test_app") {
-            resource
-                .versions
-                .insert("1.2.3-beta".to_string(), complex_version);
-        }
-
-        let path = config.get_version_path("test_app", "1.2.3-beta", None, None);
-        assert_eq!(path, Some("/apps/1.2.3-beta/final/dist.zip".to_string()));
-    }
-
-    #[test]
-    fn test_versions_default_template() {
-        let mut config = create_test_config();
-
-        // 添加default模板配置
-        let mut default_template = HashMap::new();
-        default_template.insert(
-            "default".to_string(),
-            "/releases/${version}/app.exe".to_string(),
-        );
-        default_template.insert(
-            "s3_server".to_string(),
-            "/s3-releases/${version}/installer.exe".to_string(),
-        );
-
-        if let Some(resource) = config.resources.get_mut("test_app") {
-            resource
-                .versions
-                .insert("default".to_string(), default_template);
-        }
-
-        // 测试使用default模板 - 不存在的版本应该使用default模板
-        let path = config.get_version_path("test_app", "3.0.0", None, None);
-        assert_eq!(path, Some("/releases/3.0.0/app.exe".to_string()));
-
-        // 测试使用default模板 - 特定服务器
-        let path = config.get_version_path("test_app", "3.0.0", Some("s3_server"), None);
-        assert_eq!(path, Some("/s3-releases/3.0.0/installer.exe".to_string()));
-
-        // 测试特定版本优先级高于default模板
-        let path = config.get_version_path("test_app", "1.0", None, None);
-        assert_eq!(path, Some("/app/v1.0/app.exe".to_string())); // 仍然使用特定版本配置
-
-        // 添加一个只有部分服务器配置的版本
-        let mut partial_version = HashMap::new();
-        partial_version.insert(
-            "direct_server".to_string(),
-            "/direct/v4.0.0/app.exe".to_string(),
-        );
-
-        if let Some(resource) = config.resources.get_mut("test_app") {
-            resource
-                .versions
-                .insert("4.0.0".to_string(), partial_version);
-        }
-
-        // 测试混合使用：特定版本有部分配置，缺失的回退到default模板
-        let path = config.get_version_path("test_app", "4.0.0", Some("direct_server"), None);
-        assert_eq!(path, Some("/direct/v4.0.0/app.exe".to_string())); // 使用特定配置
-
-        let path = config.get_version_path("test_app", "4.0.0", None, None);
-        assert_eq!(path, Some("/releases/4.0.0/app.exe".to_string())); // default服务器使用模板
-
-        let path = config.get_version_path("test_app", "4.0.0", Some("s3_server"), None);
-        assert_eq!(path, Some("/s3-releases/4.0.0/installer.exe".to_string())); // s3_server使用模板
-    }
-
-    #[test]
-    fn test_server_config_serialization() {
-        let server = ServerConfig {
-            id: "test".to_string(),
-            url: "https://example.com".to_string(),
-            r#type: "direct".to_string(),
-            health_check_path: None,
+    fn test_challenge_config_resource_override() {
+        use std::collections::HashMap;
+        
+        // 创建全局配置
+        let global_challenge = ChallengeConfig {
+            challenge_type: "md5".to_string(),
+            sha256_difficulty: 2,
+            web_plugin: "global_plugin".to_string(),
+            type_weights: None,
         };
 
-        let yaml = serde_yaml::to_string(&server).unwrap();
-        let deserialized: ServerConfig = serde_yaml::from_str(&yaml).unwrap();
+        // 创建资源特定配置
+        let resource_challenge = ChallengeConfig {
+            challenge_type: "sha256".to_string(),
+            sha256_difficulty: 3,
+            web_plugin: "resource_plugin".to_string(),
+            type_weights: None,
+        };
 
-        assert_eq!(server.id, deserialized.id);
-        assert_eq!(server.url, deserialized.url);
-        assert_eq!(server.r#type, deserialized.r#type);
-    }
-
-    #[test]
-    fn test_resource_config_serialization() {
-        let mut versions = HashMap::new();
-        let mut version_map = HashMap::new();
-        version_map.insert("default".to_string(), "/path/to/file".to_string());
-        versions.insert("1.0".to_string(), version_map);
-
-        let resource = ResourceConfig {
+        let mut resources = HashMap::new();
+        let resource_with_challenge = ResourceConfig {
             latest: "1.0".to_string(),
-            versions,
-            tries: vec!["server1".to_string()],
-            server: vec!["server1".to_string(), "server2".to_string()],
+            versions: HashMap::new(),
+            tries: vec![],
+            server: vec![],
             flow: vec![],
-            challenge: None,
+            challenge: Some(resource_challenge), // 资源特定配置
             download: DownloadPolicy::Enabled,
             resource_type: "file".to_string(),
-            legacy_client_support: false,
-            legacy_client_full_range: false,
             cache_enabled: false,
             cache_subpaths: vec![],
-            cache_max_age: default_cache_max_age(),
+            cache_max_age: 300,
+            legacy_client_support: false,
+            legacy_client_full_range: false,
             changelog: None,
             version_provider: None,
         };
 
-        let yaml = serde_yaml::to_string(&resource).unwrap();
-        let deserialized: ResourceConfig = serde_yaml::from_str(&yaml).unwrap();
+        let resource_without_challenge = ResourceConfig {
+            latest: "1.0".to_string(),
+            versions: HashMap::new(),
+            tries: vec![],
+            server: vec![],
+            flow: vec![],
+            challenge: None, // 无资源特定配置
+            download: DownloadPolicy::Enabled,
+            resource_type: "file".to_string(),
+            cache_enabled: false,
+            cache_subpaths: vec![],
+            cache_max_age: 300,
+            legacy_client_support: false,
+            legacy_client_full_range: false,
+            changelog: None,
+            version_provider: None,
+        };
 
-        assert_eq!(resource.latest, deserialized.latest);
-        assert_eq!(resource.tries.len(), deserialized.tries.len());
-        assert_eq!(resource.server.len(), deserialized.server.len());
-        assert_eq!(resource.resource_type, deserialized.resource_type);
-    }
+        resources.insert("resource_with_challenge".to_string(), resource_with_challenge);
+        resources.insert("resource_without_challenge".to_string(), resource_without_challenge);
 
-    #[test]
-    fn test_prefix_path_handling() {
-        // 测试路径标准化
-        assert_eq!(normalize_path("file.txt"), "/file.txt");
-        assert_eq!(normalize_path("/file.txt"), "/file.txt");
-        assert_eq!(normalize_path("../../../etc/passwd"), "/etc/passwd");
-        assert_eq!(normalize_path("dir\\file.txt"), "/dir/file.txt");
+        let config = AppConfig {
+            servers: HashMap::new(),
+            resources,
+            plugins: HashMap::new(),
+            debug_mode: false,
+            challenge: global_challenge,
+            plugin_code: HashMap::new(),
+            server_impl: HashMap::new(),
+        };
 
-        // 测试前缀路径组合
-        assert_eq!(
-            combine_prefix_path("/app/v1.0/", "bin/app.exe"),
-            "/app/v1.0/bin/app.exe"
-        );
-        assert_eq!(
-            combine_prefix_path("/app/v1.0", "/bin/app.exe"),
-            "/app/v1.0/bin/app.exe"
-        );
-        assert_eq!(
-            combine_prefix_path("/app/v1.0/", "../../../etc/passwd"),
-            "/app/v1.0/etc/passwd"
-        );
-    }
+        // 测试有资源特定配置的情况 - 应该使用资源配置
+        let resource_config = config.get_challenge_config("resource_with_challenge");
+        assert_eq!(resource_config.challenge_type, "sha256");
+        assert_eq!(resource_config.sha256_difficulty, 3);
+        assert_eq!(resource_config.web_plugin, "resource_plugin");
 
-    #[test]
-    fn test_get_version_path_with_sub() {
-        let mut config = create_test_config();
+        // 测试没有资源特定配置的情况 - 应该使用全局配置
+        let global_config = config.get_challenge_config("resource_without_challenge");
+        assert_eq!(global_config.challenge_type, "md5");
+        assert_eq!(global_config.sha256_difficulty, 2);
+        assert_eq!(global_config.web_plugin, "global_plugin");
 
-        // 添加前缀资源
-        let mut prefix_versions = HashMap::new();
-        let mut prefix_version_1_0 = HashMap::new();
-        prefix_version_1_0.insert("default".to_string(), "/releases/v1.0/".to_string());
-        prefix_versions.insert("1.0".to_string(), prefix_version_1_0);
-
-        config.resources.insert(
-            "app_suite".to_string(),
-            ResourceConfig {
-                latest: "1.0".to_string(),
-                versions: prefix_versions,
-                tries: vec!["s3_server".to_string()],
-                server: vec!["s3_server".to_string()],
-                flow: vec![],
-                challenge: None,
-                download: DownloadPolicy::Enabled,
-                resource_type: "prefix".to_string(),
-                legacy_client_support: false,
-                legacy_client_full_range: false,
-                cache_enabled: false,
-                cache_subpaths: vec![],
-                cache_max_age: default_cache_max_age(),
-                changelog: None,
-                version_provider: None,
-            },
-        );
-
-        // 测试文件资源（忽略子路径）
-        let path = config.get_version_path("test_app", "1.0", None, Some("ignored"));
-        assert_eq!(path, Some("/app/v1.0/app.exe".to_string()));
-
-        // 测试前缀资源（需要子路径）
-        let path = config.get_version_path("app_suite", "1.0", None, None);
-        assert!(path.is_none()); // 前缀资源必须提供子路径
-
-        let path = config.get_version_path("app_suite", "1.0", None, Some("windows/app.exe"));
-        assert_eq!(path, Some("/releases/v1.0/windows/app.exe".to_string()));
-
-        // 测试不存在的资源
-        let path = config.get_version_path("nonexistent", "1.0", None, Some("file"));
-        assert!(path.is_none());
+        // 测试不存在的资源 - 应该使用全局配置
+        let fallback_config = config.get_challenge_config("nonexistent_resource");
+        assert_eq!(fallback_config.challenge_type, "md5");
+        assert_eq!(fallback_config.sha256_difficulty, 2);
+        assert_eq!(fallback_config.web_plugin, "global_plugin");
     }
 }

@@ -1,6 +1,13 @@
+use crate::responses::ApiResponse;
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 use thiserror::Error;
 
 /// DFS2 统一错误类型系统
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum DfsError {
     /// 资源未找到错误
@@ -81,6 +88,10 @@ pub enum DfsError {
     #[error("Internal server error: {reason}")]
     InternalError { reason: String },
 
+    /// 认证失败错误
+    #[error("Authentication failed: {reason}")]
+    AuthenticationFailed { reason: String },
+
     /// 权限错误
     #[error("Permission denied: {resource}")]
     PermissionDenied { resource: String },
@@ -88,6 +99,10 @@ pub enum DfsError {
     /// 无效输入错误
     #[error("Invalid input: {field} - {reason}")]
     InvalidInput { field: String, reason: String },
+
+    /// 无效配置错误
+    #[error("Invalid configuration:  {reason}")]
+    InvalidConfig { reason: String },
 
     /// 超时错误
     #[error("Operation timeout: {operation} after {timeout_ms}ms")]
@@ -101,6 +116,7 @@ pub enum DfsError {
 /// 便捷的结果类型别名
 pub type DfsResult<T> = Result<T, DfsError>;
 
+#[allow(dead_code)]
 impl DfsError {
     /// 创建资源未找到错误
     pub fn resource_not_found<S: Into<String>>(resource_id: S) -> Self {
@@ -163,21 +179,25 @@ impl DfsError {
             reason: reason.into(),
         }
     }
-    
+
     /// 创建插件未找到错误
     pub fn plugin_not_found<S: Into<String>>(plugin_id: S) -> Self {
         Self::PluginNotFound {
             plugin_id: plugin_id.into(),
         }
     }
-    
+
     /// 创建插件错误（别名，兼容性）
-    pub fn plugin_error<S1: Into<String>, S2: Into<String>>(
-        plugin_id: S1,
-        reason: S2,
-    ) -> Self {
+    pub fn plugin_error<S1: Into<String>, S2: Into<String>>(plugin_id: S1, reason: S2) -> Self {
         Self::PluginExecutionFailed {
             plugin_id: plugin_id.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// 创建认证失败错误
+    pub fn authentication_failed<S: Into<String>>(reason: S) -> Self {
+        Self::AuthenticationFailed {
             reason: reason.into(),
         }
     }
@@ -193,6 +213,13 @@ impl DfsError {
     pub fn invalid_input<S1: Into<String>, S2: Into<String>>(field: S1, reason: S2) -> Self {
         Self::InvalidInput {
             field: field.into(),
+            reason: reason.into(),
+        }
+    }
+
+    /// 创建无效配置错误
+    pub fn invalid_config<S: Into<String>>(reason: S) -> Self {
+        Self::InvalidConfig {
             reason: reason.into(),
         }
     }
@@ -226,11 +253,14 @@ impl DfsError {
             | Self::ChallengeNotFound { .. }
             | Self::PluginNotFound { .. } => 404,
 
+            Self::AuthenticationFailed { .. } => 401,
+
             Self::PermissionDenied { .. } => 403,
 
             Self::DownloadNotAllowed { .. } => 403,
 
             Self::InvalidInput { .. } => 400,
+            Self::InvalidConfig { .. } => 400,
 
             Self::ChallengeVerificationFailed { .. } => 402,
 
@@ -288,11 +318,15 @@ impl DfsError {
 
             Self::SerializationError { .. } => "serialization",
 
+            Self::AuthenticationFailed { .. } => "authentication",
+
             Self::PermissionDenied { .. } => "permission",
 
             Self::DownloadNotAllowed { .. } => "download",
 
             Self::InvalidInput { .. } => "input",
+
+            Self::InvalidConfig { .. } => "config",
 
             Self::Timeout { .. } => "timeout",
 
@@ -354,6 +388,16 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for DfsError {
         Self::InternalError {
             reason: err.to_string(),
         }
+    }
+}
+
+/// Axum IntoResponse implementation for DfsError
+impl IntoResponse for DfsError {
+    fn into_response(self) -> Response {
+        let status_code = StatusCode::from_u16(self.http_status_code())
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let error_response = ApiResponse::error(self.to_string());
+        (status_code, Json(error_response)).into_response()
     }
 }
 

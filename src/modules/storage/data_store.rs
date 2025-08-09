@@ -59,8 +59,6 @@ pub trait DataStoreBackend: Send + Sync {
     async fn set_cached_metadata(&self, key: &str, value: &str, expires: u32) -> Result<(), String>;
     async fn get_string(&self, key: &str) -> Result<Option<String>, String>;
     async fn set_string(&self, key: &str, value: &str, expires: Option<u32>) -> Result<(), String>;
-    async fn get_alive_status(&self, server_id: &str, path: &str) -> Result<Option<bool>, String>;
-    async fn set_alive_status(&self, server_id: &str, path: &str, is_alive: bool) -> Result<(), String>;
     
     // 新增：健康信息支持
     async fn get_health_info(&self, server_id: &str, path: &str) -> Result<Option<HealthInfo>, String>;
@@ -399,21 +397,6 @@ impl DataStoreBackend for FileDataStore {
         let storage_key = format!("general_cache:{}", key);
         let stored_value = StoredValue::new(value.to_string(), expires);
         self.write_json_file(&storage_key, &stored_value).await
-    }
-
-    async fn get_alive_status(&self, server_id: &str, path: &str) -> Result<Option<bool>, String> {
-        let key = format!("alive_status:{}:{}", server_id, path);
-        if let Some(stored_value) = self.read_json_file::<StoredValue<bool>>(&key).await? {
-            Ok(stored_value.into_data())
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn set_alive_status(&self, server_id: &str, path: &str, is_alive: bool) -> Result<(), String> {
-        let key = format!("alive_status:{}:{}", server_id, path);
-        let stored_value = StoredValue::new(is_alive, Some(300)); // 5分钟过期
-        self.write_json_file(&key, &stored_value).await
     }
 
     async fn get_health_info(&self, server_id: &str, path: &str) -> Result<Option<HealthInfo>, String> {

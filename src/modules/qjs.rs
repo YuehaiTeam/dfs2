@@ -21,6 +21,7 @@ thread_local! {
     };
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct JsRunner {
     config: SharedConfig,
@@ -343,10 +344,9 @@ mod tests {
     use super::*;
     use crate::modules::storage::data_store::DataStore;
     use std::collections::HashMap;
-    use std::sync::{Arc, RwLock};
 
     async fn create_test_js_runner() -> JsRunner {
-        let config = Arc::new(RwLock::new(crate::config::AppConfig {
+        let app_config = crate::config::AppConfig {
             servers: HashMap::new(),
             resources: HashMap::new(),
             plugins: HashMap::new(),
@@ -354,7 +354,9 @@ mod tests {
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
             challenge: crate::config::ChallengeConfig::default(),
-        }));
+        };
+
+        let config = crate::config::SharedConfig::new(app_config);
 
         let redis_store = crate::modules::storage::data_store::FileDataStore::new()
             .await

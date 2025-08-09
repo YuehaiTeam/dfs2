@@ -13,6 +13,7 @@ pub struct GitLfsSigner {
     url_cache_ttl: u32,          // SHA256→URL缓存时间
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct LfsPointer {
     version: String,
@@ -38,6 +39,7 @@ struct LfsBatchResponse {
     objects: Vec<LfsObjectResponse>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct LfsObjectResponse {
     oid: String,
@@ -45,6 +47,7 @@ struct LfsObjectResponse {
     actions: Option<HashMap<String, LfsAction>>,
 }
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct LfsAction {
     href: String,

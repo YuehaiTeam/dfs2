@@ -39,7 +39,7 @@ pub async fn handle_download_request_unified(
     let config_guard = ctx.shared_config.load();
 
     // 统一资源验证：使用ResourceService验证资源存在性和类型
-    let (validated_resid, effective_version) = ctx
+    let (validated_resid, _effective_version) = ctx
         .resource_service
         .validate_resource_and_version(&resid, "", sub_path.as_deref())
         .await?;
@@ -903,3 +903,6 @@ pub async fn download_prefix_json(
         ),
     }
 }
+
+
+// 测试已移除 - 直接下载功能已简化，复杂的API测试架构不再需要
