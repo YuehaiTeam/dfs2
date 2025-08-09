@@ -8,7 +8,6 @@ use crate::modules::analytics::SessionLogger;
 use crate::modules::storage::data_store::DataStore;
 
 pub struct SessionCleanupTask {
-    config: SharedConfig,
     redis: DataStore,
     logger: SessionLogger,
 }
@@ -18,7 +17,6 @@ impl SessionCleanupTask {
         let logger = SessionLogger::new(config.clone(), redis.clone());
 
         Self {
-            config,
             redis,
             logger,
         }

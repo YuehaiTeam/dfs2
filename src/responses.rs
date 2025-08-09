@@ -1,12 +1,20 @@
 use serde::Serialize;
 use serde_json::Value;
 use utoipa::ToSchema;
+use axum::{
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+};
 
 #[derive(Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum ApiResponse {
     Success(ResponseData),
     Error { message: String },
+    Redirect { url: String },
+    Raw { content: Vec<u8>, headers: std::collections::HashMap<String, String> },
+    CustomStatus { status_code: u16, data: ResponseData },
 }
 
 #[allow(dead_code)]
@@ -160,4 +168,51 @@ impl ApiResponse {
     pub fn error(message: String) -> Self {
         Self::Error { message }
     }
+
+    pub fn redirect(url: String) -> Self {
+        Self::Redirect { url }
+    }
+
+    pub fn raw(content: Vec<u8>, headers: axum::http::HeaderMap) -> Self {
+        let headers_map = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        Self::Raw { content, headers: headers_map }
+    }
+
+    pub fn custom_status(status_code: StatusCode, data: ResponseData) -> Self {
+        Self::CustomStatus { status_code: status_code.as_u16(), data }
+    }
 }
+
+impl IntoResponse for ApiResponse {
+    fn into_response(self) -> Response {
+        match self {
+            ApiResponse::Redirect { url } => {
+                use axum::response::Redirect;
+                Redirect::temporary(&url).into_response()
+            }
+            ApiResponse::Raw { content, headers } => {
+                let mut header_map = axum::http::HeaderMap::new();
+                for (key, value) in headers {
+                    if let (Ok(header_name), Ok(header_value)) = (
+                        axum::http::HeaderName::from_bytes(key.as_bytes()),
+                        axum::http::HeaderValue::from_str(&value)
+                    ) {
+                        header_map.insert(header_name, header_value);
+                    }
+                }
+                (StatusCode::OK, header_map, content).into_response()
+            }
+            ApiResponse::CustomStatus { status_code, data } => {
+                let status = StatusCode::from_u16(status_code)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let response = ApiResponse::Success(data);
+                (status, Json(response)).into_response()
+            }
+            _ => (StatusCode::OK, Json(self)).into_response()
+        }
+    }
+}
+

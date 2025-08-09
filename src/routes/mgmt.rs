@@ -158,7 +158,7 @@ pub async fn health_check(Extension(ctx): Extension<AppContext>) -> impl IntoRes
         (status = 401, description = "Unauthorized - invalid or missing management token")
     )
 )]
-pub async fn reload_config(Extension(ctx): Extension<AppContext>) -> Result<impl IntoResponse, DfsError> {
+pub async fn reload_config(Extension(ctx): Extension<AppContext>) -> DfsResult<ApiResponse> {
     info!("Configuration reload requested");
 
     ctx.shared_config.reload_from_file().await
@@ -168,7 +168,7 @@ pub async fn reload_config(Extension(ctx): Extension<AppContext>) -> Result<impl
         })?;
         
     info!("Configuration reloaded successfully");
-    Ok((StatusCode::OK, Json(ApiResponse::success(crate::responses::ResponseData::Empty))))
+    Ok(ApiResponse::success(crate::responses::ResponseData::Empty))
 }
 
 /// Prometheus指标端点

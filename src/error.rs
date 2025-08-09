@@ -77,8 +77,8 @@ pub enum DfsError {
     SerializationError { reason: String },
 
     /// 网络请求错误
-    #[error("Network request failed: {url} - {reason}")]
-    NetworkError { url: String, reason: String },
+    #[error("Network request failed: {reason}")]
+    NetworkError { reason: String },
 
     /// IO 错误
     #[error("IO operation failed: {operation} - {reason}")]

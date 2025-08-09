@@ -6,7 +6,10 @@ use crate::{
     error::DfsResult,
     metrics::Metrics,
     modules::storage::data_store::{DataStore, create_data_store},
-    modules::{qjs::JsRunner, version_provider::{VersionCache, VersionUpdater, PluginVersionProvider}},
+    modules::{
+        qjs::JsRunner,
+        version_provider::{PluginVersionProvider, VersionCache, VersionUpdater},
+    },
     services::{ChallengeService, FlowService, ResourceService, SessionService},
 };
 
@@ -32,6 +35,7 @@ lazy_static::lazy_static! {
         .unwrap();
 }
 
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct AppContext {
     pub session_service: SessionService,
@@ -71,11 +75,6 @@ impl AppContext {
     pub fn get_config(&self) -> Guard<Arc<AppConfig>> {
         self.shared_config.load()
     }
-
-    /// 热重载配置
-    pub fn reload_config(&self, new_config: AppConfig) {
-        self.shared_config.reload(new_config);
-    }
 }
 
 pub struct AppContainer {
@@ -100,8 +99,15 @@ impl AppContainer {
         let js_runner = JsRunner::new(shared_config.clone(), data_store.clone()).await;
         let metrics = Arc::new(Metrics::new(shared_config.clone())?);
         let version_cache = Arc::new(VersionCache::new(data_store.clone()));
-        let plugin_provider = Arc::new(PluginVersionProvider::new(js_runner.clone(), shared_config.clone()));
-        let version_updater = Arc::new(VersionUpdater::new(shared_config.clone(), version_cache.clone(), plugin_provider));
+        let plugin_provider = Arc::new(PluginVersionProvider::new(
+            js_runner.clone(),
+            shared_config.clone(),
+        ));
+        let version_updater = Arc::new(VersionUpdater::new(
+            shared_config.clone(),
+            version_cache.clone(),
+            plugin_provider,
+        ));
 
         Ok(Self {
             data_store,
@@ -115,12 +121,11 @@ impl AppContainer {
 
     pub fn create_app_context(&self) -> AppContext {
         let session_service = SessionService::new(self.data_store.clone());
-        let resource_service =
-            ResourceService::new(
-                self.shared_config.clone(), 
-                self.version_cache.clone(),
-                self.version_updater.clone()
-            );
+        let resource_service = ResourceService::new(
+            self.shared_config.clone(),
+            self.version_cache.clone(),
+            self.version_updater.clone(),
+        );
         let flow_service = FlowService::new(
             self.shared_config.clone(),
             self.data_store.clone(),

@@ -9,13 +9,16 @@ use std::collections::HashMap;
 use tracing::{error, info};
 
 use crate::{
-    container::AppContext, 
-    models::{CreateSessionRequest, DeleteSessionRequest, Session}, 
-    modules::network::RealConnectInfo, 
-    responses::{ApiResponse, ChallengeResponse, EmptyResponse, ErrorResponse, ResponseData, SessionCreatedResponse}, 
-    routes::resource::update_session_bandwidth_stats, 
+    container::AppContext,
+    error::DfsError,
+    models::{CreateSessionRequest, DeleteSessionRequest, Session},
+    modules::network::RealConnectInfo,
+    responses::{
+        ApiResponse, ChallengeResponse, EmptyResponse, ErrorResponse, ResponseData,
+        SessionCreatedResponse,
+    },
+    routes::resource::update_session_bandwidth_stats,
     services::session_service,
-    error::DfsError
 };
 
 pub async fn handle_create_session_unified(
@@ -23,46 +26,34 @@ pub async fn handle_create_session_unified(
     sub_path: Option<String>, // 关键参数：None=普通资源, Some=前缀资源
     ctx: AppContext,
     mut req: CreateSessionRequest,
-) -> Result<impl IntoResponse, DfsError> {
+) -> crate::error::DfsResult<crate::responses::ApiResponse> {
     // 读锁访问配置
     let config_guard = ctx.get_config();
 
     // 验证资源和版本（统一处理前缀和普通资源）
-    let (validated_resid, effective_version) = ctx
+    let (validated_resid, version) = ctx
         .resource_service
         .validate_resource_and_version(&resid, &req.version, sub_path.as_deref())
         .await?;
-
-    let resource_config = config_guard.get_resource(&validated_resid).unwrap(); // 已验证存在
-
-    // 使用已验证的版本
-    let version = effective_version;
-
-    // 获取路径（统一处理）
-    let _path = ctx.resource_service.get_version_path(&resid, &version, None, sub_path.as_deref())
-        .ok_or_else(|| DfsError::path_not_found(&resid, &version))?;
 
     if req.sid.is_empty() {
         req.sid = session_service::generate_session_id();
     }
 
     if req.challenge.is_empty() {
-        // Challenge生成（统一处理）
-        let _challenge_config = config_guard.get_challenge_config(&resid);
-
         // 使用ChallengeService统一处理challenge生成
         let challenge_response = ctx
             .challenge_service
             .generate_and_store_challenge(&req.sid, &validated_resid, sub_path.as_deref())
             .await?;
-            
-        return Ok((
+
+        return Ok(ApiResponse::custom_status(
             StatusCode::PAYMENT_REQUIRED,
-            Json(ApiResponse::Success(ResponseData::Challenge {
+            ResponseData::Challenge {
                 challenge: challenge_response.challenge,
                 data: challenge_response.data,
                 sid: challenge_response.sid,
-            })),
+            },
         ));
     }
 
@@ -78,7 +69,7 @@ pub async fn handle_create_session_unified(
             debug_mode,
         )
         .await?;
-        
+
     if !challenge_verified {
         return Err(DfsError::ChallengeVerificationFailed {
             reason: "Invalid challenge response".to_string(),
@@ -98,7 +89,9 @@ pub async fn handle_create_session_unified(
         extras: req.extras.clone(),
     };
 
-    ctx.session_service.store_session(&req.sid, &session).await
+    ctx.session_service
+        .store_session(&req.sid, &session)
+        .await
         .map_err(|e| DfsError::SessionCreationFailed {
             reason: format!("Failed to store session: {}", e),
         })?;
@@ -109,13 +102,10 @@ pub async fn handle_create_session_unified(
     // 记录会话创建指标
     ctx.metrics.record_session_created();
 
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::success(ResponseData::Session {
-            tries,
-            sid: req.sid.clone(),
-        })),
-    ))
+    Ok(ApiResponse::success(ResponseData::Session {
+        tries,
+        sid: req.sid.clone(),
+    }))
 }
 
 #[utoipa::path(
@@ -163,8 +153,6 @@ pub async fn create_session(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     )
 )]
-#[allow(unused_variables)]
-#[axum::debug_handler]
 pub async fn create_prefix_session(
     Path((resid, sub_path)): Path<(String, String)>,
     Extension(ctx): Extension<AppContext>,
@@ -190,21 +178,20 @@ pub async fn create_prefix_session(
         (status = 500, description = "Internal server error", body = ErrorResponse)
     )
 )]
-#[allow(unused_variables)]
 pub async fn delete_session(
     Extension(ctx): Extension<AppContext>,
     Extension(real_connect_info): Extension<RealConnectInfo>,
     headers: HeaderMap,
     Path((sessionid, resid)): Path<(String, String)>,
     req_body: Option<Json<DeleteSessionRequest>>,
-) -> impl IntoResponse {
+) -> crate::error::DfsResult<crate::responses::ApiResponse> {
     // 提取客户端IP地址
     let client_ip = crate::modules::external::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
 
     // 在删除之前获取会话统计信息
-    match ctx.session_service.get_session_stats(&sessionid).await {
-        Ok(Some(stats)) => {
+    match ctx.session_service.get_session_stats(&sessionid).await? {
+        Some(stats) => {
             // 如果有客户端IP，记录结构化日志
             if let Some(ip) = client_ip {
                 let session_logger = crate::modules::analytics::SessionLogger::new(
@@ -272,45 +259,24 @@ pub async fn delete_session(
             update_session_bandwidth_stats(&ctx.data_store, &sessionid, &resid, &stats).await;
 
             // 删除会话
-            if let Err(e) = ctx.session_service.remove_session(&sessionid).await {
-                error!("Failed to remove session: {}", e);
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiResponse::error("Failed to delete session".to_string())),
-                );
-            }
+            ctx.session_service.remove_session(&sessionid).await?;
         }
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse::error("Session not found".to_string())),
-            );
-        }
-        Err(e) => {
-            error!("Failed to get session statistics: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiResponse::error(
-                    "Failed to get session statistics".to_string(),
-                )),
-            );
+        None => {
+            return Err(crate::error::DfsError::ResourceNotFound {
+                resource_id: format!("session:{}", sessionid),
+            });
         }
     }
 
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success(ResponseData::Empty)),
-    )
+    Ok(ApiResponse::success(ResponseData::Empty))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::CreateSessionRequest;
-    
+
     use axum::http::StatusCode;
-    
-    
 
     // 引用统一的测试框架
     use crate::tests::common::*;
@@ -318,79 +284,88 @@ mod tests {
     #[tokio::test]
     async fn test_create_session_challenge_generation() {
         let env = TestEnvironment::new().await;
-        
+
         // 创建空的会话请求（触发挑战生成）
         let request = CreateSessionRequest {
             version: "1.0.0".to_string(),
             chunks: vec!["0-1024".to_string()],
-            sid: "".to_string(), // 空sid触发生成
+            sid: "".to_string(),       // 空sid触发生成
             challenge: "".to_string(), // 空challenge触发生成
-            sub_path: None,
             extras: serde_json::json!({}),
         };
-        
+
         // 调用会话创建处理器
         let response = handle_create_session_unified(
             "test_resource".to_string(),
             None, // 普通资源
             env.app_context.clone(),
             request,
-        ).await;
-        
+        )
+        .await;
+
         // 应该返回402状态码和挑战响应
         let response = axum::response::IntoResponse::into_response(response);
         let (parts, _body) = response.into_parts();
         assert_eq!(parts.status, StatusCode::PAYMENT_REQUIRED);
-        
+
         println!("✅ Challenge generation test completed!");
     }
 
     #[tokio::test]
     async fn test_create_session_challenge_verification_success() {
         let env = TestEnvironment::new().await;
-        
+
         let session_id = "test_session_verify";
-        
+
         // 先使用ChallengeService生成一个真实的challenge
-        let challenge_response = env.services.challenge_service
+        let challenge_response = env
+            .services
+            .challenge_service
             .generate_and_store_challenge(session_id, "test_resource", None)
-            .await.unwrap();
-            
+            .await
+            .unwrap();
+
         println!("🔍 Generated challenge: {:?}", challenge_response);
-        
+
         // 为了测试，我们需要获取存储的challenge数据来计算正确答案
-        let stored_challenge_data = env.data_store.get_challenge(session_id).await.unwrap().unwrap();
-        let challenge_json: serde_json::Value = serde_json::from_str(&stored_challenge_data).unwrap();
+        let stored_challenge_data = env
+            .data_store
+            .get_challenge(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&stored_challenge_data).unwrap();
         let original_data_hex = challenge_json["original_data"].as_str().unwrap();
         let original_data = hex::decode(original_data_hex).unwrap();
-        
+
         // 计算正确的MD5响应（第一次哈希）
         let correct_response = format!("{:x}", md5::compute(&original_data));
         println!("🔍 Correct challenge response: {}", correct_response);
-        
+
         // 创建带有正确挑战答案的请求
         let request = CreateSessionRequest {
             version: "1.0.0".to_string(),
             chunks: vec!["0-1024".to_string()],
             sid: session_id.to_string(),
             challenge: correct_response,
-            sub_path: None,
             extras: serde_json::json!({}),
         };
-        
+
         println!("🔍 Making request with resource: test_resource");
         println!("🔍 Request: {:?}", request);
-        
+
         // 调用会话创建处理器
         let result = handle_create_session_unified(
             "test_resource".to_string(),
             None,
             env.app_context.clone(),
             request,
-        ).await;
-        
+        )
+        .await;
+
         println!("🔍 Function result: {:?}", result.is_ok());
-        
+
         // 处理Result类型并转换为Response
         let response = match result {
             Ok(resp) => axum::response::IntoResponse::into_response(resp),
@@ -400,66 +375,81 @@ mod tests {
             }
         };
         let (parts, body) = response.into_parts();
-        
+
         println!("🔍 Response status: {}", parts.status);
-        
+
         // 如果不是200，打印响应体来调试
         if parts.status != StatusCode::OK {
             let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
             let body_str = String::from_utf8_lossy(&body_bytes);
             println!("🔍 Response body: {}", body_str);
         }
-        
+
         assert_eq!(parts.status, StatusCode::OK);
-        
+
         // 验证会话已存储
-        let stored_session = env.services.session_service.get_validated_session(session_id).await;
+        let stored_session = env
+            .services
+            .session_service
+            .get_validated_session(session_id)
+            .await;
         assert!(stored_session.is_ok());
-        
+
         println!("✅ Challenge verification success test completed!");
     }
 
     #[tokio::test]
     async fn test_create_prefix_session_with_sub_path() {
         let env = TestEnvironment::new().await;
-        
+
         let session_id = "test_prefix_session";
-        
+
         // 先存储前缀资源的挑战
         let challenge_data = ChallengeDataBuilder::new()
             .with_challenge_type("md5")
             .build();
-            
-        env.data_store.store_challenge(session_id, &challenge_data).await.unwrap();
-        
+
+        env.data_store
+            .store_challenge(session_id, &challenge_data)
+            .await
+            .unwrap();
+
         // 创建前缀资源请求
         let request = CreateSessionRequest {
             version: "3.0.0".to_string(),
             chunks: vec!["0-2048".to_string()],
             sid: session_id.to_string(),
             challenge: "correct_answer".to_string(),
-            sub_path: Some("textures/player.png".to_string()),
             extras: serde_json::json!({}),
         };
-        
+
         // 调用前缀会话创建处理器
         let response = handle_create_session_unified(
             "game_assets".to_string(),
             Some("textures/player.png".to_string()), // 前缀资源
             env.app_context.clone(),
             request,
-        ).await;
-        
+        )
+        .await;
+
         // 应该返回200状态码
         let response = axum::response::IntoResponse::into_response(response);
         let (parts, _body) = response.into_parts();
         assert_eq!(parts.status, StatusCode::OK);
-        
+
         // 验证前缀会话已存储且包含sub_path
-        let stored_session = env.services.session_service.get_validated_session(session_id).await.unwrap();
-        assert_eq!(stored_session.sub_path, Some("textures/player.png".to_string()));
+        let stored_session = env
+            .services
+            .session_service
+            .get_validated_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_session.sub_path,
+            Some("textures/player.png".to_string())
+        );
         assert_eq!(stored_session.resource_id, "game_assets");
-        
+
         println!("✅ Prefix session creation test completed!");
     }
 

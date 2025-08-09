@@ -1,10 +1,11 @@
 use bytes::Bytes;
 use serde_json::{Value, json};
 
-use crate::container::REQWEST_CLIENT;
 use crate::config::SharedConfig;
+use crate::container::REQWEST_CLIENT;
+use crate::error::{DfsError, DfsResult};
+use crate::models::{FlowContext, FlowOptions, FlowTarget};
 use crate::services::FlowService;
-use crate::models::{FlowTarget, FlowContext, FlowOptions};
 
 /// KachinaInstaller 解析结果
 #[derive(Debug)]
@@ -15,13 +16,7 @@ pub struct KachinaMetadata {
 }
 
 /// 错误码常量定义
-const E_RESOURCE_NOT_FOUND: &str = "E_RESOURCE_NOT_FOUND";
-const E_VERSION_NOT_FOUND: &str = "E_VERSION_NOT_FOUND";
-const E_PATH_NOT_FOUND: &str = "E_PATH_NOT_FOUND";
-const E_FLOW_EXECUTION_FAILED: &str = "E_FLOW_EXECUTION_FAILED";
-const E_DOWNLOAD_FAILED: &str = "E_DOWNLOAD_FAILED";
 const E_READ_RESPONSE_FAILED: &str = "E_READ_RESPONSE_FAILED";
-const E_READ_BYTES_FAILED: &str = "E_READ_BYTES_FAILED";
 
 /// 在字节数组中搜索指定的模式
 ///
@@ -35,13 +30,13 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    
+
     for i in 0..=(haystack.len() - needle.len()) {
         if &haystack[i..i + needle.len()] == needle {
             return Some(i);
         }
     }
-    
+
     None
 }
 
@@ -110,8 +105,11 @@ pub fn parse_file_header(data: &[u8]) -> Result<Value, String> {
 
     // 验证读取到的大小值是否合理（避免读取到损坏的数据）
     const MAX_REASONABLE_SIZE: u32 = 100 * 1024 * 1024; // 100MB
-    if index_sz > MAX_REASONABLE_SIZE || config_sz > MAX_REASONABLE_SIZE || 
-       theme_sz > MAX_REASONABLE_SIZE || metadata_sz > MAX_REASONABLE_SIZE {
+    if index_sz > MAX_REASONABLE_SIZE
+        || config_sz > MAX_REASONABLE_SIZE
+        || theme_sz > MAX_REASONABLE_SIZE
+        || metadata_sz > MAX_REASONABLE_SIZE
+    {
         return Err(format!(
             "Unreasonable size values detected: index_sz={}, config_sz={}, theme_sz={}, metadata_sz={}",
             index_sz, config_sz, theme_sz, metadata_sz
@@ -161,47 +159,29 @@ pub async fn fetch_file_range(
     shared_config: &SharedConfig,
     flow_service: &FlowService,
     resid: &str,
-    version: Option<&str>,
+    version: &str,
+    sub_path: Option<String>,
     ranges: Option<Vec<(u32, u32)>>,
-) -> Result<Bytes, String> {
+) -> DfsResult<Bytes> {
     // 读锁访问配置
     let config_guard = shared_config.load();
 
     // 检查资源是否存在
     let resource_config = match config_guard.get_resource(resid) {
         Some(rc) => rc,
-        None => {
-            return Err(E_RESOURCE_NOT_FOUND.to_string());
-        }
-    };
-
-    // 确定版本
-    let target_version = version.unwrap_or(&resource_config.latest);
-
-    // 检查版本是否存在或有default模板
-    if !resource_config.versions.contains_key(target_version) && !resource_config.versions.contains_key("default") {
-        return Err(E_VERSION_NOT_FOUND.to_string());
-    }
-
-    // 获取版本对应的路径（简化版本）
-    let path = if let Some(version_map) = resource_config.versions.get(target_version) {
-        version_map.get("default")
-    } else {
-        resource_config.versions.get("default").and_then(|default_template| default_template.get("default"))
-    };
-    
-    let path = match path {
-        Some(p) => p.replace("${version}", target_version),
-        None => {
-            return Err(E_PATH_NOT_FOUND.to_string());
-        }
+        None => return Err(DfsError::resource_not_found(resid.to_string())),
     };
 
     // 使用 FlowService 获取文件的下载 URL
     let flow_list = &resource_config.flow;
     // 根据range计算文件大小
     let request_file_size = if let Some(ref ranges) = ranges {
-        Some(ranges.iter().map(|(start, end)| (end - start + 1) as u64).sum())
+        Some(
+            ranges
+                .iter()
+                .map(|(start, end)| (end - start + 1) as u64)
+                .sum(),
+        )
     } else {
         None // 没有range时不知道文件大小
     };
@@ -209,8 +189,8 @@ pub async fn fetch_file_range(
     // 构建新的Flow参数结构
     let target = FlowTarget {
         resource_id: resid.to_string(),
-        version: target_version.to_string(),
-        sub_path: None, // Kachina解析时不处理子路径
+        version: version.to_string(),
+        sub_path,
         ranges: ranges.clone(),
         file_size: request_file_size,
     };
@@ -226,8 +206,9 @@ pub async fn fetch_file_range(
     };
 
     // 执行Flow获取URL
-    let flow_result = flow_service.execute_flow(&target, &context, &options, flow_list, vec![]).await
-        .map_err(|e| format!("{}: {}", E_FLOW_EXECUTION_FAILED, e))?;
+    let flow_result = flow_service
+        .execute_flow(&target, &context, &options, flow_list, vec![])
+        .await?;
     let cdn_url = flow_result.url;
 
     // 构建 Range 头部
@@ -254,22 +235,26 @@ pub async fn fetch_file_range(
     }
 
     let response = match request.send().await {
-        Ok(resp) => resp,
-        Err(e) => {
-            return Err(format!("{}: {}", E_DOWNLOAD_FAILED, e));
-        }
-    };
+        Ok(resp) => Ok(resp),
+        Err(e) => Err(DfsError::NetworkError {
+            reason: e.to_string(),
+        }),
+    }?;
 
     if !response.status().is_success()
         && response.status() != axum::http::StatusCode::PARTIAL_CONTENT
         && response.status() != axum::http::StatusCode::RANGE_NOT_SATISFIABLE
     {
-        return Err(format!("{}: {}", E_READ_RESPONSE_FAILED, response.status()));
+        return Err(DfsError::NetworkError {
+            reason: format!("{}: {}", E_READ_RESPONSE_FAILED, response.status()),
+        });
     }
 
     match response.bytes().await {
         Ok(bytes) => Ok(bytes),
-        Err(e) => Err(format!("{}: {}", E_READ_BYTES_FAILED, e)),
+        Err(e) => Err(DfsError::NetworkError {
+            reason: e.to_string(),
+        }),
     }
 }
 
@@ -430,11 +415,19 @@ pub async fn parse_kachina_metadata(
     shared_config: &SharedConfig,
     flow_service: &FlowService,
     resid: &str,
-    version: Option<&str>,
-) -> Result<Option<KachinaMetadata>, String> {
+    version: &str,
+    sub_path: Option<String>,
+) -> DfsResult<Option<KachinaMetadata>> {
     // 获取文件的前256字节
-    let header_bytes =
-        fetch_file_range(shared_config, flow_service, resid, version, Some(vec![(0, 255)])).await?;
+    let header_bytes = fetch_file_range(
+        shared_config,
+        flow_service,
+        resid,
+        version,
+        sub_path.clone(),
+        Some(vec![(0, 255)]),
+    )
+    .await?;
 
     // 解析文件头部信息
     let parsed_header = parse_file_header(&header_bytes)?;
@@ -472,6 +465,7 @@ pub async fn parse_kachina_metadata(
         flow_service,
         resid,
         version,
+        sub_path,
         Some(vec![(index_start, data_end - 1)]),
     )
     .await?;

@@ -1,8 +1,6 @@
 use axum::{
-    Json,
     extract::{Extension, Path, Query},
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::HeaderMap,
 };
 use std::collections::HashMap;
 use tracing::info;
@@ -38,7 +36,7 @@ pub async fn get_cdn(
     headers: HeaderMap,
     Path((sessionid, resid)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
-) -> Result<impl IntoResponse, DfsError> {
+) -> crate::error::DfsResult<crate::responses::ApiResponse> {
     // 记录请求开始时间
     let start_time = std::time::Instant::now();
 
@@ -163,10 +161,7 @@ pub async fn get_cdn(
     record_request_metrics!(ctx.metrics, start_time);
     record_flow_metrics!(ctx.metrics, true);
 
-    Ok((
-        StatusCode::OK,
-        Json(ApiResponse::success(ResponseData::Cdn { url: cdn_url })),
-    ))
+    Ok(ApiResponse::success(ResponseData::Cdn { url: cdn_url }))
 }
 
 #[cfg(test)]

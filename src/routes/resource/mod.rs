@@ -1,7 +1,4 @@
-use axum::{
-    Router,
-    routing::get,
-};
+use axum::{Router, routing::get};
 use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
@@ -11,11 +8,6 @@ pub mod chunk;
 pub mod downloads;
 pub mod metadata;
 pub mod sessions;
-
-// 错误码常量定义
-pub const E_RESOURCE_NOT_FOUND: &str = "E_RESOURCE_NOT_FOUND";
-pub const E_VERSION_NOT_FOUND: &str = "E_VERSION_NOT_FOUND";
-pub const E_PATH_NOT_FOUND: &str = "E_PATH_NOT_FOUND";
 
 // 解析range字符串为flowrunner的ranges格式
 // "0-" 或整个文件 -> None

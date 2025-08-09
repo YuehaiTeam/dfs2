@@ -416,11 +416,6 @@ impl SharedConfig {
         drop(old_config); // 显式释放旧配置
     }
 
-    /// 获取内部ArcSwap的克隆（用于传递给其他组件）
-    pub fn clone_inner(&self) -> Arc<ArcSwap<AppConfig>> {
-        self.config.clone()
-    }
-
     /// 更新配置的便捷方法（用于替换config.write().await的使用场景）
     pub async fn reload_from_file(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let new_config = AppConfig::load().await?;

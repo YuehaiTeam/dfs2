@@ -1,10 +1,11 @@
 use axum::{
-    extract::{Extension, Path, Query}, http::{HeaderMap, StatusCode}, response::{IntoResponse, Redirect}, Json
+    extract::{Extension, Path, Query},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
 };
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
-use crate::{error::DfsResult, modules::storage::cache::download_and_cache, responses::{ApiResponse, DownloadUrlResponse, ErrorResponse, ResponseData}};
 use crate::{
     config::DownloadPolicy,
     error::DfsError,
@@ -15,6 +16,11 @@ use crate::{
     routes::resource::{calculate_actual_bytes_from_range, parse_range_for_flow},
 };
 use crate::{container::AppContext, modules::storage::data_store::CacheMetadata};
+use crate::{
+    error::DfsResult,
+    modules::storage::cache::download_and_cache,
+    responses::{ApiResponse, DownloadUrlResponse, ErrorResponse, ResponseData},
+};
 
 // 下载响应类型
 #[derive(Debug)]
@@ -195,7 +201,8 @@ pub async fn handle_download_request_unified(
 
     // 缓存未命中，需要进行实际的服务器调度
     // 从flow配置中提取服务器列表来获取文件大小（用于Size条件评估）
-    let servers_from_flow: Vec<String> = resource_config.flow
+    let servers_from_flow: Vec<String> = resource_config
+        .flow
         .iter()
         .flat_map(|flow_item| {
             flow_item.r#use.iter().filter_map(|flow_use| {
@@ -207,19 +214,30 @@ pub async fn handle_download_request_unified(
             })
         })
         .collect();
-    
-    debug!("Starting file size detection for path: {}, servers from flow: {:?}", path, servers_from_flow);
+
+    debug!(
+        "Starting file size detection for path: {}, servers from flow: {:?}",
+        path, servers_from_flow
+    );
     let file_size = {
         let mut size_candidate = None;
         for server_id in &servers_from_flow {
-            debug!("Checking health info for server: {}, path: {}", server_id, path);
+            debug!(
+                "Checking health info for server: {}, path: {}",
+                server_id, path
+            );
             match ctx.data_store.get_health_info(server_id, &path).await {
                 Ok(Some(health_info)) => {
-                    debug!("Health info found for server {}: file_size={:?}, is_alive={}", 
-                           server_id, health_info.file_size, health_info.is_alive);
+                    debug!(
+                        "Health info found for server {}: file_size={:?}, is_alive={}",
+                        server_id, health_info.file_size, health_info.is_alive
+                    );
                     if let Some(size) = health_info.file_size {
                         size_candidate = Some(size);
-                        debug!("File size detected: {} bytes from server {}", size, server_id);
+                        debug!(
+                            "File size detected: {} bytes from server {}",
+                            size, server_id
+                        );
                         break;
                     }
                 }
@@ -247,14 +265,20 @@ pub async fn handle_download_request_unified(
                 .map(|(start, end)| (end - start + 1) as u64)
                 .sum(),
         );
-        debug!("Range request detected: {:?}, calculated size: {:?}", ranges, range_size);
+        debug!(
+            "Range request detected: {:?}, calculated size: {:?}",
+            ranges, range_size
+        );
         range_size
     } else {
         // 如果没有range请求，使用完整文件大小
         debug!("No range request, using full file size: {:?}", file_size);
         file_size
     };
-    debug!("Final request_file_size for flow evaluation: {:?}", request_file_size);
+    debug!(
+        "Final request_file_size for flow evaluation: {:?}",
+        request_file_size
+    );
 
     // 使用新的FlowService API生成下载 URL
     let target = crate::models::FlowTarget {
@@ -319,12 +343,19 @@ pub async fn handle_download_request_unified(
     } else {
         resid.clone()
     };
-    let file_size_mb = request_file_size.map(|size| size as f64 / 1024.0 / 1024.0).unwrap_or(0.0);
-    info!("{} size={:.2}MB -> {} weight={}", 
-          resource_path, 
-          file_size_mb,
-          flow_result.selected_server_id.as_deref().unwrap_or("unknown"),
-          flow_result.selected_server_weight.unwrap_or(0));
+    let file_size_mb = request_file_size
+        .map(|size| size as f64 / 1024.0 / 1024.0)
+        .unwrap_or(0.0);
+    info!(
+        "{} size={:.2}MB -> {} weight={}",
+        resource_path,
+        file_size_mb,
+        flow_result
+            .selected_server_id
+            .as_deref()
+            .unwrap_or("unknown"),
+        flow_result.selected_server_weight.unwrap_or(0)
+    );
 
     // 检查是否应该缓存
     let cached_result = if let Some((file_size, max_age)) = should_cache_content(
@@ -526,7 +557,7 @@ pub async fn download_redirect(
     Extension(real_connect_info): Extension<RealConnectInfo>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> crate::error::DfsResult<crate::responses::ApiResponse> {
     // 提取客户端IP地址
     let client_ip = crate::modules::external::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
@@ -568,16 +599,12 @@ pub async fn download_redirect(
                 headers.insert("content-type", "application/octet-stream".parse().unwrap());
             }
 
-            (StatusCode::OK, headers, content).into_response()
+            Ok(crate::responses::ApiResponse::raw(content, headers))
         }
         Ok(DownloadResponse::Redirect(download_url)) => {
-            Redirect::temporary(&download_url).into_response()
+            Ok(crate::responses::ApiResponse::redirect(download_url))
         }
-        Err(e) => {
-            let status_code = StatusCode::from_u16(e.http_status_code())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status_code, Json(ApiResponse::error(e.to_string()))).into_response()
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -605,7 +632,7 @@ pub async fn download_json(
     Extension(real_connect_info): Extension<RealConnectInfo>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> crate::error::DfsResult<crate::responses::ApiResponse> {
     // 提取客户端IP地址
     let client_ip = crate::modules::external::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
@@ -633,28 +660,23 @@ pub async fn download_json(
 
             if sid.is_empty() {
                 // 首次请求，使用ChallengeService生成legacy challenge并创建session
-                match ctx.challenge_service
+                match ctx
+                    .challenge_service
                     .generate_legacy_challenge(&resid, range.as_deref())
                     .await
                 {
                     Ok(challenge) => {
-                        return (
+                        return Ok(ApiResponse::custom_status(
                             StatusCode::UNAUTHORIZED,
-                            Json(ApiResponse::success(
-                                ResponseData::LegacyChallengeResponse {
-                                    challenge: challenge.format_data(), // 直接使用 "hash/source" 格式
-                                },
-                            )),
-                        );
+                            ResponseData::LegacyChallengeResponse {
+                                challenge: challenge.format_data(), // 直接使用 "hash/source" 格式
+                            },
+                        ));
                     }
                     Err(e) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiResponse::error(format!(
-                                "LEGACY_ERROR: {}",
-                                e.to_string()
-                            ))),
-                        );
+                        return Err(crate::error::DfsError::InternalError {
+                            reason: format!("LEGACY_ERROR: {}", e.to_string()),
+                        });
                     }
                 }
             } else {
@@ -672,31 +694,26 @@ pub async fn download_json(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    match handle_download_request_unified(
+    let response_data = match handle_download_request_unified(
         resid, None, // sub_path为None表示普通资源
         session_id, range, &ctx, client_ip, user_agent,
     )
     .await
     {
-        Ok(DownloadResponse::Redirect(download_url)) => (
-            StatusCode::OK,
-            Json(ApiResponse::success(ResponseData::Download {
-                url: download_url,
-            })),
-        ),
-        Err(e) => {
-            let status_code = StatusCode::from_u16(e.http_status_code())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status_code, Json(ApiResponse::error(e.to_string())))
+        Ok(DownloadResponse::Redirect(download_url)) => {
+            ResponseData::Download { url: download_url }
         }
+        Err(e) => return Err(e),
         // 移除缓存支持以保证历史客户端兼容性
-        Ok(DownloadResponse::Cached { .. }) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error(
-                "Cached responses not supported in POST download".to_string(),
-            )),
-        ),
-    }
+        Ok(DownloadResponse::Cached { .. }) => {
+            return Err(crate::error::DfsError::InvalidInput {
+                field: "download_type".to_string(),
+                reason: "Cached responses not supported in POST download".to_string(),
+            });
+        }
+    };
+
+    Ok(ApiResponse::success(response_data))
 }
 
 // GET /download/{resid}/*sub_path - 重定向到下载链接
@@ -725,7 +742,7 @@ pub async fn download_prefix_redirect(
     Extension(real_connect_info): Extension<RealConnectInfo>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> crate::error::DfsResult<crate::responses::ApiResponse> {
     // 提取客户端IP地址
     let client_ip = crate::modules::external::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
@@ -771,16 +788,12 @@ pub async fn download_prefix_redirect(
                 headers.insert("content-type", "application/octet-stream".parse().unwrap());
             }
 
-            (StatusCode::OK, headers, content).into_response()
+            Ok(crate::responses::ApiResponse::raw(content, headers))
         }
         Ok(DownloadResponse::Redirect(download_url)) => {
-            Redirect::temporary(&download_url).into_response()
+            Ok(crate::responses::ApiResponse::redirect(download_url))
         }
-        Err(e) => {
-            let status_code = StatusCode::from_u16(e.http_status_code())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status_code, Json(ApiResponse::error(e.to_string()))).into_response()
-        }
+        Err(e) => Err(e),
     }
 }
 
@@ -809,7 +822,7 @@ pub async fn download_prefix_json(
     Extension(real_connect_info): Extension<RealConnectInfo>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, crate::error::DfsError> {
     // 提取客户端IP地址
     let client_ip = crate::modules::external::geolocation::extract_client_ip(&headers)
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
@@ -833,28 +846,23 @@ pub async fn download_prefix_json(
 
             if sid.is_empty() {
                 // 首次请求，使用ChallengeService生成legacy challenge并创建session
-                match ctx.challenge_service
+                match ctx
+                    .challenge_service
                     .generate_legacy_challenge(&resid, range.as_deref())
                     .await
                 {
                     Ok(challenge) => {
-                        return (
+                        return Ok(ApiResponse::custom_status(
                             StatusCode::UNAUTHORIZED,
-                            Json(ApiResponse::success(
-                                ResponseData::LegacyChallengeResponse {
-                                    challenge: challenge.format_data(), // 直接使用 "hash/source" 格式
-                                },
-                            )),
-                        );
+                            ResponseData::LegacyChallengeResponse {
+                                challenge: challenge.format_data(), // 直接使用 "hash/source" 格式
+                            },
+                        ));
                     }
                     Err(e) => {
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ApiResponse::error(format!(
-                                "LEGACY_ERROR: {}",
-                                e.to_string()
-                            ))),
-                        );
+                        return Err(crate::error::DfsError::InternalError {
+                            reason: format!("LEGACY_ERROR: {}", e.to_string()),
+                        });
                     }
                 }
             } else {
@@ -872,7 +880,7 @@ pub async fn download_prefix_json(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    match handle_download_request_unified(
+    let response_data = match handle_download_request_unified(
         resid,
         Some(sub_path), // sub_path有值表示前缀资源
         session_id,
@@ -883,26 +891,18 @@ pub async fn download_prefix_json(
     )
     .await
     {
-        Ok(DownloadResponse::Redirect(download_url)) => (
-            StatusCode::OK,
-            Json(ApiResponse::success(ResponseData::Download {
-                url: download_url,
-            })),
-        ),
-        Err(e) => {
-            let status_code = StatusCode::from_u16(e.http_status_code())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status_code, Json(ApiResponse::error(e.to_string())))
+        Ok(DownloadResponse::Redirect(download_url)) => {
+            ResponseData::Download { url: download_url }
         }
+        Err(e) => return Err(e),
         // 移除缓存支持以保证历史客户端兼容性
-        Ok(DownloadResponse::Cached { .. }) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiResponse::error(
-                "Cached responses not supported in POST download".to_string(),
-            )),
-        ),
-    }
+        Ok(DownloadResponse::Cached { .. }) => {
+            return Err(crate::error::DfsError::InvalidInput {
+                field: "download_type".to_string(),
+                reason: "Cached responses not supported in POST download".to_string(),
+            });
+        }
+    };
+
+    Ok(ApiResponse::success(response_data))
 }
-
-
-// 测试已移除 - 直接下载功能已简化，复杂的API测试架构不再需要

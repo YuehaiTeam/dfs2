@@ -33,8 +33,6 @@ pub struct CreateSessionRequest {
     pub challenge: String,
     #[serde(default = "default_version")]
     pub version: String,
-    #[serde(default)]
-    pub sub_path: Option<String>, // 新增：支持前缀资源的sub_path
     #[serde(default = "default_empty_json")]
     pub extras: serde_json::Value,
 }
@@ -103,6 +101,7 @@ pub struct FlowOptions {
 
 /// Flow执行结果
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FlowResult {
     pub url: String, // 主要返回值：最终URL
     pub selected_server_id: Option<String>,
