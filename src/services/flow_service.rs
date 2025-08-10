@@ -647,3 +647,744 @@ fn normalize_path_simple(path: &str) -> String {
         cleaned
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::common::TestEnvironment;
+    use serde_json::json;
+    use size::Size;
+    use std::collections::HashMap;
+
+    /// 创建标准测试上下文
+    fn create_test_context() -> (FlowTarget, FlowContext, FlowOptions) {
+        let target = FlowTarget {
+            resource_id: "test_resource".to_string(),
+            version: "1.0.0".to_string(),
+            file_size: Some(1024 * 1024), // 1MB
+            sub_path: None,
+            ranges: None,
+        };
+
+        let context = FlowContext {
+            client_ip: Some("192.168.1.100".parse().unwrap()), // 私有IP，模拟中国用户
+            session_id: Some("test_session".to_string()),
+            extras: json!({"test_flag": true}),
+        };
+
+        let options = FlowOptions {
+            cdn_full_range: false,
+        };
+
+        (target, context, options)
+    }
+
+    /// 创建测试FlowService
+    async fn create_test_flow_service() -> FlowService {
+        let env = TestEnvironment::new().await;
+        env.services.flow_service
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_condition() {
+        let service = create_test_flow_service().await;
+        let (target, mut context, _options) = create_test_context();
+
+        // 测试 CnIp 条件
+        // 在测试环境中，没有IPIP数据库，is_global_ip默认返回true
+        // 因此所有IP都被认为是全球IP (!is_global_ip = false)
+        context.client_ip = Some("192.168.1.100".parse().unwrap());
+        let result = service
+            .evaluate_condition(&FlowCond::CnIp(true), &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "Without IPDB, all IPs are considered global (non-CN)"
+        );
+
+        // 测试cnip false条件 - 应该返回true（因为所有IP都是全球IP）
+        let result = service
+            .evaluate_condition(&FlowCond::CnIp(false), &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "Without IPDB, cnip false should return true"
+        );
+
+        // 测试不同IP地址 - 在没有IPDB的情况下结果应该相同
+        context.client_ip = Some("8.8.8.8".parse().unwrap());
+        let result = service
+            .evaluate_condition(&FlowCond::CnIp(false), &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "All IPs should be treated as global without IPDB"
+        );
+
+        // 无IP情况
+        context.client_ip = None;
+        let result = service
+            .evaluate_condition(&FlowCond::CnIp(true), &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), false, "No IP should return false");
+
+        // 测试 IpVersion 条件
+        context.client_ip = Some("192.168.1.100".parse().unwrap()); // IPv4
+        let result = service
+            .evaluate_condition(&FlowCond::IpVersion(4), &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "IPv4 address should match version 4");
+
+        context.client_ip = Some("::1".parse().unwrap()); // IPv6
+        let result = service
+            .evaluate_condition(&FlowCond::IpVersion(6), &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "IPv6 address should match version 6");
+
+        // 测试 Size 条件
+        let mut sized_target = target.clone();
+        sized_target.file_size = Some(1048576); // 精确的1MB = 1024*1024字节
+
+        // size > 500KB (500*1024 = 512000字节)
+        let size_500kb = Size::from_str("500KB").unwrap();
+        let result = service
+            .evaluate_condition(
+                &FlowCond::Size(FlowComp::Gt, size_500kb),
+                &sized_target,
+                &context,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "1048576 bytes should be greater than 500KB"
+        );
+
+        // size < 2MB (2*1024*1024 = 2097152字节)
+        let size_2mb = Size::from_str("2MB").unwrap();
+        let result = service
+            .evaluate_condition(
+                &FlowCond::Size(FlowComp::Lt, size_2mb),
+                &sized_target,
+                &context,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "1048576 bytes should be less than 2MB"
+        );
+
+        // size >= 1MB - 使用>=比较来避免精度问题
+        let size_1mb = Size::from_str("1MB").unwrap();
+        let result = service
+            .evaluate_condition(
+                &FlowCond::Size(FlowComp::Ge, size_1mb),
+                &sized_target,
+                &context,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "1048576 bytes should be >= 1MB");
+
+        // 测试精确相等 - 使用已知的字节数
+        sized_target.file_size = Some(size_1mb.bytes() as u64);
+        let result = service
+            .evaluate_condition(
+                &FlowCond::Size(FlowComp::Eq, size_1mb.clone()),
+                &sized_target,
+                &context,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "Exact bytes should equal");
+
+        // 无文件大小情况
+        sized_target.file_size = None;
+        let result = service
+            .evaluate_condition(
+                &FlowCond::Size(FlowComp::Gt, size_500kb),
+                &sized_target,
+                &context,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), false, "No file size should return false");
+
+        // 测试 Extras 条件
+        let result = service
+            .evaluate_condition(
+                &FlowCond::Extras("test_flag".to_string()),
+                &target,
+                &context,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "Existing extra field should return true"
+        );
+
+        let result = service
+            .evaluate_condition(
+                &FlowCond::Extras("nonexistent".to_string()),
+                &target,
+                &context,
+            )
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "Non-existing extra field should return false"
+        );
+
+        // 测试 Time 条件 (使用固定时间进行测试)
+        let earlier_time = chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+
+        // 由于time条件使用当前时间，我们主要测试逻辑结构
+        let result = service
+            .evaluate_condition(
+                &FlowCond::Time(FlowComp::Ge, earlier_time),
+                &target,
+                &context,
+            )
+            .await;
+        assert!(result.is_ok(), "Time condition should not error");
+
+        println!("✅ All condition evaluation tests passed");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_flow_rules() {
+        let service = create_test_flow_service().await;
+        let (target, mut context, _options) = create_test_context();
+
+        // 测试空规则 - 应该返回true
+        let result = service
+            .evaluate_flow_rules(&[], &FlowMode::AND, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "Empty rules should return true");
+
+        // 测试AND模式 - 所有条件必须满足
+        // 在测试环境中使用cnip false（全球IP）和文件大小条件
+        context.client_ip = Some("192.168.1.100".parse().unwrap()); // 任意IP
+        let mut sized_target = target.clone();
+        sized_target.file_size = Some(2 * 1024 * 1024); // 2MB
+
+        let and_rules = vec![
+            FlowCond::CnIp(false), // 全球IP (在测试环境中总是true)
+            FlowCond::Size(FlowComp::Gt, Size::from_str("1MB").unwrap()), // 大于1MB
+        ];
+
+        // 全球IP + 2MB文件 -> 两个条件都满足 -> true
+        let result = service
+            .evaluate_flow_rules(&and_rules, &FlowMode::AND, &sized_target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "AND mode: both conditions true should return true"
+        );
+
+        // 全球IP + 500KB文件 -> 大小条件不满足 -> false
+        sized_target.file_size = Some(500 * 1024); // 500KB
+        let result = service
+            .evaluate_flow_rules(&and_rules, &FlowMode::AND, &sized_target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "AND mode: one condition false should return false"
+        );
+
+        // 测试使用cnip true的场景 - 应该总是失败
+        let cn_ip_rules = vec![FlowCond::CnIp(true)]; // 中国IP条件
+        let result = service
+            .evaluate_flow_rules(&cn_ip_rules, &FlowMode::AND, &sized_target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "Without IPDB, cnip true should always be false"
+        );
+
+        // 测试OR模式 - 任一条件满足即可
+        let or_rules = vec![
+            FlowCond::CnIp(false), // 全球IP (总是true)
+            FlowCond::Size(FlowComp::Gt, Size::from_str("1MB").unwrap()), // 大于1MB
+        ];
+
+        // 全球IP + 500KB文件 -> IP条件满足 -> true
+        context.client_ip = Some("192.168.1.100".parse().unwrap());
+        sized_target.file_size = Some(500 * 1024); // 500KB
+        let result = service
+            .evaluate_flow_rules(&or_rules, &FlowMode::OR, &sized_target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "OR mode: one condition true should return true"
+        );
+
+        // 测试都不满足的OR情况
+        let impossible_or_rules = vec![
+            FlowCond::CnIp(true), // 中国IP (总是false)
+            FlowCond::Size(FlowComp::Gt, Size::from_str("10MB").unwrap()), // 大于10MB (当前2MB不满足)
+        ];
+
+        sized_target.file_size = Some(2 * 1024 * 1024); // 2MB
+        let result = service
+            .evaluate_flow_rules(&impossible_or_rules, &FlowMode::OR, &sized_target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "OR mode: all conditions false should return false"
+        );
+
+        // 测试复杂条件组合 - 使用在测试环境中可以满足的条件
+        let complex_rules = vec![
+            FlowCond::CnIp(false), // 全球IP (总是true)
+            FlowCond::Size(FlowComp::Ge, Size::from_str("1MB").unwrap()), // 大于等于1MB
+            FlowCond::Extras("test_flag".to_string()), // extras包含test_flag
+            FlowCond::IpVersion(4), // IPv4
+        ];
+
+        // 设置满足所有条件的上下文
+        context.client_ip = Some("192.168.1.100".parse().unwrap()); // IPv4地址
+        sized_target.file_size = Some(1024 * 1024); // 1MB，满足>=1MB条件
+        // extras已经包含test_flag
+
+        let result = service
+            .evaluate_flow_rules(&complex_rules, &FlowMode::AND, &sized_target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "Complex AND rules: all conditions true should return true"
+        );
+
+        println!("✅ All rule combination tests passed");
+    }
+
+    #[tokio::test]
+    async fn test_weighted_random_selection() {
+        let service = create_test_flow_service().await;
+
+        // 测试空服务器池 - 应该返回错误
+        let empty_pool: Vec<(String, u32)> = vec![];
+        let result = service.weighted_random_selection(&empty_pool);
+        assert!(result.is_err(), "Empty pool should return error");
+
+        // 测试全零权重 - 应该返回错误
+        let zero_weight_pool = vec![("server1".to_string(), 0), ("server2".to_string(), 0)];
+        let result = service.weighted_random_selection(&zero_weight_pool);
+        assert!(result.is_err(), "Zero weight pool should return error");
+
+        // 测试单个服务器 - 应该100%选中该服务器
+        let single_server_pool = vec![("server1".to_string(), 10)];
+        let result = service.weighted_random_selection(&single_server_pool);
+        assert!(result.is_ok(), "Single server should succeed");
+        assert_eq!(
+            result.unwrap().0,
+            "server1",
+            "Single server should be selected"
+        );
+
+        // 测试权重分布 - 使用统计验证
+        let test_pool = vec![
+            ("server1".to_string(), 70), // 期望约70%
+            ("server2".to_string(), 30), // 期望约30%
+        ];
+
+        let mut server1_count = 0;
+        let mut server2_count = 0;
+        let total_runs = 1000;
+
+        for _ in 0..total_runs {
+            let result = service.weighted_random_selection(&test_pool);
+            assert!(result.is_ok(), "Selection should not fail");
+
+            match result.unwrap().0.as_str() {
+                "server1" => server1_count += 1,
+                "server2" => server2_count += 1,
+                _ => panic!("Unexpected server selected"),
+            }
+        }
+
+        // 验证分布 (允许±10%的误差)
+        let server1_ratio = server1_count as f64 / total_runs as f64;
+        let server2_ratio = server2_count as f64 / total_runs as f64;
+
+        println!(
+            "Server1 ratio: {:.2}% (expected ~70%)",
+            server1_ratio * 100.0
+        );
+        println!(
+            "Server2 ratio: {:.2}% (expected ~30%)",
+            server2_ratio * 100.0
+        );
+
+        assert!(
+            server1_ratio > 0.60 && server1_ratio < 0.80,
+            "Server1 should be selected ~70% of time, got {:.1}%",
+            server1_ratio * 100.0
+        );
+        assert!(
+            server2_ratio > 0.20 && server2_ratio < 0.40,
+            "Server2 should be selected ~30% of time, got {:.1}%",
+            server2_ratio * 100.0
+        );
+
+        // 测试0权重服务器不被选中
+        let mixed_weight_pool = vec![
+            ("server1".to_string(), 10),
+            ("server2".to_string(), 0),
+            ("server3".to_string(), 5),
+        ];
+
+        let mut server2_selected = false;
+        for _ in 0..100 {
+            let result = service.weighted_random_selection(&mixed_weight_pool);
+            assert!(result.is_ok(), "Selection should not fail");
+            if result.unwrap().0 == "server2" {
+                server2_selected = true;
+                break;
+            }
+        }
+        assert!(
+            !server2_selected,
+            "Zero weight server should never be selected"
+        );
+
+        // 测试不同权重比例
+        let unequal_pool = vec![("high".to_string(), 90), ("low".to_string(), 10)];
+
+        let mut high_count = 0;
+        for _ in 0..200 {
+            let result = service.weighted_random_selection(&unequal_pool);
+            if result.unwrap().0 == "high" {
+                high_count += 1;
+            }
+        }
+
+        let high_ratio = high_count as f64 / 200.0;
+        assert!(
+            high_ratio > 0.80,
+            "High weight server should be selected most of the time"
+        );
+
+        println!("✅ All weighted random selection tests passed");
+    }
+
+    #[tokio::test]
+    async fn test_apply_penalty_to_pool() {
+        let service = create_test_flow_service().await;
+
+        // 测试空惩罚列表 - 权重应该不变
+        let mut pool = vec![
+            ("server1".to_string(), 10),
+            ("server2".to_string(), 5),
+            ("server3".to_string(), 8),
+        ];
+        let original_pool = pool.clone();
+        service.apply_penalty_to_pool(&mut pool, &[]);
+        assert_eq!(
+            pool, original_pool,
+            "Empty penalty list should not change weights"
+        );
+
+        // 测试标准惩罚 - 惩罚服务器权重被调整到最低非惩罚权重
+        let mut pool = vec![
+            ("server1".to_string(), 10),
+            ("server2".to_string(), 5), // 最低非惩罚权重
+            ("server3".to_string(), 8),
+        ];
+        let penalty_servers = vec!["server1".to_string(), "server3".to_string()];
+        service.apply_penalty_to_pool(&mut pool, &penalty_servers);
+
+        // server1 和 server3 应该被调整到 5 (最低非惩罚权重)
+        // server2 保持 5 不变
+        assert_eq!(
+            pool[0].1, 5,
+            "Penalized server1 should have weight reduced to min non-penalized"
+        );
+        assert_eq!(
+            pool[1].1, 5,
+            "Non-penalized server2 should keep original weight"
+        );
+        assert_eq!(
+            pool[2].1, 5,
+            "Penalized server3 should have weight reduced to min non-penalized"
+        );
+
+        // 测试全部服务器被惩罚 - 权重应该保持不变
+        let mut pool = vec![
+            ("server1".to_string(), 10),
+            ("server2".to_string(), 5),
+            ("server3".to_string(), 8),
+        ];
+        let original_pool = pool.clone();
+        let all_penalty = vec![
+            "server1".to_string(),
+            "server2".to_string(),
+            "server3".to_string(),
+        ];
+        service.apply_penalty_to_pool(&mut pool, &all_penalty);
+        assert_eq!(
+            pool, original_pool,
+            "All penalized servers should keep original weights"
+        );
+
+        // 测试惩罚不存在的服务器 - 应该没有影响
+        let mut pool = vec![("server1".to_string(), 10), ("server2".to_string(), 5)];
+        let original_pool = pool.clone();
+        let nonexistent_penalty = vec!["nonexistent_server".to_string()];
+        service.apply_penalty_to_pool(&mut pool, &nonexistent_penalty);
+        assert_eq!(
+            pool, original_pool,
+            "Non-existent penalty servers should have no effect"
+        );
+
+        // 测试部分惩罚 - 只有被惩罚的服务器权重改变
+        let mut pool = vec![
+            ("server1".to_string(), 20),
+            ("server2".to_string(), 15),
+            ("server3".to_string(), 10), // 最低非惩罚权重
+            ("server4".to_string(), 25),
+        ];
+        let partial_penalty = vec!["server1".to_string(), "server4".to_string()];
+        service.apply_penalty_to_pool(&mut pool, &partial_penalty);
+
+        assert_eq!(
+            pool[0].1, 10,
+            "Penalized server1 should be reduced to min non-penalized (10)"
+        );
+        assert_eq!(
+            pool[1].1, 15,
+            "Non-penalized server2 should keep weight (15)"
+        );
+        assert_eq!(
+            pool[2].1, 10,
+            "Non-penalized server3 should keep weight (10)"
+        );
+        assert_eq!(
+            pool[3].1, 10,
+            "Penalized server4 should be reduced to min non-penalized (10)"
+        );
+
+        // 测试边界情况：只有一个非惩罚服务器
+        let mut pool = vec![
+            ("server1".to_string(), 10),
+            ("server2".to_string(), 5), // 唯一非惩罚服务器
+            ("server3".to_string(), 8),
+        ];
+        let single_non_penalty = vec!["server1".to_string(), "server3".to_string()];
+        service.apply_penalty_to_pool(&mut pool, &single_non_penalty);
+
+        assert_eq!(
+            pool[0].1, 5,
+            "Penalized server should match single non-penalized weight"
+        );
+        assert_eq!(
+            pool[1].1, 5,
+            "Non-penalized server should keep original weight"
+        );
+        assert_eq!(
+            pool[2].1, 5,
+            "Penalized server should match single non-penalized weight"
+        );
+
+        println!("✅ All penalty application tests passed");
+    }
+
+    #[tokio::test]
+    async fn test_process_plugin_result() {
+        let service = create_test_flow_service().await;
+
+        // 测试增强格式解析 - 包含元数据
+        let enhanced_result = json!([
+            false, // should_break
+            [
+                ["http://server1.example.com/file", 10, {
+                    "server_id": "srv1",
+                    "skip_penalty": true
+                }],
+                ["http://server2.example.com/file", 5, {
+                    "server_id": "srv2",
+                    "skip_penalty": false
+                }],
+                ["http://server3.example.com/file", 8, null]
+            ]
+        ]);
+
+        let mut pool = vec![];
+        let mut plugin_server_mapping = HashMap::new();
+
+        let result =
+            service.process_plugin_result(enhanced_result, &mut pool, &mut plugin_server_mapping);
+        assert!(
+            result.is_ok(),
+            "Enhanced format should be parsed successfully"
+        );
+
+        // 验证服务器池
+        assert_eq!(pool.len(), 3, "Pool should contain 3 servers");
+        assert_eq!(pool[0], ("http://server1.example.com/file".to_string(), 10));
+        assert_eq!(pool[1], ("http://server2.example.com/file".to_string(), 5));
+        assert_eq!(pool[2], ("http://server3.example.com/file".to_string(), 8));
+
+        // 验证元数据映射
+        assert_eq!(
+            plugin_server_mapping.len(),
+            2,
+            "Should have 2 server mappings with metadata"
+        );
+        assert_eq!(
+            plugin_server_mapping.get("http://server1.example.com/file"),
+            Some(&(Some("srv1".to_string()), true))
+        );
+        assert_eq!(
+            plugin_server_mapping.get("http://server2.example.com/file"),
+            Some(&(Some("srv2".to_string()), false))
+        );
+        assert!(
+            !plugin_server_mapping.contains_key("http://server3.example.com/file"),
+            "Server with null metadata should not be in mapping"
+        );
+
+        // 测试兼容格式解析 - 旧格式
+        let compatible_result = json!([
+            false, // should_break
+            [
+                ["http://legacy1.example.com/file", 15],
+                ["http://legacy2.example.com/file", 20]
+            ]
+        ]);
+
+        let mut pool = vec![];
+        let mut plugin_server_mapping = HashMap::new();
+
+        let result =
+            service.process_plugin_result(compatible_result, &mut pool, &mut plugin_server_mapping);
+        assert!(
+            result.is_ok(),
+            "Compatible format should be parsed successfully"
+        );
+
+        // 验证服务器池
+        assert_eq!(pool.len(), 2, "Pool should contain 2 servers");
+        assert_eq!(pool[0], ("http://legacy1.example.com/file".to_string(), 15));
+        assert_eq!(pool[1], ("http://legacy2.example.com/file".to_string(), 20));
+
+        // 兼容格式应该没有元数据映射
+        assert_eq!(
+            plugin_server_mapping.len(),
+            0,
+            "Compatible format should not have metadata"
+        );
+
+        // 测试错误格式处理
+        let invalid_result = json!("invalid_format");
+        let mut pool = vec![];
+        let mut plugin_server_mapping = HashMap::new();
+
+        let result =
+            service.process_plugin_result(invalid_result, &mut pool, &mut plugin_server_mapping);
+        assert!(result.is_err(), "Invalid format should return error");
+
+        // 测试部分无效数据 - 缺少必要字段
+        let partial_invalid_result = json!([
+            false,
+            [
+                ["http://server1.example.com/file"] // 缺少权重
+            ]
+        ]);
+
+        let mut pool = vec![];
+        let mut plugin_server_mapping = HashMap::new();
+
+        let result = service.process_plugin_result(
+            partial_invalid_result,
+            &mut pool,
+            &mut plugin_server_mapping,
+        );
+        assert!(
+            result.is_err(),
+            "Partial invalid format should return error"
+        );
+
+        // 测试空结果
+        let empty_result = json!([false, []]);
+        let mut pool = vec![("existing".to_string(), 1)]; // 预存在的数据
+        let mut plugin_server_mapping = HashMap::new();
+
+        let result =
+            service.process_plugin_result(empty_result, &mut pool, &mut plugin_server_mapping);
+        assert!(result.is_ok(), "Empty result should be valid");
+        assert_eq!(
+            pool.len(),
+            0,
+            "Pool should be cleared even for empty result"
+        );
+
+        // 测试带有skip_penalty的元数据应用
+        let skip_penalty_result = json!([
+            false,
+            [
+                ["http://penalty-skip.example.com/file", 10, {
+                    "server_id": "penalty-skip",
+                    "skip_penalty": true
+                }],
+                ["http://penalty-normal.example.com/file", 10, {
+                    "server_id": "penalty-normal"
+                    // skip_penalty 省略，应该默认为false
+                }]
+            ]
+        ]);
+
+        let mut pool = vec![];
+        let mut plugin_server_mapping = HashMap::new();
+
+        let result = service.process_plugin_result(
+            skip_penalty_result,
+            &mut pool,
+            &mut plugin_server_mapping,
+        );
+        assert!(result.is_ok(), "Skip penalty result should be valid");
+
+        // 验证skip_penalty处理
+        assert_eq!(
+            plugin_server_mapping.get("http://penalty-skip.example.com/file"),
+            Some(&(Some("penalty-skip".to_string()), true)),
+            "skip_penalty: true should be preserved"
+        );
+        assert_eq!(
+            plugin_server_mapping.get("http://penalty-normal.example.com/file"),
+            Some(&(Some("penalty-normal".to_string()), false)),
+            "missing skip_penalty should default to false"
+        );
+
+        println!("✅ All plugin result processing tests passed");
+    }
+}
