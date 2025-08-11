@@ -1,6 +1,8 @@
 use crate::models::{CdnRecord, Session};
 use crate::modules::server::HealthInfo;
-use crate::modules::storage::data_store::{CacheMetadata, DataStoreBackend, SessionStats};
+use crate::modules::storage::data_store::{
+    CacheMetadata, DataStoreBackend, RingBufferMeta, SessionStats,
+};
 use redis::{AsyncCommands, Client};
 use std::collections::HashMap;
 use tracing::{debug, warn};
@@ -64,6 +66,7 @@ impl DataStoreBackend for RedisDataStore {
                 "extras",
                 serde_json::to_string(&session.extras).map_err(|e| e.to_string())?,
             )
+            .hset(&session_key, "created_at", session.created_at)
             .expire(&session_key, 3600);
 
         // 初始化所有chunk的下载计数为0
@@ -92,13 +95,14 @@ impl DataStoreBackend for RedisDataStore {
         let key = self.redis_key("session", sid);
 
         // 使用Pipeline一次获取所有字段
-        let (resource_id, version, chunks, sub_path, cdn_records, extras): (
+        let (resource_id, version, chunks, sub_path, cdn_records, extras, created_at): (
             Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<u64>,
         ) = redis::pipe()
             .atomic()
             .hget(&key, "resource_id")
@@ -107,6 +111,7 @@ impl DataStoreBackend for RedisDataStore {
             .hget(&key, "sub_path")
             .hget(&key, "cdn_records")
             .hget(&key, "extras")
+            .hget(&key, "created_at")
             .query_async(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
@@ -128,6 +133,7 @@ impl DataStoreBackend for RedisDataStore {
                     sub_path: sub_path_value,
                     cdn_records,
                     extras,
+                    created_at: created_at.unwrap_or(0), // 如果没有created_at字段，默认为0
                 }))
             }
             _ => Ok(None),
@@ -294,11 +300,12 @@ impl DataStoreBackend for RedisDataStore {
         let counts_key = self.redis_key("counts", sid);
 
         // 使用Pipeline同时获取所有信息
-        let (resource_id, version, chunks, cdn_records, counts): (
+        let (resource_id, version, chunks, cdn_records, created_at, counts): (
             Option<String>,
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<u64>,
             HashMap<String, u32>,
         ) = redis::pipe()
             .atomic()
@@ -306,6 +313,7 @@ impl DataStoreBackend for RedisDataStore {
             .hget(&session_key, "version")
             .hget(&session_key, "chunks")
             .hget(&session_key, "cdn_records")
+            .hget(&session_key, "created_at")
             .hgetall(&counts_key)
             .query_async(&mut conn)
             .await
@@ -322,6 +330,7 @@ impl DataStoreBackend for RedisDataStore {
                     chunks,
                     download_counts: counts,
                     cdn_records,
+                    created_at: created_at.unwrap_or(0), // 如果没有created_at字段，默认为0
                 }))
             }
             _ => Ok(None),
@@ -808,9 +817,220 @@ impl DataStoreBackend for RedisDataStore {
 
         Ok(expired_sessions)
     }
+
+    // 分钟级带宽统计接口实现
+    async fn update_server_minute_bandwidth_direct(
+        &self,
+        server_id: &str,
+        minute_timestamp: u64,
+        bytes: u64,
+    ) -> Result<(), String> {
+        let ring_key = format!("server_bw_ring:{}", server_id);
+
+        // 获取或创建环形缓冲区
+        let meta = self
+            .get_or_create_ring_buffer(&ring_key, minute_timestamp)
+            .await?;
+
+        // 计算物理索引
+        if let Some(physical_index) = meta.get_physical_index(minute_timestamp) {
+            let mut conn = self
+                .client
+                .get_multiplexed_async_connection()
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // 原子性更新
+            let _: () = redis::cmd("HINCRBY")
+                .arg(&ring_key)
+                .arg(physical_index.to_string())
+                .arg(bytes as i64)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            // 设置TTL（25小时）
+            let _: () = redis::cmd("EXPIRE")
+                .arg(&ring_key)
+                .arg(90000u32) // 25 hours in seconds
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        Ok(())
+    }
+
+    async fn get_server_minutes_bandwidth_direct(
+        &self,
+        server_id: &str,
+        minutes: u32,
+    ) -> Result<u64, String> {
+        let ring_key = format!("server_bw_ring:{}", server_id);
+        let current_minute = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 60;
+
+        // 获取环形缓冲区的当前状态
+        let meta_opt = self.get_ring_meta(&ring_key).await?;
+
+        if let Some(meta) = meta_opt {
+            let mut total_bytes = 0u64;
+            let mut fields_to_query = Vec::new();
+
+            // 计算需要查询的物理索引
+            for i in 0..minutes {
+                let target_minute = current_minute.saturating_sub(i as u64);
+                if let Some(physical_index) = meta.get_physical_index(target_minute) {
+                    fields_to_query.push(physical_index.to_string());
+                }
+            }
+
+            // 批量查询Redis
+            if !fields_to_query.is_empty() {
+                let values = self.hmget(&ring_key, &fields_to_query).await?;
+
+                for value in values {
+                    if let Some(bytes_str) = value {
+                        if let Ok(bytes) = bytes_str.parse::<u64>() {
+                            total_bytes += bytes;
+                        }
+                    }
+                }
+            }
+
+            Ok(total_bytes)
+        } else {
+            // 环形缓冲区不存在，返回0
+            Ok(0)
+        }
+    }
+
+    async fn get_ring_meta(&self, ring_key: &str) -> Result<Option<RingBufferMeta>, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 尝试获取现有元数据
+        let meta_result: Result<(Option<String>, Option<String>), redis::RedisError> =
+            redis::pipe()
+                .hget(ring_key, "meta_start_minute")
+                .hget(ring_key, "meta_head_index")
+                .query_async(&mut conn)
+                .await;
+
+        match meta_result {
+            Ok((Some(start_minute_str), Some(head_index_str))) => {
+                let start_minute: u64 = start_minute_str
+                    .parse()
+                    .map_err(|e| format!("Invalid start_minute: {}", e))?;
+                let head_index: u32 = head_index_str
+                    .parse()
+                    .map_err(|e| format!("Invalid head_index: {}", e))?;
+
+                Ok(Some(RingBufferMeta {
+                    start_minute,
+                    head_index,
+                    ring_size: 1440,
+                }))
+            }
+            Ok(_) => Ok(None), // 缺少元数据
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<String>>, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if fields.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let mut cmd = redis::cmd("HMGET");
+        cmd.arg(key);
+        for field in fields {
+            cmd.arg(field);
+        }
+
+        cmd.query_async(&mut conn).await.map_err(|e| e.to_string())
+    }
 }
 
 impl RedisDataStore {
+    /// 获取或创建环形缓冲区
+    async fn get_or_create_ring_buffer(
+        &self,
+        ring_key: &str,
+        minute_timestamp: u64,
+    ) -> Result<RingBufferMeta, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 尝试获取现有元数据
+        let existing_meta: Option<String> = redis::cmd("HGET")
+            .arg(ring_key)
+            .arg("meta_start_minute")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        match existing_meta {
+            Some(start_minute_str) => {
+                // 环形缓冲区已存在
+                let start_minute: u64 = start_minute_str.parse().unwrap_or(minute_timestamp);
+                let head_index_str: Option<String> = redis::cmd("HGET")
+                    .arg(ring_key)
+                    .arg("meta_head_index")
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let head_index_str = head_index_str.unwrap_or_else(|| "0".to_string());
+
+                Ok(RingBufferMeta {
+                    start_minute,
+                    head_index: head_index_str.parse().unwrap_or(0),
+                    ring_size: 1440,
+                })
+            }
+            None => {
+                // 创建新的环形缓冲区
+                let meta = RingBufferMeta {
+                    start_minute: minute_timestamp,
+                    head_index: 0,
+                    ring_size: 1440,
+                };
+
+                // 初始化元数据
+                let _: () = redis::cmd("HMSET")
+                    .arg(ring_key)
+                    .arg("meta_start_minute")
+                    .arg(minute_timestamp)
+                    .arg("meta_head_index")
+                    .arg(0u32)
+                    .arg("meta_ring_size")
+                    .arg(1440u32)
+                    .arg("0")
+                    .arg(0u64)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                Ok(meta)
+            }
+        }
+    }
+
     /// 从 Redis 键中提取会话 ID
     fn extract_session_id(&self, key: &str) -> Option<String> {
         // key 格式: "session:session_id" 或 "prefix:session:session_id"

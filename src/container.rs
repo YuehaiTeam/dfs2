@@ -10,7 +10,9 @@ use crate::{
         qjs::JsRunner,
         version_provider::{PluginVersionProvider, VersionCache, VersionUpdater},
     },
-    services::{ChallengeService, FlowService, ResourceService, SessionService},
+    services::{
+        BandwidthCacheService, ChallengeService, FlowService, ResourceService, SessionService,
+    },
 };
 
 use std::sync::Arc;
@@ -42,6 +44,7 @@ pub struct AppContext {
     pub resource_service: ResourceService,
     pub flow_service: FlowService,
     pub challenge_service: ChallengeService,
+    pub bandwidth_cache_service: BandwidthCacheService,
     pub js_runner: JsRunner,
     pub metrics: Arc<Metrics>,
     pub shared_config: SharedConfig,
@@ -54,6 +57,7 @@ impl AppContext {
         resource_service: ResourceService,
         flow_service: FlowService,
         challenge_service: ChallengeService,
+        bandwidth_cache_service: BandwidthCacheService,
         js_runner: JsRunner,
         metrics: Arc<Metrics>,
         shared_config: SharedConfig,
@@ -64,6 +68,7 @@ impl AppContext {
             resource_service,
             flow_service,
             challenge_service,
+            bandwidth_cache_service,
             js_runner,
             metrics,
             shared_config,
@@ -126,10 +131,13 @@ impl AppContainer {
             self.version_cache.clone(),
             self.version_updater.clone(),
         );
+        let bandwidth_cache_service = BandwidthCacheService::new(self.data_store.clone());
         let flow_service = FlowService::new(
             self.shared_config.clone(),
             self.data_store.clone(),
             self.js_runner.clone(),
+            bandwidth_cache_service.clone(),
+            resource_service.clone(),
         );
         let challenge_service = ChallengeService::new(
             self.data_store.clone(),
@@ -143,6 +151,7 @@ impl AppContainer {
             resource_service,
             flow_service,
             challenge_service,
+            bandwidth_cache_service,
             self.js_runner.clone(),
             self.metrics.clone(),
             self.shared_config.clone(),

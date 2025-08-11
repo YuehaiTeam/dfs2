@@ -196,6 +196,17 @@ impl ConfigValidator {
                     report.config_valid = false;
                 }
             }
+
+            // 验证版本配置：每个资源必须配置版本（静态或动态）
+            let has_static_version = !resource.latest.is_empty();
+            let has_dynamic_version = resource.version_provider.is_some();
+
+            if !has_static_version && !has_dynamic_version {
+                report.add_error(format!(
+                    "资源 '{resource_id}' 缺少版本配置：必须配置 'latest' 字段或 'version_provider'"
+                ));
+                report.config_valid = false;
+            }
         }
 
         // 检查插件配置

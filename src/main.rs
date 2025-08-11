@@ -1,3 +1,4 @@
+mod commands;
 mod config;
 mod container;
 mod error;
@@ -29,18 +30,48 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validation::ConfigValidator;
 
+use crate::commands::{prometheus_config, rclone_config};
 use crate::modules::{analytics, network::RealConnectInfo};
 
 /// DFS2 - Distributed File System Server
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Validate configuration and plugins only, then exit
-    #[arg(
-        long,
-        help = "Validate configuration and plugins, then exit without starting the server"
-    )]
-    validate_only: bool,
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    /// Start the DFS2 server (default)
+    Serve,
+    /// Validate configuration and plugins, then exit
+    Validate,
+    /// Generate Prometheus configuration for monitoring
+    GeneratePrometheus {
+        /// Filter servers by profile (e.g., "minio")
+        #[arg(long, help = "Filter servers by profile")]
+        profile: Option<String>,
+        /// Scrape interval (e.g., "15s", "1m", "5m")
+        #[arg(
+            long,
+            help = "Scrape interval for metrics collection",
+            default_value = "15s"
+        )]
+        scrape_interval: String,
+        /// Output file path, use "-" for stdout
+        #[arg(short = 'o', long, help = "Output file path", default_value = "-")]
+        output: String,
+    },
+    /// Generate rclone configuration
+    GenerateRclone {
+        /// Filter servers by profile (e.g., "minio")
+        #[arg(long, help = "Filter servers by profile")]
+        profile: Option<String>,
+        /// Output file path, use "-" for stdout
+        #[arg(short = 'o', long, help = "Output file path", default_value = "-")]
+        output: String,
+    },
 }
 
 fn init_tracing() -> DfsResult<()> {
@@ -55,7 +86,6 @@ fn init_tracing() -> DfsResult<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!("Tracing initialized successfully");
     Ok(())
 }
 
@@ -74,21 +104,73 @@ async fn real_ip_middleware(
     next.run(req).await
 }
 
-#[tokio::main]
-async fn main() -> DfsResult<()> {
-    dotenv().ok();
-
-    // 解析命令行参数
-    let args = Args::parse();
-
-    // 初始化日志系统
-    init_tracing()?;
-
-    if args.validate_only {
-        info!("运行配置验证模式...");
+async fn write_output(content: &str, output_path: &str) -> DfsResult<()> {
+    if output_path == "-" {
+        println!("{}", content);
     } else {
-        info!("Starting DFS2 server...");
+        tokio::fs::write(output_path, content).await.map_err(|e| {
+            error!("Failed to write to file {}: {}", output_path, e);
+            DfsError::internal_error(format!("File write error: {e}"))
+        })?;
+        info!("Configuration written to: {}", output_path);
     }
+    Ok(())
+}
+
+async fn handle_generate_prometheus(
+    profile_filter: Option<&str>,
+    scrape_interval: &str,
+    output_path: &str,
+) -> DfsResult<()> {
+    // 直接读取配置文件，跳过插件加载和验证
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
+    let content = tokio::fs::read_to_string(config_path).await.map_err(|e| {
+        error!("Failed to read configuration file: {}", e);
+        DfsError::internal_error(format!("Configuration file error: {e}"))
+    })?;
+    let config: config::AppConfig = serde_yaml::from_str(&content).map_err(|e| {
+        error!("Failed to parse configuration: {}", e);
+        DfsError::internal_error(format!("Configuration parse error: {e}"))
+    })?;
+
+    // 生成Prometheus配置
+    match prometheus_config::generate_prometheus_config(&config, profile_filter, scrape_interval) {
+        Ok(prometheus_yaml) => write_output(&prometheus_yaml, output_path).await,
+        Err(e) => {
+            error!("Failed to generate Prometheus configuration: {}", e);
+            Err(DfsError::internal_error(format!(
+                "Prometheus config generation error: {e}"
+            )))
+        }
+    }
+}
+
+async fn handle_generate_rclone(profile_filter: Option<&str>, output_path: &str) -> DfsResult<()> {
+    // 直接读取配置文件，跳过插件加载和验证
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
+    let content = tokio::fs::read_to_string(config_path).await.map_err(|e| {
+        error!("Failed to read configuration file: {}", e);
+        DfsError::internal_error(format!("Configuration file error: {e}"))
+    })?;
+    let config: config::AppConfig = serde_yaml::from_str(&content).map_err(|e| {
+        error!("Failed to parse configuration: {}", e);
+        DfsError::internal_error(format!("Configuration parse error: {e}"))
+    })?;
+
+    // 生成rclone配置
+    match rclone_config::generate_rclone_config(&config, profile_filter) {
+        Ok(rclone_conf) => write_output(&rclone_conf, output_path).await,
+        Err(e) => {
+            error!("Failed to generate rclone configuration: {}", e);
+            Err(DfsError::internal_error(format!(
+                "rclone config generation error: {e}"
+            )))
+        }
+    }
+}
+
+async fn handle_validate() -> DfsResult<()> {
+    info!("运行配置验证模式...");
 
     // 使用AppContainer初始化所有组件
     let app_container = match AppContainer::new().await {
@@ -102,21 +184,67 @@ async fn main() -> DfsResult<()> {
         }
     };
 
-    // 如果是验证模式，执行验证后退出
-    if args.validate_only {
-        let config_guard = app_container.shared_config.load();
-        match ConfigValidator::validate_full(&config_guard, &app_container.data_store).await {
-            Ok(report) => {
-                report.print_report();
-                std::process::exit(if report.is_valid() { 0 } else { 1 });
-            }
-            Err(e) => {
-                error!("配置验证失败: {}", e);
-                std::process::exit(1);
-            }
+    // 执行验证并退出
+    let config_guard = app_container.shared_config.load();
+    match ConfigValidator::validate_full(&config_guard, &app_container.data_store).await {
+        Ok(report) => {
+            report.print_report();
+            std::process::exit(if report.is_valid() { 0 } else { 1 });
+        }
+        Err(e) => {
+            error!("配置验证失败: {}", e);
+            std::process::exit(1);
         }
     }
+}
 
+#[tokio::main]
+async fn main() -> DfsResult<()> {
+    dotenv().ok();
+
+    // 解析命令行参数
+    let args = Args::parse();
+
+    // 初始化日志系统
+    init_tracing()?;
+
+    // 处理命令行命令
+    match args.command {
+        Some(Commands::GeneratePrometheus {
+            profile,
+            scrape_interval,
+            output,
+        }) => {
+            return handle_generate_prometheus(profile.as_deref(), &scrape_interval, &output).await;
+        }
+        Some(Commands::GenerateRclone { profile, output }) => {
+            return handle_generate_rclone(profile.as_deref(), &output).await;
+        }
+        Some(Commands::Validate) => {
+            return handle_validate().await;
+        }
+        Some(Commands::Serve) | None => {
+            info!("Starting DFS2 server...");
+
+            // 使用AppContainer初始化所有组件
+            let app_container = match AppContainer::new().await {
+                Ok(container) => {
+                    info!("Application container initialized successfully");
+                    container
+                }
+                Err(e) => {
+                    error!("Failed to initialize application container: {}", e);
+                    return Err(e);
+                }
+            };
+
+            // 继续服务器启动流程
+            return start_server(app_container).await;
+        }
+    }
+}
+
+async fn start_server(app_container: AppContainer) -> DfsResult<()> {
     // 创建统一的AppContext
     let app_context = app_container.create_app_context();
     info!("Application context created");

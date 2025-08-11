@@ -3,7 +3,7 @@ use axum::{
     http::HeaderMap,
 };
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::container::AppContext;
 use crate::error::DfsError;
@@ -58,12 +58,6 @@ pub async fn get_cdn(
         .check_download_limit(&sessionid, range_str)
         .await?;
 
-    // 验证资源存在性
-    let (validated_resid, _effective_version) = ctx
-        .resource_service
-        .validate_resource_and_version(&resid, "", None)
-        .await?;
-
     // 解析ranges参数
     let ranges = if range_str.contains(',') {
         // Multiple ranges: "0-255,256-511,512-767"
@@ -111,7 +105,11 @@ pub async fn get_cdn(
     };
 
     let config_guard = ctx.shared_config.load();
-    let res = config_guard.get_resource(&validated_resid).unwrap(); // 已验证存在
+    let res = config_guard.get_resource(&resid);
+    if res.is_none() {
+        return Err(DfsError::resource_not_found(&resid));
+    }
+    let res = res.unwrap();
     let flow_list = &res.flow;
 
     // 计算文件大小：根据ranges计算总大小
@@ -121,6 +119,9 @@ pub async fn get_cdn(
             .map(|(start, end)| (end - start + 1) as u64)
             .sum(),
     );
+    let file_size_mb = file_size
+        .map(|size| size as f64 / 1024.0 / 1024.0)
+        .unwrap_or(0.0);
 
     // 使用SessionService统一处理flow执行
     let flow_result = ctx
@@ -134,32 +135,74 @@ pub async fn get_cdn(
             file_size,
             flow_list,
         )
-        .await?;
-    let cdn_url = flow_result.url;
-
-    // 记录调度结果日志
+        .await;
     let resource_path = if let Some(ref sub_path_val) = session.sub_path {
         format!("{resid}/{sub_path_val}")
     } else {
         resid.clone()
     };
-    let file_size_mb = file_size
-        .map(|size| size as f64 / 1024.0 / 1024.0)
-        .unwrap_or(0.0);
+    if flow_result.is_err() {
+        let e = flow_result.unwrap_err();
+        error!(
+            "SESSION-ERROR {} size={:.2}MB {}",
+            resource_path, file_size_mb, e
+        );
+        return Err(e);
+    }
+
+    let flow_result = flow_result.unwrap();
+    let cdn_url = flow_result.url;
+
+    // 记录调度结果日志
     info!(
-        "{} size={:.2}MB -> {} weight={}",
+        "{} size={:.2}MB -> {} weight={} ip={}",
         resource_path,
         file_size_mb,
         flow_result
             .selected_server_id
             .as_deref()
             .unwrap_or("unknown"),
-        flow_result.selected_server_weight.unwrap_or(0)
+        flow_result.selected_server_weight.unwrap_or(0),
+        if let Some(ip) = client_ip {
+            ip.to_string()
+        } else {
+            "unknown".to_string()
+        }
     );
 
     // 记录成功的请求和流程执行指标
     record_request_metrics!(ctx.metrics, start_time);
     record_flow_metrics!(ctx.metrics, true);
+
+    // 记录调度请求指标和流量统计（CDN访问场景）
+    if let Some(server_id) = flow_result.selected_server_id.as_deref() {
+        ctx.metrics
+            .record_scheduled_request(&resid, server_id, false);
+
+        // 记录流量统计（两个体系都要记录）
+        if let Some(bytes) = file_size {
+            // 1. 记录日流量（使用批量更新接口）
+            if let Err(e) = ctx
+                .data_store
+                .update_bandwidth_batch(crate::modules::storage::data_store::BandwidthUpdateBatch {
+                    resource_id: resid.clone(),
+                    server_id: server_id.to_string(),
+                    bytes,
+                })
+                .await
+            {
+                warn!(
+                    "Failed to update daily bandwidth for server {}: {}",
+                    server_id, e
+                );
+            }
+
+            // 2. 记录分钟级流量
+            ctx.bandwidth_cache_service
+                .record_bandwidth(server_id, bytes)
+                .await;
+        }
+    }
 
     Ok(ApiResponse::success(ResponseData::Cdn { url: cdn_url }))
 }

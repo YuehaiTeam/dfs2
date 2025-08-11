@@ -155,6 +155,23 @@ pub trait DataStoreBackend: Send + Sync {
 
     // 批量带宽更新接口
     async fn update_bandwidth_batch(&self, batch: BandwidthUpdateBatch) -> Result<(), String>;
+
+    // 分钟级带宽统计接口
+    async fn update_server_minute_bandwidth_direct(
+        &self,
+        server_id: &str,
+        minute_timestamp: u64,
+        bytes: u64,
+    ) -> Result<(), String>;
+
+    async fn get_server_minutes_bandwidth_direct(
+        &self,
+        server_id: &str,
+        minutes: u32,
+    ) -> Result<u64, String>;
+
+    async fn get_ring_meta(&self, ring_key: &str) -> Result<Option<RingBufferMeta>, String>;
+    async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<String>>, String>;
 }
 
 #[derive(Debug, Clone)]
@@ -164,6 +181,32 @@ pub struct BandwidthUpdateBatch {
     pub bytes: u64,
 }
 
+/// 环形缓冲区元数据
+#[derive(Debug, Clone)]
+pub struct RingBufferMeta {
+    pub start_minute: u64, // 缓冲区起始时间
+    pub head_index: u32,   // 当前头部物理索引
+    pub ring_size: u32,    // 缓冲区大小
+}
+
+impl RingBufferMeta {
+    /// 根据目标分钟获取物理索引
+    pub fn get_physical_index(&self, target_minute: u64) -> Option<u32> {
+        if target_minute < self.start_minute {
+            return None; // 时间太早，超出缓冲区范围
+        }
+
+        let minutes_offset = target_minute - self.start_minute;
+        if minutes_offset >= self.ring_size as u64 {
+            return None; // 时间太晚，超出缓冲区范围
+        }
+
+        // 计算物理索引位置
+        let physical_index = (self.head_index + minutes_offset as u32) % self.ring_size;
+        Some(physical_index)
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionStats {
     pub resource_id: String,
@@ -171,6 +214,7 @@ pub struct SessionStats {
     pub chunks: Vec<String>,
     pub download_counts: HashMap<String, u32>,
     pub cdn_records: HashMap<String, Vec<CdnRecord>>,
+    pub created_at: u64, // session创建时间戳
 }
 
 // 文件数据存储实现 - 每个key对应一个文件
@@ -397,6 +441,7 @@ impl DataStoreBackend for FileDataStore {
                 chunks: session.chunks,
                 download_counts,
                 cdn_records,
+                created_at: session.created_at,
             }))
         } else {
             Ok(None)
@@ -698,6 +743,60 @@ impl DataStoreBackend for FileDataStore {
         }
 
         Ok(expired_sessions)
+    }
+
+    // 分钟级带宽统计接口实现（FileDataStore只做基础支持）
+    async fn update_server_minute_bandwidth_direct(
+        &self,
+        server_id: &str,
+        minute_timestamp: u64,
+        bytes: u64,
+    ) -> Result<(), String> {
+        // 文件存储的简化实现：使用类似日流量的存储方式
+        let minute_key = format!("server_bw_minute:{}:{}", server_id, minute_timestamp);
+
+        // 读取当前值并累加
+        let current_usage: u64 = self.read_json_file(&minute_key).await?.unwrap_or(0);
+        let new_usage = current_usage + bytes;
+
+        // 写入新值
+        self.write_json_file(&minute_key, &new_usage).await
+    }
+
+    async fn get_server_minutes_bandwidth_direct(
+        &self,
+        server_id: &str,
+        minutes: u32,
+    ) -> Result<u64, String> {
+        let current_minute = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 60;
+
+        let mut total_bytes = 0u64;
+
+        // 累加指定时间窗口内的流量
+        for i in 0..minutes {
+            let target_minute = current_minute.saturating_sub(i as u64);
+            let minute_key = format!("server_bw_minute:{}:{}", server_id, target_minute);
+
+            if let Ok(Some(bytes)) = self.read_json_file::<u64>(&minute_key).await {
+                total_bytes += bytes;
+            }
+        }
+
+        Ok(total_bytes)
+    }
+
+    async fn get_ring_meta(&self, _ring_key: &str) -> Result<Option<RingBufferMeta>, String> {
+        // 文件存储不支持环形缓冲区，返回None
+        Ok(None)
+    }
+
+    async fn hmget(&self, _key: &str, _fields: &[String]) -> Result<Vec<Option<String>>, String> {
+        // 文件存储不支持hash操作，返回空结果
+        Ok(vec![])
     }
 }
 

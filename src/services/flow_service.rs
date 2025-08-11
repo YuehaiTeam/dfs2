@@ -18,14 +18,24 @@ pub struct FlowService {
     shared_config: SharedConfig,
     data_store: DataStore,
     js_runner: JsRunner,
+    bandwidth_cache: crate::services::BandwidthCacheService,
+    resource_service: crate::services::ResourceService,
 }
 
 impl FlowService {
-    pub fn new(shared_config: SharedConfig, data_store: DataStore, js_runner: JsRunner) -> Self {
+    pub fn new(
+        shared_config: SharedConfig,
+        data_store: DataStore,
+        js_runner: JsRunner,
+        bandwidth_cache: crate::services::BandwidthCacheService,
+        resource_service: crate::services::ResourceService,
+    ) -> Self {
         Self {
             shared_config,
             data_store,
             js_runner,
+            bandwidth_cache,
+            resource_service,
         }
     }
 
@@ -377,6 +387,24 @@ impl FlowService {
                     FlowComp::Le => true, // 0总是小于等于任何数
                 })
             }
+            FlowCond::ServerBwMinutes(server_id, minutes, comp, limit) => {
+                // 服务器分钟级流量限制检查：使用缓存服务
+                let current_usage = self
+                    .bandwidth_cache
+                    .get_server_minutes_bandwidth(server_id, *minutes)
+                    .await
+                    .unwrap_or(0);
+
+                let limit_bytes = limit.bytes() as u64;
+                Ok(match comp {
+                    FlowComp::Eq => current_usage == limit_bytes,
+                    FlowComp::Ne => current_usage != limit_bytes,
+                    FlowComp::Gt => current_usage > limit_bytes,
+                    FlowComp::Ge => current_usage >= limit_bytes,
+                    FlowComp::Lt => current_usage < limit_bytes,
+                    FlowComp::Le => current_usage <= limit_bytes,
+                })
+            }
             FlowCond::Time(comp, expected_time) => {
                 let current_time = chrono::Local::now().time();
                 Ok(match comp {
@@ -524,33 +552,28 @@ impl FlowService {
     ) -> DfsResult<bool> {
         let config = self.shared_config.load();
         if let Some(server_impl) = config.get_server(&server.0) {
-            let resource = config
-                .get_resource(&target.resource_id)
-                .ok_or_else(|| DfsError::resource_not_found(&target.resource_id))?;
+            // 首先验证资源和版本，获取有效版本
+            let (validated_resource_id, effective_version) = self
+                .resource_service
+                .validate_resource_and_version(
+                    &target.resource_id,
+                    &target.version,
+                    target.sub_path.as_deref(),
+                )
+                .await?;
 
-            // 获取版本路径
-            let path = if let Some(version_map) = resource.versions.get(&target.version) {
-                if let Some(server_id) = Some(&server.0) {
-                    version_map
-                        .get(server_id)
-                        .or_else(|| version_map.get("default"))
-                } else {
-                    version_map.get("default")
-                }
-            } else {
-                resource
-                    .versions
-                    .get("default")
-                    .and_then(|default_template| {
-                        default_template
-                            .get(&server.0)
-                            .or_else(|| default_template.get("default"))
-                    })
-            };
-
-            let health_check_path = path
-                .map(|p| p.replace("${version}", &target.version))
-                .ok_or_else(|| DfsError::path_not_found(&target.resource_id, &target.version))?;
+            // 使用统一的路径获取函数，支持前缀资源和子路径
+            let health_check_path = self
+                .resource_service
+                .get_version_path(
+                    &validated_resource_id,
+                    &effective_version,
+                    Some(&server.0),
+                    target.sub_path.as_deref(),
+                )
+                .ok_or_else(|| {
+                    DfsError::path_not_found(&validated_resource_id, &effective_version)
+                })?;
 
             Ok(server_impl
                 .is_alive(&server.0, &health_check_path, Some(&self.data_store))
@@ -1216,6 +1239,279 @@ mod tests {
         );
 
         println!("✅ All penalty application tests passed");
+    }
+
+    #[tokio::test]
+    async fn test_server_bandwidth_minutes_condition() {
+        let service = create_test_flow_service().await;
+        let (target, context, _options) = create_test_context();
+
+        // 获取bandwidth cache service来记录流量数据
+        let bandwidth_service = &service.bandwidth_cache;
+
+        // 测试场景：记录不同服务器的流量数据
+        let server_id = "test_cdn";
+
+        // 记录一些流量数据
+        bandwidth_service
+            .record_bandwidth(server_id, 500_000_000)
+            .await; // 500MB
+        bandwidth_service
+            .record_bandwidth(server_id, 300_000_000)
+            .await; // 300MB
+
+        // 手动刷新到存储
+        bandwidth_service.flush_pending_for_test().await.unwrap();
+
+        // 测试小于条件：800MB < 1GB -> true
+        let size_1gb = Size::from_str("1GB").unwrap();
+        let condition = FlowCond::ServerBwMinutes(
+            server_id.to_string(),
+            30, // 30分钟窗口
+            FlowComp::Lt,
+            size_1gb.clone(),
+        );
+
+        let result = service
+            .evaluate_condition(&condition, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "800MB should be less than 1GB");
+
+        // 测试大于条件：800MB > 500MB -> true
+        let size_500mb = Size::from_str("500MB").unwrap();
+        let condition =
+            FlowCond::ServerBwMinutes(server_id.to_string(), 30, FlowComp::Gt, size_500mb);
+
+        let result = service
+            .evaluate_condition(&condition, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "800MB should be greater than 500MB");
+
+        // 测试等于条件（使用确切值）
+        let size_800mb = Size::from_str("800MB").unwrap();
+        let condition =
+            FlowCond::ServerBwMinutes(server_id.to_string(), 30, FlowComp::Eq, size_800mb);
+
+        let result = service
+            .evaluate_condition(&condition, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), true, "800MB should equal 800MB");
+
+        // 测试不存在的服务器 - 应该返回0流量
+        let nonexistent_condition = FlowCond::ServerBwMinutes(
+            "nonexistent_server".to_string(),
+            30,
+            FlowComp::Lt,
+            Size::from_str("100MB").unwrap(),
+        );
+
+        let result = service
+            .evaluate_condition(&nonexistent_condition, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "Non-existent server should have 0 bandwidth, thus < 100MB"
+        );
+
+        // 测试不同时间窗口的流量查询
+        let smaller_window_condition = FlowCond::ServerBwMinutes(
+            server_id.to_string(),
+            1, // 1分钟窗口（应该包含所有当前分钟的流量）
+            FlowComp::Eq,
+            size_800mb.clone(),
+        );
+
+        let result = service
+            .evaluate_condition(&smaller_window_condition, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "Current minute should contain all recorded bandwidth"
+        );
+
+        println!("✅ Server bandwidth minutes condition tests passed");
+    }
+
+    #[tokio::test]
+    async fn test_server_bandwidth_minutes_in_flow_rules() {
+        let service = create_test_flow_service().await;
+        let (target, context, _options) = create_test_context();
+
+        let bandwidth_service = &service.bandwidth_cache;
+        let high_traffic_server = "high_traffic_cdn";
+        let low_traffic_server = "low_traffic_cdn";
+
+        // 为高流量服务器记录大量数据
+        bandwidth_service
+            .record_bandwidth(high_traffic_server, 1_500_000_000)
+            .await; // 1.5GB
+
+        // 为低流量服务器记录少量数据
+        bandwidth_service
+            .record_bandwidth(low_traffic_server, 200_000_000)
+            .await; // 200MB
+
+        // 刷新到存储
+        bandwidth_service.flush_pending_for_test().await.unwrap();
+
+        // 测试复合流量控制规则：只有低流量服务器可以处理新请求
+        let bandwidth_limit_rules = vec![
+            FlowCond::ServerBwMinutes(
+                high_traffic_server.to_string(),
+                60, // 60分钟窗口
+                FlowComp::Lt,
+                Size::from_str("1GB").unwrap(),
+            ),
+            FlowCond::CnIp(false), // 全球用户
+        ];
+
+        // 高流量服务器应该不满足条件（1.5GB不小于1GB）
+        let result = service
+            .evaluate_flow_rules(&bandwidth_limit_rules, &FlowMode::AND, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "High traffic server should fail bandwidth limit check"
+        );
+
+        // 测试低流量服务器满足条件的规则
+        let low_bandwidth_rules = vec![
+            FlowCond::ServerBwMinutes(
+                low_traffic_server.to_string(),
+                60,
+                FlowComp::Lt,
+                Size::from_str("1GB").unwrap(),
+            ),
+            FlowCond::CnIp(false), // 全球用户
+        ];
+
+        let result = service
+            .evaluate_flow_rules(&low_bandwidth_rules, &FlowMode::AND, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "Low traffic server should pass bandwidth limit check"
+        );
+
+        // 测试OR模式下的带宽条件
+        let or_bandwidth_rules = vec![
+            FlowCond::ServerBwMinutes(
+                high_traffic_server.to_string(),
+                60,
+                FlowComp::Lt,
+                Size::from_str("1GB").unwrap(), // 不满足
+            ),
+            FlowCond::ServerBwMinutes(
+                low_traffic_server.to_string(),
+                60,
+                FlowComp::Lt,
+                Size::from_str("1GB").unwrap(), // 满足
+            ),
+        ];
+
+        let result = service
+            .evaluate_flow_rules(&or_bandwidth_rules, &FlowMode::OR, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "OR mode should pass when one bandwidth condition is met"
+        );
+
+        // 测试复杂场景：文件大小 + 服务器带宽限制
+        let mut sized_target = target.clone();
+        sized_target.file_size = Some(100 * 1024 * 1024); // 100MB文件
+
+        let complex_rules = vec![
+            FlowCond::Size(FlowComp::Gt, Size::from_str("50MB").unwrap()), // 文件大于50MB
+            FlowCond::ServerBwMinutes(
+                low_traffic_server.to_string(),
+                30,
+                FlowComp::Lt,
+                Size::from_str("500MB").unwrap(), // 服务器30分钟流量小于500MB
+            ),
+        ];
+
+        let result = service
+            .evaluate_flow_rules(&complex_rules, &FlowMode::AND, &sized_target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "Large files should be allowed on low-bandwidth servers"
+        );
+
+        println!("✅ Server bandwidth minutes flow rules tests passed");
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_condition_time_windows() {
+        let service = create_test_flow_service().await;
+        let (target, context, _options) = create_test_context();
+
+        let bandwidth_service = &service.bandwidth_cache;
+        let server_id = "time_test_server";
+
+        // 记录流量数据
+        bandwidth_service
+            .record_bandwidth(server_id, 400_000_000)
+            .await; // 400MB
+        bandwidth_service.flush_pending_for_test().await.unwrap();
+
+        // 测试不同时间窗口
+        let time_windows = vec![1, 5, 15, 30, 60, 120];
+
+        for minutes in time_windows {
+            let condition = FlowCond::ServerBwMinutes(
+                server_id.to_string(),
+                minutes,
+                FlowComp::Ge, // 大于等于
+                Size::from_str("400MB").unwrap(),
+            );
+
+            let result = service
+                .evaluate_condition(&condition, &target, &context)
+                .await;
+            assert!(result.is_ok());
+            assert_eq!(
+                result.unwrap(),
+                true,
+                "All time windows should contain the recorded 400MB"
+            );
+        }
+
+        // 测试时间窗口边界：记录的数据应该在所有合理的时间窗口内都能查到
+        let large_window_condition = FlowCond::ServerBwMinutes(
+            server_id.to_string(),
+            1440, // 24小时 = 1440分钟
+            FlowComp::Eq,
+            Size::from_str("400MB").unwrap(),
+        );
+
+        let result = service
+            .evaluate_condition(&large_window_condition, &target, &context)
+            .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            true,
+            "Large time window should still contain recorded data"
+        );
+
+        println!("✅ Bandwidth condition time window tests passed");
     }
 
     #[tokio::test]

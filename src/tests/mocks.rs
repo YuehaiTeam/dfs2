@@ -10,10 +10,12 @@ use crate::models::{CdnRecord, Session};
 use crate::modules::qjs::JsRunner;
 use crate::modules::server::HealthInfo;
 use crate::modules::storage::data_store::{
-    BandwidthUpdateBatch, CacheMetadata, DataStoreBackend, SessionStats,
+    BandwidthUpdateBatch, CacheMetadata, DataStoreBackend, RingBufferMeta, SessionStats,
 };
 use crate::modules::version_provider::{PluginVersionProvider, VersionCache, VersionUpdater};
-use crate::services::{ChallengeService, FlowService, ResourceService, SessionService};
+use crate::services::{
+    BandwidthCacheService, ChallengeService, FlowService, ResourceService, SessionService,
+};
 
 /// 统一的测试环境，包含所有必要的服务和Mock
 pub struct TestEnvironment {
@@ -21,7 +23,8 @@ pub struct TestEnvironment {
     pub shared_config: SharedConfig,
     pub js_runner: JsRunner,
     pub services: TestServices,
-    pub app_context: AppContext, // 添加app_context字段
+    pub app_context: AppContext,             // 添加app_context字段
+    pub mock_data_store: Arc<MockDataStore>, // 直接存储MockDataStore引用
 }
 
 pub struct TestServices {
@@ -38,10 +41,18 @@ impl TestEnvironment {
         Self::with_config(config).await
     }
 
+    /// 设置Mock的当前时间（测试用）
+    pub async fn set_mock_current_time(&self, minute_timestamp: Option<u64>) {
+        // 直接使用存储的MockDataStore引用
+        self.mock_data_store
+            .set_current_time(minute_timestamp)
+            .await;
+    }
+
     /// 使用自定义配置创建测试环境
     pub async fn with_config(config: AppConfig) -> Self {
         let mock_data_store = Arc::new(MockDataStore::new());
-        let data_store: crate::modules::storage::data_store::DataStore = mock_data_store;
+        let data_store: crate::modules::storage::data_store::DataStore = mock_data_store.clone();
         let shared_config = SharedConfig::new(config);
         let js_runner = JsRunner::new(shared_config.clone(), data_store.clone()).await;
 
@@ -59,10 +70,16 @@ impl TestEnvironment {
 
         // 创建服务
         let session_service = SessionService::new(data_store.clone());
-        let flow_service =
-            FlowService::new(shared_config.clone(), data_store.clone(), js_runner.clone());
         let resource_service =
             ResourceService::new(shared_config.clone(), version_cache, version_updater);
+        let bandwidth_cache_service = BandwidthCacheService::new(data_store.clone());
+        let flow_service = FlowService::new(
+            shared_config.clone(),
+            data_store.clone(),
+            js_runner.clone(),
+            bandwidth_cache_service.clone(),
+            resource_service.clone(),
+        );
         let challenge_service = ChallengeService::new(
             data_store.clone(),
             js_runner.clone(),
@@ -77,6 +94,7 @@ impl TestEnvironment {
             resource_service.clone(),
             flow_service.clone(),
             challenge_service.clone(),
+            bandwidth_cache_service.clone(),
             js_runner.clone(),
             metrics,
             shared_config.clone(),
@@ -94,6 +112,7 @@ impl TestEnvironment {
                 challenge_service,
             },
             app_context,
+            mock_data_store, // 存储MockDataStore引用
         }
     }
 }
@@ -110,6 +129,11 @@ pub struct MockDataStore {
     cache_content: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     string_storage: Arc<RwLock<HashMap<String, (String, Option<u64>)>>>,
     bandwidth_stats: Arc<RwLock<HashMap<String, u64>>>,
+    // 分钟级流量统计存储
+    minute_bandwidth: Arc<RwLock<HashMap<String, HashMap<u32, u64>>>>, // server_id -> (minute_index -> bytes)
+    ring_meta: Arc<RwLock<HashMap<String, RingBufferMeta>>>,           // ring_key -> meta
+    // 时间注入机制（测试专用）
+    current_time_override: Arc<RwLock<Option<u64>>>, // 注入的当前分钟时间戳
 }
 
 impl MockDataStore {
@@ -130,7 +154,10 @@ impl MockDataStore {
             healthy.clone(),
         );
         health_info.insert("test_server_1:/web/file.bin".to_string(), healthy.clone());
-        health_info.insert("test_server_1:/game/v3/".to_string(), healthy.clone());
+        health_info.insert(
+            "test_server_1:/game/v3/textures/player.png".to_string(),
+            healthy.clone(),
+        );
 
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -143,6 +170,9 @@ impl MockDataStore {
             cache_content: Arc::new(RwLock::new(HashMap::new())),
             string_storage: Arc::new(RwLock::new(HashMap::new())),
             bandwidth_stats: Arc::new(RwLock::new(HashMap::new())),
+            minute_bandwidth: Arc::new(RwLock::new(HashMap::new())),
+            ring_meta: Arc::new(RwLock::new(HashMap::new())),
+            current_time_override: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -161,6 +191,27 @@ impl MockDataStore {
         } else {
             false
         }
+    }
+
+    /// 获取当前分钟时间戳（支持时间注入）
+    async fn get_current_minute(&self) -> u64 {
+        let override_time = self.current_time_override.read().await;
+        if let Some(injected_time) = *override_time {
+            injected_time
+        } else {
+            // 使用真实时间
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                / 60
+        }
+    }
+
+    /// 设置Mock的当前时间（测试用）
+    pub async fn set_current_time(&self, minute_timestamp: Option<u64>) {
+        let mut override_time = self.current_time_override.write().await;
+        *override_time = minute_timestamp;
     }
 }
 
@@ -260,6 +311,7 @@ impl DataStoreBackend for MockDataStore {
             chunks: session.chunks,
             download_counts,
             cdn_records: session_cdn_records,
+            created_at: session.created_at,
         }))
     }
 
@@ -454,6 +506,167 @@ impl DataStoreBackend for MockDataStore {
             .await?;
         self.update_global_daily_bandwidth(batch.bytes).await?;
         Ok(())
+    }
+
+    // 分钟级带宽统计接口实现
+    async fn update_server_minute_bandwidth_direct(
+        &self,
+        server_id: &str,
+        minute_timestamp: u64,
+        bytes: u64,
+    ) -> Result<(), String> {
+        println!(
+            "[Mock] update_server_minute_bandwidth_direct: server={}, minute={}, bytes={}",
+            server_id, minute_timestamp, bytes
+        );
+
+        let ring_key = format!("server_bw_ring:{}", server_id);
+
+        // 获取或创建环形缓冲区元数据
+        let ring_size = 1440u32; // 24小时
+
+        let mut meta_storage = self.ring_meta.write().await;
+        let is_new = !meta_storage.contains_key(&ring_key);
+        let meta = meta_storage.entry(ring_key.clone()).or_insert_with(|| {
+            println!(
+                "[Mock] 创建新环形缓冲区: server={}, start_minute={}",
+                server_id, minute_timestamp
+            );
+            RingBufferMeta {
+                start_minute: minute_timestamp, // 使用第一次写入的时间戳作为起始时间
+                head_index: 0,
+                ring_size,
+            }
+        });
+
+        if !is_new {
+            println!(
+                "[Mock] 使用现有环形缓冲区: server={}, start_minute={}, head_index={}",
+                server_id, meta.start_minute, meta.head_index
+            );
+        }
+
+        // 计算物理索引
+        if let Some(physical_index) = meta.get_physical_index(minute_timestamp) {
+            println!(
+                "[Mock] 物理索引计算成功: minute={}, physical_index={}",
+                minute_timestamp, physical_index
+            );
+            let mut minute_data = self.minute_bandwidth.write().await;
+            let server_data = minute_data
+                .entry(server_id.to_string())
+                .or_insert_with(HashMap::new);
+            let current_bytes = server_data.get(&physical_index).copied().unwrap_or(0);
+            server_data.insert(physical_index, current_bytes + bytes);
+            println!(
+                "[Mock] 更新数据: physical_index={}, old_bytes={}, new_bytes={}",
+                physical_index,
+                current_bytes,
+                current_bytes + bytes
+            );
+        } else {
+            println!(
+                "[Mock] 物理索引计算失败: minute={}, meta.start_minute={}, ring_size={}",
+                minute_timestamp, meta.start_minute, meta.ring_size
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn get_server_minutes_bandwidth_direct(
+        &self,
+        server_id: &str,
+        minutes: u32,
+    ) -> Result<u64, String> {
+        let current_minute = self.get_current_minute().await; // 使用注入的时间
+        println!(
+            "[Mock] get_server_minutes_bandwidth_direct: server={}, minutes={}, current_minute={}",
+            server_id, minutes, current_minute
+        );
+
+        let ring_key = format!("server_bw_ring:{}", server_id);
+
+        // 获取环形缓冲区元数据
+        let meta_storage = self.ring_meta.read().await;
+        let meta = match meta_storage.get(&ring_key) {
+            Some(m) => {
+                println!(
+                    "[Mock] 找到环形缓冲区元数据: start_minute={}, head_index={}, ring_size={}",
+                    m.start_minute, m.head_index, m.ring_size
+                );
+                m.clone()
+            }
+            None => {
+                println!("[Mock] 未找到环形缓冲区元数据: server={}", server_id);
+                return Ok(0); // 没有数据
+            }
+        };
+
+        let mut total_bytes = 0u64;
+        let minute_data = self.minute_bandwidth.read().await;
+        let server_data = minute_data.get(server_id);
+
+        if let Some(data) = server_data {
+            println!("[Mock] 找到服务器数据，包含 {} 个物理索引", data.len());
+            // 计算需要查询的物理索引
+            for i in 0..minutes {
+                let target_minute = current_minute.saturating_sub(i as u64);
+                if let Some(physical_index) = meta.get_physical_index(target_minute) {
+                    if let Some(&bytes) = data.get(&physical_index) {
+                        println!(
+                            "[Mock] 查询命中: target_minute={}, physical_index={}, bytes={}",
+                            target_minute, physical_index, bytes
+                        );
+                        total_bytes += bytes;
+                    } else {
+                        println!(
+                            "[Mock] 查询未命中: target_minute={}, physical_index={}, 无数据",
+                            target_minute, physical_index
+                        );
+                    }
+                } else {
+                    println!("[Mock] 物理索引计算失败: target_minute={}", target_minute);
+                }
+            }
+        } else {
+            println!("[Mock] 未找到服务器数据: server={}", server_id);
+        }
+
+        println!(
+            "[Mock] 查询结果: server={}, total_bytes={}",
+            server_id, total_bytes
+        );
+        Ok(total_bytes)
+    }
+
+    async fn get_ring_meta(&self, ring_key: &str) -> Result<Option<RingBufferMeta>, String> {
+        let meta_storage = self.ring_meta.read().await;
+        Ok(meta_storage.get(ring_key).cloned())
+    }
+
+    async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<String>>, String> {
+        // Mock实现：简化为从minute_bandwidth中获取数据
+        if key.starts_with("server_bw_ring:") {
+            let server_id = key.strip_prefix("server_bw_ring:").unwrap_or("");
+            let minute_data = self.minute_bandwidth.read().await;
+
+            if let Some(server_data) = minute_data.get(server_id) {
+                let mut results = Vec::new();
+                for field in fields {
+                    if let Ok(index) = field.parse::<u32>() {
+                        let bytes = server_data.get(&index).copied().unwrap_or(0);
+                        results.push(Some(bytes.to_string()));
+                    } else {
+                        results.push(None);
+                    }
+                }
+                return Ok(results);
+            }
+        }
+
+        // 默认返回空值
+        Ok(vec![None; fields.len()])
     }
 }
 

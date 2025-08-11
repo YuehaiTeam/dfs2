@@ -161,6 +161,23 @@ impl S3Signer {
         mac.finalize().into_bytes().to_vec()
     }
 
+    // Getter methods for Prometheus configuration generation
+    pub fn access_key(&self) -> &str {
+        &self.access_key
+    }
+
+    pub fn secret_key(&self) -> &str {
+        &self.secret_key
+    }
+
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     pub fn from_url(url_str: &str) -> Result<Self> {
         let url = Url::parse(url_str)?;
 

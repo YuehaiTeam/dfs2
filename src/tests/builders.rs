@@ -53,6 +53,7 @@ impl SessionBuilder {
             sub_path: self.sub_path,
             cdn_records: self.cdn_records,
             extras: self.extras,
+            created_at: chrono::Utc::now().timestamp() as u64,
         }
     }
 }

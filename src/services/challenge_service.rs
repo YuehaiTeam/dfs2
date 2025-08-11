@@ -384,6 +384,8 @@ impl ChallengeService {
     pub async fn generate_legacy_challenge(
         &self,
         resid: &str,
+        version: &str,
+        sub_path: Option<&str>,
         range: Option<&str>,
     ) -> DfsResult<Challenge> {
         use crate::models::Session;
@@ -409,11 +411,12 @@ impl ChallengeService {
         // 直接用响应值作为 session ID 创建 session
         let session = Session {
             resource_id: resid.to_string(),
-            version: "latest".to_string(),
+            version: version.to_string(),
             chunks,
-            sub_path: None, // 历史客户端不支持sub_path
+            sub_path: sub_path.map(|s| s.to_string()),
             cdn_records: HashMap::new(),
             extras: serde_json::json!({}), // 历史客户端使用空extras
+            created_at: chrono::Utc::now().timestamp() as u64,
         };
 
         // 使用SessionService创建session
@@ -692,7 +695,9 @@ mod tests {
         let service = create_test_service().await;
         let resource_id = "legacy_resource";
 
-        let result = service.generate_legacy_challenge(resource_id, None).await;
+        let result = service
+            .generate_legacy_challenge(resource_id, "", None, None)
+            .await;
         assert!(result.is_ok(), "Legacy challenge generation should succeed");
 
         let challenge = result.unwrap();
@@ -709,7 +714,7 @@ mod tests {
         let range = "1024-2047";
 
         let result = service
-            .generate_legacy_challenge(resource_id, Some(range))
+            .generate_legacy_challenge(resource_id, "", None, Some(range))
             .await;
         assert!(result.is_ok(), "Legacy challenge with range should succeed");
 
@@ -729,7 +734,6 @@ mod tests {
 
         let session = session_result.unwrap();
         assert_eq!(session.resource_id, resource_id);
-        assert_eq!(session.version, "latest");
         assert_eq!(session.chunks, vec![range.to_string()]);
     }
 

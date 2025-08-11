@@ -21,6 +21,7 @@ pub struct Session {
     pub cdn_records: HashMap<String, Vec<CdnRecord>>, // chunk_id -> Vec<CdnRecord>
     #[serde(default = "default_empty_json")]
     pub extras: serde_json::Value, // 额外的用户自定义数据
+    pub created_at: u64,          // session创建时间戳
 }
 
 #[derive(Deserialize, ToSchema, Debug)]
@@ -38,7 +39,7 @@ pub struct CreateSessionRequest {
 }
 
 fn default_version() -> String {
-    "latest".to_string()
+    "".to_string()
 }
 
 fn default_empty_json() -> serde_json::Value {
@@ -53,10 +54,22 @@ pub struct Challenge {
 }
 
 #[derive(Clone, Deserialize, ToSchema)]
+pub struct InsightItem {
+    pub url: String,
+    pub ttfb: u32,
+    pub time: u32,
+    pub size: u32,
+    pub error: Option<String>,
+    #[serde(default)]
+    pub range: Vec<(u32, u32)>,
+    #[serde(default)]
+    pub mode: Option<String>,
+}
+
+#[derive(Clone, Deserialize, ToSchema)]
 #[allow(dead_code)]
 pub struct InsightData {
-    pub bandwidth: HashMap<String, String>,
-    pub ttfb: HashMap<String, String>,
+    pub servers: Vec<InsightItem>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

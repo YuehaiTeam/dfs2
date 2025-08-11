@@ -276,6 +276,7 @@ mod tests {
             extras: json!({
                 "client_ip": "192.168.1.100"
             }),
+            created_at: chrono::Utc::now().timestamp() as u64,
         }
     }
 

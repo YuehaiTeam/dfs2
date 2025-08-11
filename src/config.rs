@@ -197,6 +197,9 @@ pub struct ServerConfig {
     /// 如果未设置，则跳过该服务器的连接性检查
     #[serde(default)]
     pub health_check_path: Option<String>,
+    /// 服务器配置文件，用于区分具体实现类型（如minio、aws等）
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 impl<'js> IntoJs<'js> for ServerConfig {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
@@ -205,6 +208,7 @@ impl<'js> IntoJs<'js> for ServerConfig {
         obj.set("url", self.url)?;
         obj.set("type", self.r#type)?;
         obj.set("health_check_path", self.health_check_path)?;
+        obj.set("profile", self.profile)?;
         Ok(obj.into())
     }
 }

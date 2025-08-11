@@ -4,7 +4,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use serde_json::json;
 use std::collections::HashMap;
 use tracing::{error, info};
 
@@ -87,6 +86,7 @@ pub async fn handle_create_session_unified(
         sub_path: sub_path.clone(), // 关键差异：前缀资源保存sub_path
         cdn_records: HashMap::new(),
         extras: req.extras.clone(),
+        created_at: chrono::Utc::now().timestamp() as u64,
     };
 
     ctx.session_service
@@ -214,46 +214,7 @@ pub async fn delete_session(
                 }
             }
 
-            // 合并所有统计信息（保留原有的JSON日志）
-            let complete_stats = if let Some(Json(req)) = req_body {
-                // 如果有请求体，包含 insights 信息
-                if let Some(insights) = req.insights {
-                    json!({
-                        "session_id": sessionid,
-                        "resource_id": resid,
-                        "resource_id": &stats.resource_id,
-                        "version": &stats.version,
-                        "chunks": stats.chunks,
-                        "download_counts": stats.download_counts,
-                        "cdn_records": stats.cdn_records,  // 包含了CDN调度记录
-                        "insights": {
-                            "bandwidth": insights.bandwidth,
-                            "ttfb": insights.ttfb,
-                        }
-                    })
-                } else {
-                    json!({
-                        "session_id": sessionid,
-                        "resource_id": resid,
-                        "resource_id": &stats.resource_id,
-                        "version": &stats.version,
-                        "chunks": stats.chunks,
-                        "download_counts": stats.download_counts,
-                        "cdn_records": stats.cdn_records,
-                    })
-                }
-            } else {
-                // 如果没有请求体，不包含 insights 信息
-                json!({
-                    "session_id": sessionid,
-                    "resource_id": resid,
-                    "chunks": stats.chunks,
-                    "download_counts": stats.download_counts,
-                    "cdn_records": stats.cdn_records,
-                })
-            };
-
-            info!("Session completed: {}", complete_stats);
+            info!("Session completed: {} {}", resid, sessionid);
 
             // 更新流量统计（基于会话完成情况）
             update_session_bandwidth_stats(&ctx.data_store, &sessionid, &resid, &stats).await;

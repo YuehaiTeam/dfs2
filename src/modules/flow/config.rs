@@ -185,6 +185,7 @@ pub enum FlowCond {
     Size(FlowComp, Size),
     ResourceBwDaily(ResourcePattern, FlowComp, Size), // 资源级别的日流量限制
     ServerBwDaily(String, FlowComp, Size),            // 服务器级别的日流量限制，必须指定server_id
+    ServerBwMinutes(String, u32, FlowComp, Size), // 服务器分钟级流量限制：server_id, minutes, comp, size
     Time(FlowComp, chrono::NaiveTime),
     GeoIp(String), // geoip关键词匹配
 }
@@ -264,6 +265,18 @@ impl<'de> Deserialize<'de> for FlowCond {
                 let comp = FlowComp::from_str(parts[2]).map_err(serde::de::Error::custom)?;
                 let size = Size::from_str(parts[3]).map_err(serde::de::Error::custom)?;
                 Ok(FlowCond::ServerBwDaily(server_id, comp, size))
+            }
+            "server_bw_minutes" => {
+                if parts.len() != 5 {
+                    return Err(serde::de::Error::custom(
+                        "server_bw_minutes requires format: server_bw_minutes {server_id} {minutes} {comp} {size}",
+                    ));
+                }
+                let server_id = parts[1].to_string();
+                let minutes = parts[2].parse::<u32>().map_err(serde::de::Error::custom)?;
+                let comp = FlowComp::from_str(parts[3]).map_err(serde::de::Error::custom)?;
+                let size = Size::from_str(parts[4]).map_err(serde::de::Error::custom)?;
+                Ok(FlowCond::ServerBwMinutes(server_id, minutes, comp, size))
             }
             "time" => {
                 let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
@@ -413,6 +426,9 @@ impl Serialize for FlowCond {
             FlowCond::ServerBwDaily(server_id, comp, size) => {
                 serializer.serialize_str(&format!("server_bw_daily {server_id} {comp} {size}"))
             }
+            FlowCond::ServerBwMinutes(server_id, minutes, comp, size) => serializer.serialize_str(
+                &format!("server_bw_minutes {server_id} {minutes} {comp} {size}"),
+            ),
             FlowCond::Time(comp, time) => serializer.serialize_str(&format!("time {comp} {time}")),
         }
     }

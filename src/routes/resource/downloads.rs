@@ -105,7 +105,7 @@ pub async fn handle_download_request_unified(
     };
 
     // 获取版本对应的路径 - 使用统一的get_version_path函数
-    let version: String = ctx.resource_service.get_effective_version(&resid).await;
+    let version: String = ctx.resource_service.get_effective_version(&resid).await?;
     let path = ctx
         .resource_service
         .get_version_path(&resid, &version, None, sub_path.as_deref())
@@ -176,6 +176,11 @@ pub async fn handle_download_request_unified(
                 {
                     warn!("Failed to update bandwidth for cached download: {}", e);
                 }
+
+                // 新增：记录分钟级流量
+                ctx.bandwidth_cache_service
+                    .record_bandwidth(server_id, file_size)
+                    .await;
 
                 // 记录缓存命中的调度请求 - 没有实际调度到服务器
                 ctx.metrics
@@ -298,6 +303,15 @@ pub async fn handle_download_request_unified(
             && resource_config.legacy_client_support, // 历史客户端全范围模式
     };
 
+    // 记录调度结果日志
+    let resource_path = if let Some(ref sub_path_val) = sub_path {
+        format!("{resid}/{sub_path_val}")
+    } else {
+        resid.clone()
+    };
+    let file_size_mb = request_file_size
+        .map(|size| size as f64 / 1024.0 / 1024.0)
+        .unwrap_or(0.0);
     let flow_list = &resource_config.flow;
     let flow_result = if let (Some(sid), Some(session)) = (&original_session_id, &enabled_session) {
         // Enabled模式：有session，使用SessionService统一处理
@@ -314,7 +328,7 @@ pub async fn handle_download_request_unified(
             )
             .await
             .map_err(|e| {
-                error!("Failed to run flow for session in download: {}", e);
+                error!("ERROR {} size={:.2}MB {}", resource_path, file_size_mb, e);
                 DfsError::internal_error(format!("Failed to generate download URL: {e}"))
             })?
     } else {
@@ -329,30 +343,26 @@ pub async fn handle_download_request_unified(
             )
             .await
             .map_err(|e| {
-                error!("Failed to run flow for download: {}", e);
+                error!("ERROR {} size={:.2}MB {}", resource_path, file_size_mb, e);
                 DfsError::internal_error(format!("Failed to generate download URL: {e}"))
             })?
     };
     let cdn_url = flow_result.url;
 
-    // 记录调度结果日志
-    let resource_path = if let Some(ref sub_path_val) = sub_path {
-        format!("{resid}/{sub_path_val}")
-    } else {
-        resid.clone()
-    };
-    let file_size_mb = request_file_size
-        .map(|size| size as f64 / 1024.0 / 1024.0)
-        .unwrap_or(0.0);
     info!(
-        "{} size={:.2}MB -> {} weight={}",
+        "{} size={:.2}MB -> {} weight={} ip={}",
         resource_path,
         file_size_mb,
         flow_result
             .selected_server_id
             .as_deref()
             .unwrap_or("unknown"),
-        flow_result.selected_server_weight.unwrap_or(0)
+        flow_result.selected_server_weight.unwrap_or(0),
+        if let Some(ip) = client_ip {
+            ip.to_string()
+        } else {
+            "unknown".to_string()
+        }
     );
 
     // 检查是否应该缓存
@@ -461,15 +471,14 @@ pub async fn handle_download_request_unified(
                     "session after download"
                 };
                 warn!("Failed to remove {}: {}", session_type, e);
-            } else {
-                let session_type = if sub_path.is_some() {
-                    "prefix download"
-                } else {
-                    "download"
-                };
-                info!("Session {} destroyed after {}", sid, session_type);
             }
         }
+    }
+
+    // 记录调度请求指标（无论是否能获取文件大小）
+    if let Some(server_id) = &flow_result.selected_server_id {
+        ctx.metrics
+            .record_scheduled_request(&resid, server_id, false);
     }
 
     // 更新流量统计（在成功生成下载URL后）
@@ -481,7 +490,7 @@ pub async fn handle_download_request_unified(
                 let actual_bytes =
                     calculate_actual_bytes_from_range(range.as_deref(), full_file_size);
 
-                // 使用批量更新接口同时更新资源、服务器和全局流量统计
+                // 1. 更新日流量统计（资源、服务器、全局）
                 if let Err(e) = ctx
                     .data_store
                     .update_bandwidth_batch(BandwidthUpdateBatch {
@@ -497,14 +506,15 @@ pub async fn handle_download_request_unified(
                         "server"
                     };
                     warn!(
-                        "Failed to update bandwidth for {} {}: {}",
+                        "Failed to update daily bandwidth for {} {}: {}",
                         server_type, server_id, e
                     );
-                } else {
-                    // 记录成功的调度请求（非缓存）
-                    ctx.metrics
-                        .record_scheduled_request(&resid, server_id, false);
                 }
+
+                // 2. 记录分钟级流量（独立于日流量更新结果）
+                ctx.bandwidth_cache_service
+                    .record_bandwidth(server_id, actual_bytes)
+                    .await;
 
                 let debug_msg = if sub_path.is_some() {
                     format!(
@@ -656,9 +666,18 @@ pub async fn download_json(
 
             if sid.is_empty() {
                 // 首次请求，使用ChallengeService生成legacy challenge并创建session
+                let (validated_resid, effective_version) = ctx
+                    .resource_service
+                    .validate_resource_and_version(&resid, "", None)
+                    .await?;
                 match ctx
                     .challenge_service
-                    .generate_legacy_challenge(&resid, range.as_deref())
+                    .generate_legacy_challenge(
+                        &validated_resid,
+                        &effective_version,
+                        None,
+                        range.as_deref(),
+                    )
                     .await
                 {
                     Ok(challenge) => {
@@ -842,9 +861,18 @@ pub async fn download_prefix_json(
 
             if sid.is_empty() {
                 // 首次请求，使用ChallengeService生成legacy challenge并创建session
+                let (validated_resid, effective_version) = ctx
+                    .resource_service
+                    .validate_resource_and_version(&resid, "", Some(&sub_path))
+                    .await?;
                 match ctx
                     .challenge_service
-                    .generate_legacy_challenge(&resid, range.as_deref())
+                    .generate_legacy_challenge(
+                        &validated_resid,
+                        &effective_version,
+                        Some(&sub_path),
+                        range.as_deref(),
+                    )
                     .await
                 {
                     Ok(challenge) => {

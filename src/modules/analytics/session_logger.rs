@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
@@ -55,7 +55,6 @@ impl SessionLogger {
                     user_agent,
                     &stats,
                     insights,
-                    "client_terminated",
                 )
                 .await?;
 
@@ -89,7 +88,6 @@ impl SessionLogger {
                     user_agent,
                     &stats,
                     None,
-                    "timeout",
                 )
                 .await?;
 
@@ -116,52 +114,40 @@ impl SessionLogger {
     ) -> Result<(), String> {
         let now = Utc::now();
 
-        // 构建直接下载的会话统计
-        let session_stats = SessionStatsLog {
-            created_at: now.to_rfc3339(),
-            completed_at: Some(now.to_rfc3339()),
-            timeout_at: None,
-            duration_ms: 0,
-            total_chunks: 1,
-            successful_downloads: 1,
-            failed_downloads: 0,
-            success_rate: 1.0,
-            completion_reason: "direct_download".to_string(),
-        };
-
         // 构建CDN记录
         let cdn_record = CdnRecordLog {
             url: cdn_url.to_string(),
-            server_id: server_id.to_string(),
-            server_weight,
-            timestamp: now.to_rfc3339(),
-            skip_penalty: false,
-            selection_reason: "flow_selected".to_string(),
+            srv: Some(server_id.to_string()),
+            wgt: Some(server_weight),
+            ts: now.timestamp() as u64,
+            pen: Some(false),
+            rsn: Some("flow_selected".to_string()),
+            ttfb: None,
+            time: None,
+            size: None,
+            err: None,
+            mode: None,
         };
 
         let chunk = ChunkLog {
-            range: "full_file".to_string(),
-            download_attempts: 1,
-            cdn_records: vec![cdn_record],
+            rng: "full_file".to_string(),
+            att: 1,
+            cdns: vec![cdn_record],
         };
 
-        let mut server_usage = HashMap::new();
-        server_usage.insert(server_id.to_string(), 1u32);
-
         let session_log = SessionLog {
-            timestamp: now.to_rfc3339(),
+            start: now.timestamp() as u64, // direct download没有真正的session创建时间
+            end: now.timestamp() as u64,
             log_type: "direct_download".to_string(),
-            session_id: None,
-            resource_id: resource_id.to_string(),
-            version: version.to_string(),
-            client_ip: client_ip.to_string(),
-            user_agent,
-            geo_info: GeoInfo::from_ip(client_ip),
-            download_policy: "free".to_string(),
-            session_stats,
+            sid: None,
+            rid: resource_id.to_string(),
+            ver: version.to_string(),
+            ua: user_agent,
+            ip: (
+                client_ip.to_string(),
+                crate::modules::external::geolocation::get_ip_location_data(client_ip),
+            ),
             chunks: vec![chunk],
-            server_usage_summary: server_usage,
-            client_insights: None,
         };
 
         self.write_log(&session_log).await
@@ -180,40 +166,26 @@ impl SessionLogger {
     ) -> Result<(), String> {
         let now = Utc::now();
 
-        // 构建缓存下载的会话统计
-        let session_stats = SessionStatsLog {
-            created_at: now.to_rfc3339(),
-            completed_at: Some(now.to_rfc3339()),
-            timeout_at: None,
-            duration_ms: 0,
-            total_chunks: 1,
-            successful_downloads: 1,
-            failed_downloads: 0,
-            success_rate: 1.0,
-            completion_reason: "cached_download".to_string(),
-        };
-
         // 缓存命中不记录CDN记录，创建空的chunk信息
         let chunk = ChunkLog {
-            range: "full_file".to_string(),
-            download_attempts: 0, // 缓存命中无需下载尝试
-            cdn_records: vec![],  // 缓存命中不记录CDN记录
+            rng: "full_file".to_string(),
+            att: 0,       // 缓存命中无需下载尝试
+            cdns: vec![], // 缓存命中不记录CDN记录
         };
 
         let session_log = SessionLog {
-            timestamp: now.to_rfc3339(),
+            start: now.timestamp() as u64, // cached download没有真正的session创建时间
+            end: now.timestamp() as u64,
             log_type: "cached_download".to_string(),
-            session_id: None,
-            resource_id: resource_id.to_string(),
-            version: version.to_string(),
-            client_ip: client_ip.to_string(),
-            user_agent,
-            geo_info: GeoInfo::from_ip(client_ip),
-            download_policy: "free".to_string(), // 缓存下载通常是free模式
-            session_stats,
+            sid: None,
+            rid: resource_id.to_string(),
+            ver: version.to_string(),
+            ua: user_agent,
+            ip: (
+                client_ip.to_string(),
+                crate::modules::external::geolocation::get_ip_location_data(client_ip),
+            ),
             chunks: vec![chunk],
-            server_usage_summary: HashMap::new(), // 缓存命中无服务器使用
-            client_insights: None,
         };
 
         self.write_log(&session_log).await
@@ -229,7 +201,6 @@ impl SessionLogger {
         user_agent: Option<String>,
         stats: &SessionStats,
         insights: Option<InsightData>,
-        completion_reason: &str,
     ) -> Result<SessionLog, String> {
         let config_guard = self.config.load();
         let resource_config = config_guard
@@ -237,109 +208,147 @@ impl SessionLogger {
             .ok_or_else(|| format!("Resource {resource_id} not found"))?;
 
         let now = Utc::now();
-        let created_at = now.to_rfc3339(); // 暂时使用当前时间，后续可以从 Redis 获取创建时间
 
-        // 构建会话统计
-        let total_chunks = stats.chunks.len() as u32;
-        let successful_downloads = stats.download_counts.len() as u32;
-        let failed_downloads = total_chunks.saturating_sub(successful_downloads);
-
-        let session_stats = SessionStatsLog {
-            created_at: created_at.clone(),
-            completed_at: if log_type == "session_timeout" {
-                None
-            } else {
-                Some(now.to_rfc3339())
-            },
-            timeout_at: if log_type == "session_timeout" {
-                Some(now.to_rfc3339())
-            } else {
-                None
-            },
-            duration_ms: 0, // 暂时设为0，后续可以计算实际时长
-            total_chunks,
-            successful_downloads,
-            failed_downloads,
-            success_rate: SessionStatsLog::calculate_success_rate(
-                successful_downloads,
-                total_chunks,
-            ),
-            completion_reason: completion_reason.to_string(),
-        };
-
-        // 构建分块信息
+        // 构建分块信息和客户端数据匹配
         let mut chunks = Vec::new();
-        let mut server_usage = HashMap::new();
+        let mut unmatched_insights = Vec::new();
+
+        // 收集所有未匹配的客户端数据
+        if let Some(insight_data) = &insights {
+            unmatched_insights.extend(insight_data.servers.clone());
+        }
 
         for chunk_id in &stats.chunks {
             let download_attempts = stats.download_counts.get(chunk_id).unwrap_or(&0);
             let empty_records = Vec::new();
             let cdn_records = stats.cdn_records.get(chunk_id).unwrap_or(&empty_records);
 
-            let cdn_record_logs: Vec<CdnRecordLog> = cdn_records
+            let mut cdn_record_logs: Vec<CdnRecordLog> = cdn_records
                 .iter()
                 .map(|record| {
-                    // 统计服务器使用
-                    if let Some(server_id) = &record.server_id {
-                        *server_usage.entry(server_id.clone()).or_insert(0) += 1;
+                    // 尝试匹配客户端数据
+                    let mut matched_insight: Option<crate::models::InsightItem> = None;
+                    if let Some(insight_data) = &insights {
+                        for insight in insight_data.servers.iter() {
+                            // 通过URL和range匹配
+                            if Self::urls_match(&insight.url, &record.url)
+                                && Self::ranges_match(&insight.range, chunk_id)
+                            {
+                                matched_insight = Some(insight.clone());
+                                // 从未匹配列表中移除
+                                if let Some(pos) = unmatched_insights
+                                    .iter()
+                                    .position(|x| x.url == insight.url && x.range == insight.range)
+                                {
+                                    unmatched_insights.remove(pos);
+                                }
+                                break;
+                            }
+                        }
                     }
 
                     CdnRecordLog {
                         url: record.url.clone(),
-                        server_id: record
-                            .server_id
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        server_weight: record.weight,
-                        timestamp: DateTime::from_timestamp(record.timestamp as i64, 0)
-                            .unwrap_or_else(Utc::now)
-                            .to_rfc3339(),
-                        skip_penalty: record.skip_penalty,
-                        selection_reason: if record.skip_penalty {
-                            "retry_fallback"
-                        } else {
-                            "flow_selected"
-                        }
-                        .to_string(),
+                        srv: record.server_id.clone(),
+                        wgt: Some(record.weight),
+                        ts: record.timestamp,
+                        pen: Some(record.skip_penalty),
+                        rsn: Some(
+                            if record.skip_penalty {
+                                "retry_fallback"
+                            } else {
+                                "flow_selected"
+                            }
+                            .to_string(),
+                        ),
+                        ttfb: matched_insight.as_ref().map(|i| i.ttfb),
+                        time: matched_insight.as_ref().map(|i| i.time),
+                        size: matched_insight.as_ref().map(|i| i.size),
+                        err: matched_insight.as_ref().and_then(|i| i.error.clone()),
+                        mode: matched_insight.as_ref().and_then(|i| i.mode.clone()),
                     }
                 })
                 .collect();
 
+            // 为当前chunk添加未匹配的客户端记录
+            for insight in unmatched_insights.iter() {
+                if Self::ranges_match(&insight.range, chunk_id) {
+                    cdn_record_logs.push(CdnRecordLog {
+                        url: insight.url.clone(),
+                        srv: None, // 客户端记录没有服务器信息
+                        wgt: None,
+                        ts: now.timestamp() as u64, // 使用当前时间
+                        pen: None,
+                        rsn: None,
+                        ttfb: Some(insight.ttfb),
+                        time: Some(insight.time),
+                        size: Some(insight.size),
+                        err: insight.error.clone(),
+                        mode: insight.mode.clone(),
+                    });
+                }
+            }
+
+            // 从未匹配列表中移除已处理的项
+            unmatched_insights.retain(|insight| !Self::ranges_match(&insight.range, chunk_id));
+
             chunks.push(ChunkLog {
-                range: chunk_id.clone(),
-                download_attempts: *download_attempts,
-                cdn_records: cdn_record_logs,
+                rng: chunk_id.clone(),
+                att: *download_attempts,
+                cdns: cdn_record_logs,
             });
         }
 
-        // 构建客户端洞察数据
-        let client_insights = insights.map(|data| ClientInsightsLog {
-            bandwidth_stats: Some(data.bandwidth),
-            ttfb_stats: Some(data.ttfb),
-        });
-
-        // 确定下载策略
-        let download_policy = match resource_config.download {
-            crate::config::DownloadPolicy::Enabled => "enabled",
-            crate::config::DownloadPolicy::Free => "free",
-            crate::config::DownloadPolicy::Disabled => "disabled",
+        // 处理剩余未匹配的客户端数据（创建新的chunk）
+        let mut additional_chunks = HashMap::<String, Vec<crate::models::InsightItem>>::new();
+        for insight in unmatched_insights {
+            for (start, end) in &insight.range {
+                let range_str = format!("{}-{}", start, end);
+                additional_chunks
+                    .entry(range_str)
+                    .or_insert_with(Vec::new)
+                    .push(insight.clone());
+            }
         }
-        .to_string();
+
+        for (range_str, insight_items) in additional_chunks {
+            let cdn_records: Vec<CdnRecordLog> = insight_items
+                .into_iter()
+                .map(|insight| CdnRecordLog {
+                    url: insight.url,
+                    srv: None,
+                    wgt: None,
+                    ts: now.timestamp() as u64,
+                    pen: None,
+                    rsn: None,
+                    ttfb: Some(insight.ttfb),
+                    time: Some(insight.time),
+                    size: Some(insight.size),
+                    err: insight.error,
+                    mode: insight.mode,
+                })
+                .collect();
+
+            chunks.push(ChunkLog {
+                rng: range_str,
+                att: 0, // 客户端记录没有服务端下载尝试
+                cdns: cdn_records,
+            });
+        }
 
         Ok(SessionLog {
-            timestamp: now.to_rfc3339(),
+            start: stats.created_at,
+            end: now.timestamp() as u64,
             log_type: log_type.to_string(),
-            session_id,
-            resource_id: resource_id.to_string(),
-            version: resource_config.latest.clone(),
-            client_ip: client_ip.to_string(),
-            user_agent,
-            geo_info: GeoInfo::from_ip(client_ip),
-            download_policy,
-            session_stats,
+            sid: session_id,
+            rid: resource_id.to_string(),
+            ver: resource_config.latest.clone(),
+            ua: user_agent,
+            ip: (
+                client_ip.to_string(),
+                crate::modules::external::geolocation::get_ip_location_data(client_ip),
+            ),
             chunks,
-            server_usage_summary: server_usage,
-            client_insights,
         })
     }
 
@@ -399,5 +408,55 @@ impl SessionLogger {
             .unwrap_or_else(|_| "true".to_string())
             .parse::<bool>()
             .unwrap_or(true)
+    }
+
+    /// 检查两个URL是否匹配（忽略签名参数等差异）
+    fn urls_match(insight_url: &str, cdn_url: &str) -> bool {
+        // 简单的URL匹配，可以根据需要增强
+        // 目前只做基本的字符串匹配，将来可以添加更智能的匹配逻辑
+        insight_url == cdn_url
+            || Self::extract_base_url(insight_url) == Self::extract_base_url(cdn_url)
+    }
+
+    /// 提取URL的基础部分（去除查询参数）
+    fn extract_base_url(url: &str) -> &str {
+        if let Some(pos) = url.find('?') {
+            &url[..pos]
+        } else {
+            url
+        }
+    }
+
+    /// 检查客户端range是否与chunk_id完全匹配
+    fn ranges_match(client_ranges: &[(u32, u32)], chunk_id: &str) -> bool {
+        // 将客户端ranges转换为标准化的字符串格式
+        let client_range_str = Self::ranges_to_string(client_ranges);
+
+        // 直接比较字符串
+        client_range_str == chunk_id
+    }
+
+    /// 将range列表转换为标准字符串格式
+    fn ranges_to_string(ranges: &[(u32, u32)]) -> String {
+        if ranges.is_empty() {
+            return String::new();
+        }
+
+        // 按起始位置排序
+        let mut sorted_ranges = ranges.to_vec();
+        sorted_ranges.sort_by_key(|&(start, _)| start);
+
+        // 转换为字符串格式
+        if sorted_ranges.len() == 1 {
+            // 单个range: "start-end"
+            format!("{}-{}", sorted_ranges[0].0, sorted_ranges[0].1)
+        } else {
+            // 多个range: "start1-end1,start2-end2,..."
+            sorted_ranges
+                .iter()
+                .map(|(start, end)| format!("{}-{}", start, end))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
     }
 }

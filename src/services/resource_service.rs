@@ -46,8 +46,8 @@ impl ResourceService {
             ));
         }
 
-        let effective_version = if version.is_empty() || version == "latest" {
-            self.get_effective_version(resource_id).await
+        let effective_version = if version.is_empty() {
+            self.get_effective_version(resource_id).await?
         } else {
             version.to_string()
         };
@@ -62,20 +62,23 @@ impl ResourceService {
         Ok((resource_id.to_string(), effective_version))
     }
 
-    pub async fn get_effective_version(&self, resource_id: &str) -> String {
+    pub async fn get_effective_version(&self, resource_id: &str) -> Result<String, DfsError> {
         // 集成版本缓存逻辑
         if let Some(cached_version) = self.version_cache.get_cached_version(resource_id).await {
-            cached_version
+            Ok(cached_version)
         } else {
             let config = self.shared_config.load();
             if let Some(resource) = config.resources.get(resource_id) {
                 if !resource.latest.is_empty() {
-                    resource.latest.clone()
+                    Ok(resource.latest.clone())
                 } else {
-                    "latest".to_string()
+                    Err(DfsError::version_not_found(
+                        resource_id,
+                        "no latest version configured and no cached version available",
+                    ))
                 }
             } else {
-                "latest".to_string()
+                Err(DfsError::resource_not_found(resource_id))
             }
         }
     }
