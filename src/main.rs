@@ -30,7 +30,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validation::ConfigValidator;
 
-use crate::commands::{prometheus_config, rclone_config};
+use crate::commands::{analyze, prometheus_config, rclone_config};
 use crate::modules::{analytics, network::RealConnectInfo};
 
 /// DFS2 - Distributed File System Server
@@ -47,6 +47,8 @@ enum Commands {
     Serve,
     /// Validate configuration and plugins, then exit
     Validate,
+    /// Analyze session log files for performance insights
+    Analyze(analyze::AnalyzeArgs),
     /// Generate Prometheus configuration for monitoring
     GeneratePrometheus {
         /// Filter servers by profile (e.g., "minio")
@@ -210,6 +212,12 @@ async fn main() -> DfsResult<()> {
 
     // 处理命令行命令
     match args.command {
+        Some(Commands::Analyze(analyze_args)) => {
+            return analyze::handle_analyze(analyze_args).await.map_err(|e| {
+                error!("Analysis failed: {}", e);
+                DfsError::internal_error(format!("Analysis error: {e}"))
+            });
+        }
         Some(Commands::GeneratePrometheus {
             profile,
             scrape_interval,
