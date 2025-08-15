@@ -24,12 +24,10 @@ lazy_static! {
 pub fn is_global_ip(ip: IpAddr) -> bool {
     if let Some(ref ipdb) = *IPDB {
         // 使用find_city_info获取详细的城市信息
-        match ipdb.find_city_info(&ip.to_string(), "CN") {
-            Ok(city_info) => {
-                // 直接检查country_code字段，精确判断
-                let is_cn = city_info.country_code.eq_ignore_ascii_case("CN")
-                    || city_info.country_code.eq_ignore_ascii_case("CHN");
-                !is_cn // 返回是否为全球IP（非中国IP）
+        match ipdb.find(&ip.to_string(), "CN") {
+            Ok(ipvec) => {
+                // check if ipvec not include "CN" or "CHN"
+                !ipvec.contains(&"CN") && !ipvec.contains(&"CHN")
             }
             Err(e) => {
                 warn!("Failed to lookup IP {} with find_city_info: {}", ip, e);

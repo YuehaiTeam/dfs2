@@ -10,8 +10,7 @@ use crate::{
     config::DownloadPolicy,
     error::DfsError,
     modules::{
-        network::RealConnectInfo,
-        storage::{cache::should_cache_content, data_store::BandwidthUpdateBatch},
+        external::geolocation, network::RealConnectInfo, storage::{cache::should_cache_content, data_store::BandwidthUpdateBatch}
     },
     routes::resource::{calculate_actual_bytes_from_range, parse_range_for_flow},
 };
@@ -325,6 +324,7 @@ pub async fn handle_download_request_unified(
                 client_ip,
                 request_file_size,
                 flow_list,
+                &options,
             )
             .await
             .map_err(|e| {
@@ -350,7 +350,7 @@ pub async fn handle_download_request_unified(
     let cdn_url = flow_result.url;
 
     info!(
-        "{} size={:.2}MB -> {} weight={} ip={}",
+        "{} size={:.2}MB -> {} weight={} ip={} geo={}",
         resource_path,
         file_size_mb,
         flow_result
@@ -360,6 +360,11 @@ pub async fn handle_download_request_unified(
         flow_result.selected_server_weight.unwrap_or(0),
         if let Some(ip) = client_ip {
             ip.to_string()
+        } else {
+            "unknown".to_string()
+        },
+        if let Some(ip) = client_ip {
+            geolocation::get_ip_location_data(ip).unwrap_or("unknown".to_string())
         } else {
             "unknown".to_string()
         }

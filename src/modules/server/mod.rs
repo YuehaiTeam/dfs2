@@ -1,3 +1,4 @@
+use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tracing::warn;
@@ -17,10 +18,10 @@ pub struct HealthInfo {
 }
 
 /// 从HTTP响应中提取文件大小
-fn extract_file_size_from_response(response: &reqwest::Response) -> Option<u64> {
+fn extract_file_size_from_response(headers: &HeaderMap) -> Option<u64> {
     // 优先从 Content-Range 头部提取总大小 (Range请求的情况)
     // 格式: Content-Range: bytes 0-255/1048576
-    if let Some(content_range) = response.headers().get("content-range") {
+    if let Some(content_range) = headers.get("content-range") {
         if let Ok(range_str) = content_range.to_str() {
             if let Some(total_size_str) = range_str.split('/').nth(1) {
                 if let Ok(total_size) = total_size_str.parse::<u64>() {
@@ -31,8 +32,7 @@ fn extract_file_size_from_response(response: &reqwest::Response) -> Option<u64> 
     }
 
     // 如果是完整文件响应，从Content-Length获取
-    response
-        .headers()
+    headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse().ok())
@@ -167,18 +167,20 @@ impl ServerImpl {
             }
         };
         let is_alive = ret.status().is_success();
+        let headers = ret.headers().clone();
 
         if !is_alive {
+            let status = ret.status();
+            let body = ret.text().await.unwrap_or_default();
             warn!(
-                "Keepalive check failed for URL {}: status {}",
-                check_url,
-                ret.status()
+                "Keepalive check failed for URL {}: status {} / {}",
+                check_url, status, body
             );
         }
 
         // 从响应中提取文件大小信息
         let file_size = if is_alive {
-            extract_file_size_from_response(&ret)
+            extract_file_size_from_response(&headers)
         } else {
             None
         };

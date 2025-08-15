@@ -5,10 +5,10 @@ use axum::{
 use std::collections::HashMap;
 use tracing::{error, info, warn};
 
-use crate::container::AppContext;
 use crate::error::DfsError;
 use crate::modules::network::RealConnectInfo;
 use crate::responses::{ApiResponse, CdnUrlResponse, ErrorResponse, ResponseData};
+use crate::{container::AppContext, modules::external::geolocation};
 use crate::{record_flow_metrics, record_request_metrics};
 
 #[utoipa::path(
@@ -124,6 +124,10 @@ pub async fn get_cdn(
         .unwrap_or(0.0);
 
     // 使用SessionService统一处理flow执行
+    let options = crate::models::FlowOptions {
+        cdn_full_range: false,
+    };
+    
     let flow_result = ctx
         .session_service
         .run_flow_for_session(
@@ -134,6 +138,7 @@ pub async fn get_cdn(
             client_ip,
             file_size,
             flow_list,
+            &options,
         )
         .await;
     let resource_path = if let Some(ref sub_path_val) = session.sub_path {
@@ -155,7 +160,7 @@ pub async fn get_cdn(
 
     // 记录调度结果日志
     info!(
-        "{} size={:.2}MB -> {} weight={} ip={}",
+        "{} size={:.2}MB -> {} weight={} ip={} geo={}",
         resource_path,
         file_size_mb,
         flow_result
@@ -165,6 +170,11 @@ pub async fn get_cdn(
         flow_result.selected_server_weight.unwrap_or(0),
         if let Some(ip) = client_ip {
             ip.to_string()
+        } else {
+            "unknown".to_string()
+        },
+        if let Some(ip) = client_ip {
+            geolocation::get_ip_location_data(ip).unwrap_or("unknown".to_string())
         } else {
             "unknown".to_string()
         }

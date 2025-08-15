@@ -191,6 +191,7 @@ impl SessionService {
         client_ip: Option<IpAddr>,
         file_size: Option<u64>,
         flow_items: &[FlowItem],
+        options: &FlowOptions,
     ) -> DfsResult<FlowResult> {
         // 1. 直接使用传入的session（无需重复获取）
 
@@ -222,13 +223,10 @@ impl SessionService {
             extras: session.extras.clone(),
         };
 
-        let options = FlowOptions {
-            cdn_full_range: false, // Session场景一般不使用full_range
-        };
 
         // 6. 执行Flow（纯函数）
         let flow_result = flow_service
-            .execute_flow(&target, &context, &options, flow_items, penalty_servers)
+            .execute_flow(&target, &context, options, flow_items, penalty_servers)
             .await?;
 
         // 7. 记录最终CDN结果
