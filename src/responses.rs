@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 use utoipa::ToSchema;
 
-#[derive(Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum ApiResponse {
     Success(ResponseData),
@@ -28,7 +28,7 @@ pub enum ApiResponse {
 }
 
 #[allow(dead_code)]
-#[derive(Serialize, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum ResponseData {
     Metadata {
@@ -55,6 +55,7 @@ pub enum ResponseData {
     Download {
         url: String,
     },
+    BatchCdn(BatchCdnUrlResponse),
     Json(Value),
     Raw(String),
     Empty,
@@ -165,6 +166,22 @@ pub struct HealthMetrics {
     pub active_sessions: u64,
     pub requests_per_second: f64,
     pub error_rate: f64,
+}
+
+/// 批量CDN URL响应结构
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BatchCdnUrlResponse {
+    /// chunk ID 到结果的映射
+    pub urls: std::collections::HashMap<String, ChunkResult>,
+}
+
+/// 单个chunk的结果
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChunkResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // Additional request types

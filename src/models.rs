@@ -121,3 +121,39 @@ pub struct FlowResult {
     pub selected_server_weight: Option<u32>,
     pub plugin_server_mapping: HashMap<String, (Option<String>, bool)>, // 插件元数据映射
 }
+
+/// 批量chunk请求结构
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BatchChunkRequest {
+    /// 要获取CDN地址的chunk列表，格式如 ["0-1023", "1024-2047", "2048-4095"]
+    pub chunks: Vec<String>,
+}
+
+/// 批量Redis操作结果结构
+#[derive(Debug)]
+pub struct BatchChunkData {
+    /// 有效chunks及其下载计数
+    pub valid_chunks: HashMap<String, u32>,
+    /// 无效的chunk列表
+    pub invalid_chunks: Vec<String>,
+    /// 每个chunk的CDN记录（用于penalty服务器）
+    pub cdn_records: HashMap<String, Vec<CdnRecord>>,
+}
+
+/// 单个chunk处理结果
+#[derive(Debug)]
+pub struct ChunkProcessResult {
+    pub chunk_id: String,
+    pub url: Option<String>,
+    pub error: Option<String>,
+    pub bandwidth_info: Option<BandwidthInfo>,
+    pub cdn_record: Option<CdnRecord>,
+}
+
+/// 带宽信息结构
+#[derive(Debug)]
+pub struct BandwidthInfo {
+    pub server_id: Option<String>,
+    pub bytes: u64,
+    pub chunk_id: String,
+}

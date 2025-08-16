@@ -156,6 +156,20 @@ pub trait DataStoreBackend: Send + Sync {
     // 批量带宽更新接口
     async fn update_bandwidth_batch(&self, batch: BandwidthUpdateBatch) -> Result<(), String>;
 
+    // 批量chunk处理接口
+    async fn batch_check_and_increment_downloads(
+        &self,
+        sid: &str,
+        chunks: &[String],
+    ) -> Result<crate::models::BatchChunkData, String>;
+
+    async fn batch_write_cdn_and_bandwidth(
+        &self,
+        sid: &str,
+        cdn_records: &[BatchCdnRecord],
+        bandwidth_batch: &MultiBandwidthUpdateBatch,
+    ) -> Result<(), String>;
+
     // 分钟级带宽统计接口
     async fn update_server_minute_bandwidth_direct(
         &self,
@@ -215,6 +229,21 @@ pub struct SessionStats {
     pub download_counts: HashMap<String, u32>,
     pub cdn_records: HashMap<String, Vec<CdnRecord>>,
     pub created_at: u64, // session创建时间戳
+}
+
+/// 批量CDN记录
+#[derive(Debug)]
+pub struct BatchCdnRecord {
+    pub chunk_id: String,
+    pub record: CdnRecord,
+}
+
+/// 多服务器带宽更新批次
+#[derive(Debug)]
+pub struct MultiBandwidthUpdateBatch {
+    pub resource_id: String,
+    pub server_updates: HashMap<String, u64>, // server_id -> total_bytes
+    pub total_bytes: u64,
 }
 
 // 文件数据存储实现 - 每个key对应一个文件
@@ -682,6 +711,72 @@ impl DataStoreBackend for FileDataStore {
         self.update_server_daily_bandwidth(&batch.server_id, batch.bytes)
             .await?;
         self.update_global_daily_bandwidth(batch.bytes).await?;
+        Ok(())
+    }
+
+    async fn batch_check_and_increment_downloads(
+        &self,
+        sid: &str,
+        chunks: &[String],
+    ) -> Result<crate::models::BatchChunkData, String> {
+        // 文件存储的简单实现：逐个处理chunks
+        let mut valid_chunks = HashMap::new();
+        let mut invalid_chunks = Vec::new();
+        let mut cdn_records = HashMap::new();
+
+        for chunk in chunks {
+            // 检查并增加下载计数
+            match self.increment_download_count(sid, chunk).await? {
+                Some(count) => {
+                    valid_chunks.insert(chunk.clone(), count);
+
+                    // 获取CDN记录
+                    let records = self.get_cdn_records(sid, chunk).await?;
+                    if !records.is_empty() {
+                        cdn_records.insert(chunk.clone(), records);
+                    }
+                }
+                None => {
+                    invalid_chunks.push(chunk.clone());
+                }
+            }
+        }
+
+        Ok(crate::models::BatchChunkData {
+            valid_chunks,
+            invalid_chunks,
+            cdn_records,
+        })
+    }
+
+    async fn batch_write_cdn_and_bandwidth(
+        &self,
+        sid: &str,
+        cdn_records: &[BatchCdnRecord],
+        bandwidth_batch: &MultiBandwidthUpdateBatch,
+    ) -> Result<(), String> {
+        // 批量写入CDN记录
+        for batch_record in cdn_records {
+            self.update_cdn_record_v2(sid, &batch_record.chunk_id, batch_record.record.clone())
+                .await?;
+        }
+
+        // 批量更新带宽统计
+        if bandwidth_batch.total_bytes > 0 {
+            self.update_resource_daily_bandwidth(
+                &bandwidth_batch.resource_id,
+                bandwidth_batch.total_bytes,
+            )
+            .await?;
+            self.update_global_daily_bandwidth(bandwidth_batch.total_bytes)
+                .await?;
+
+            for (server_id, bytes) in &bandwidth_batch.server_updates {
+                self.update_server_daily_bandwidth(server_id, *bytes)
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 

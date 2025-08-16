@@ -400,6 +400,59 @@ impl DataStoreBackend for MockDataStore {
         Ok(Vec::new())
     }
 
+    async fn batch_check_and_increment_downloads(
+        &self,
+        _sid: &str,
+        chunks: &[String],
+    ) -> Result<crate::models::BatchChunkData, String> {
+        // 模拟实现：大部分chunks有效，少数无效（用于测试混合场景）
+        let mut valid_chunks = std::collections::HashMap::new();
+        let mut invalid_chunks = Vec::new();
+
+        for chunk in chunks {
+            // 模拟逻辑：包含"invalid"的chunk被认为无效
+            if chunk.contains("invalid") {
+                invalid_chunks.push(chunk.clone());
+            } else {
+                valid_chunks.insert(chunk.clone(), 1);
+            }
+        }
+
+        // 模拟一些CDN记录
+        let mut cdn_records = std::collections::HashMap::new();
+        if let Some(first_chunk) = chunks.first() {
+            if !first_chunk.contains("invalid") {
+                cdn_records.insert(
+                    first_chunk.clone(),
+                    vec![crate::models::CdnRecord {
+                        url: "https://mock-cdn.com/file".to_string(),
+                        server_id: Some("mock-server".to_string()),
+                        skip_penalty: false,
+                        timestamp: 1234567890,
+                        weight: 10,
+                        size: Some(1024),
+                    }],
+                );
+            }
+        }
+
+        Ok(crate::models::BatchChunkData {
+            valid_chunks,
+            invalid_chunks,
+            cdn_records,
+        })
+    }
+
+    async fn batch_write_cdn_and_bandwidth(
+        &self,
+        _sid: &str,
+        _cdn_records: &[crate::modules::storage::data_store::BatchCdnRecord],
+        _bandwidth_batch: &crate::modules::storage::data_store::MultiBandwidthUpdateBatch,
+    ) -> Result<(), String> {
+        // 模拟实现：总是成功
+        Ok(())
+    }
+
     async fn get_cache_metadata(&self, key: &str) -> Result<Option<CacheMetadata>, String> {
         let metadata = self.cache_metadata.read().await;
         Ok(metadata.get(key).cloned())

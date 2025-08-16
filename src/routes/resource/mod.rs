@@ -174,7 +174,9 @@ pub fn routes() -> Router {
         )
         .route(
             "/session/{sessionid}/{resid}",
-            get(chunk::get_cdn).delete(sessions::delete_session),
+            get(chunk::get_cdn)
+                .post(chunk::post_batch_cdn)
+                .delete(sessions::delete_session),
         )
         .route(
             "/download/{resid}",

@@ -10,7 +10,9 @@ use crate::{
     config::DownloadPolicy,
     error::DfsError,
     modules::{
-        external::geolocation, network::RealConnectInfo, storage::{cache::should_cache_content, data_store::BandwidthUpdateBatch}
+        external::geolocation,
+        network::RealConnectInfo,
+        storage::{cache::should_cache_content, data_store::BandwidthUpdateBatch},
     },
     routes::resource::{calculate_actual_bytes_from_range, parse_range_for_flow},
 };

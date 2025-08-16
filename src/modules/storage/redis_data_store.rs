@@ -739,6 +739,170 @@ impl DataStoreBackend for RedisDataStore {
         Ok(())
     }
 
+    async fn batch_check_and_increment_downloads(
+        &self,
+        sid: &str,
+        chunks: &[String],
+    ) -> Result<crate::models::BatchChunkData, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let counts_key = self.redis_key("counts", sid);
+        let session_key = self.redis_key("session", sid);
+
+        // 构建Pipeline: 检查存在性 + 增加计数 + 获取CDN记录
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        // 1. 批量检查chunk存在性
+        for chunk in chunks {
+            pipe.hexists(&counts_key, chunk);
+        }
+
+        // 2. 批量增加下载计数
+        for chunk in chunks {
+            pipe.hincr(&counts_key, chunk, 1);
+        }
+
+        // 3. 获取CDN记录
+        pipe.hget(&session_key, "cdn_records");
+
+        // 4. 刷新过期时间
+        pipe.expire(&counts_key, 3600);
+        pipe.expire(&session_key, 3600);
+
+        // 执行Pipeline
+        let results: Vec<redis::Value> = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 解析结果
+        let chunk_count = chunks.len();
+        let mut valid_chunks = std::collections::HashMap::new();
+        let mut invalid_chunks = Vec::new();
+
+        // 处理存在性检查和下载计数结果
+        for (i, chunk) in chunks.iter().enumerate() {
+            let exists: bool = redis::from_redis_value(&results[i]).map_err(|e| e.to_string())?;
+
+            if exists {
+                let new_count: u32 = redis::from_redis_value(&results[chunk_count + i])
+                    .map_err(|e| e.to_string())?;
+                valid_chunks.insert(chunk.clone(), new_count);
+            } else {
+                invalid_chunks.push(chunk.clone());
+            }
+        }
+
+        // 解析CDN记录
+        let cdn_records_json: Option<String> =
+            redis::from_redis_value(&results[chunk_count * 2]).map_err(|e| e.to_string())?;
+
+        let all_cdn_records: std::collections::HashMap<String, Vec<crate::models::CdnRecord>> =
+            cdn_records_json
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+
+        let mut cdn_records = std::collections::HashMap::new();
+        for chunk in chunks {
+            if let Some(records) = all_cdn_records.get(chunk) {
+                cdn_records.insert(chunk.clone(), records.clone());
+            }
+        }
+
+        Ok(crate::models::BatchChunkData {
+            valid_chunks,
+            invalid_chunks,
+            cdn_records,
+        })
+    }
+
+    async fn batch_write_cdn_and_bandwidth(
+        &self,
+        sid: &str,
+        cdn_records: &[crate::modules::storage::data_store::BatchCdnRecord],
+        bandwidth_batch: &crate::modules::storage::data_store::MultiBandwidthUpdateBatch,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let session_key = self.redis_key("session", sid);
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // 构建大Pipeline
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+
+        // 1. 批量更新CDN记录
+        if !cdn_records.is_empty() {
+            // 先获取现有记录
+            let existing_records: Option<String> = conn
+                .hget(&session_key, "cdn_records")
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let mut all_records: std::collections::HashMap<String, Vec<crate::models::CdnRecord>> =
+                existing_records
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default();
+
+            // 合并新记录
+            for batch_record in cdn_records {
+                all_records
+                    .entry(batch_record.chunk_id.clone())
+                    .or_default()
+                    .push(batch_record.record.clone());
+            }
+
+            // 写回Redis
+            let records_json = serde_json::to_string(&all_records).map_err(|e| e.to_string())?;
+            pipe.hset(&session_key, "cdn_records", records_json);
+            pipe.expire(&session_key, 3600);
+        }
+
+        // 2. 批量更新带宽统计
+        if bandwidth_batch.total_bytes > 0 {
+            let resource_key = self.redis_key(
+                "resource_bw_daily",
+                &format!("{}:{}", bandwidth_batch.resource_id, today),
+            );
+            let global_key = self.redis_key("global_bw_daily", &today);
+
+            // 全局和资源级统计
+            pipe.cmd("INCRBY")
+                .arg(&resource_key)
+                .arg(bandwidth_batch.total_bytes);
+            pipe.expire(&resource_key, 86400);
+            pipe.cmd("INCRBY")
+                .arg(&global_key)
+                .arg(bandwidth_batch.total_bytes);
+            pipe.expire(&global_key, 86400);
+
+            // 服务器级统计
+            for (server_id, bytes) in &bandwidth_batch.server_updates {
+                let server_key =
+                    self.redis_key("server_bw_daily", &format!("{}:{}", server_id, today));
+                pipe.cmd("INCRBY").arg(&server_key).arg(*bytes);
+                pipe.expire(&server_key, 86400);
+            }
+        }
+
+        // 执行Pipeline
+        let _: () = pipe
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(())
+    }
+
     async fn scan_expired_sessions(
         &self,
         timeout_seconds: u64,
@@ -961,6 +1125,148 @@ impl DataStoreBackend for RedisDataStore {
         }
 
         cmd.query_async(&mut conn).await.map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::storage::data_store::DataStoreBackend;
+    use crate::tests::mocks::MockDataStore;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_batch_check_and_increment_downloads_success() {
+        let mock_store = Arc::new(MockDataStore::new());
+        let data_store: crate::modules::storage::data_store::DataStore = mock_store.clone();
+
+        let test_sid = "test_batch_session_001";
+        let test_chunks = vec![
+            "0-1023".to_string(),
+            "1024-2047".to_string(),
+            "2048-4095".to_string(),
+        ];
+
+        // MockDataStore的batch_check_and_increment_downloads已经实现了
+        // 它会将所有chunks标记为有效，计数为1
+        let result = data_store
+            .batch_check_and_increment_downloads(test_sid, &test_chunks)
+            .await;
+
+        // 验证结果
+        assert!(result.is_ok());
+        let batch_data = result.unwrap();
+
+        // 验证所有chunks都被识别为有效
+        assert_eq!(batch_data.valid_chunks.len(), 3);
+        assert!(batch_data.invalid_chunks.is_empty());
+
+        // 验证下载计数都设置为1（根据mock实现）
+        for chunk in &test_chunks {
+            assert_eq!(batch_data.valid_chunks.get(chunk), Some(&1));
+        }
+
+        // 验证CDN记录（mock实现为第一个chunk提供CDN记录）
+        assert_eq!(batch_data.cdn_records.len(), 1);
+        assert!(batch_data.cdn_records.contains_key("0-1023"));
+    }
+
+    #[tokio::test]
+    async fn test_batch_check_and_increment_downloads_empty_chunks() {
+        let mock_store = Arc::new(MockDataStore::new());
+        let data_store: crate::modules::storage::data_store::DataStore = mock_store.clone();
+
+        let test_sid = "test_batch_session_002";
+        let empty_chunks: Vec<String> = vec![];
+
+        // 调用批量函数
+        let result = data_store
+            .batch_check_and_increment_downloads(test_sid, &empty_chunks)
+            .await;
+
+        // 验证结果
+        assert!(result.is_ok());
+        let batch_data = result.unwrap();
+
+        assert!(batch_data.valid_chunks.is_empty());
+        assert!(batch_data.invalid_chunks.is_empty());
+        assert!(batch_data.cdn_records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_batch_write_cdn_and_bandwidth_success() {
+        let mock_store = Arc::new(MockDataStore::new());
+        let data_store: crate::modules::storage::data_store::DataStore = mock_store.clone();
+
+        let test_sid = "test_batch_session_003";
+
+        // 准备测试数据
+        let cdn_records = vec![
+            crate::modules::storage::data_store::BatchCdnRecord {
+                chunk_id: "0-1023".to_string(),
+                record: crate::models::CdnRecord {
+                    url: "https://test-cdn.com/file1".to_string(),
+                    server_id: Some("server1".to_string()),
+                    skip_penalty: false,
+                    timestamp: 1234567890,
+                    weight: 10,
+                    size: Some(1024),
+                },
+            },
+            crate::modules::storage::data_store::BatchCdnRecord {
+                chunk_id: "1024-2047".to_string(),
+                record: crate::models::CdnRecord {
+                    url: "https://test-cdn.com/file2".to_string(),
+                    server_id: Some("server2".to_string()),
+                    skip_penalty: false,
+                    timestamp: 1234567891,
+                    weight: 15,
+                    size: Some(1024),
+                },
+            },
+        ];
+
+        let mut server_updates = HashMap::new();
+        server_updates.insert("server1".to_string(), 1024u64);
+        server_updates.insert("server2".to_string(), 1024u64);
+
+        let bandwidth_batch = crate::modules::storage::data_store::MultiBandwidthUpdateBatch {
+            resource_id: "test_resource".to_string(),
+            server_updates,
+            total_bytes: 2048,
+        };
+
+        // 调用批量写入函数
+        let result = data_store
+            .batch_write_cdn_and_bandwidth(test_sid, &cdn_records, &bandwidth_batch)
+            .await;
+
+        // 验证结果 - MockDataStore总是返回成功
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_batch_write_cdn_and_bandwidth_empty_data() {
+        let mock_store = Arc::new(MockDataStore::new());
+        let data_store: crate::modules::storage::data_store::DataStore = mock_store.clone();
+
+        let test_sid = "test_batch_session_004";
+        let empty_cdn_records: Vec<crate::modules::storage::data_store::BatchCdnRecord> = vec![];
+        let empty_bandwidth_batch =
+            crate::modules::storage::data_store::MultiBandwidthUpdateBatch {
+                resource_id: "test_resource".to_string(),
+                server_updates: HashMap::new(),
+                total_bytes: 0,
+            };
+
+        // 调用批量写入函数
+        let result = data_store
+            .batch_write_cdn_and_bandwidth(test_sid, &empty_cdn_records, &empty_bandwidth_batch)
+            .await;
+
+        // 验证结果
+        assert!(result.is_ok());
     }
 }
 
