@@ -225,7 +225,7 @@ impl SessionService {
 
         // 6. 执行Flow（纯函数）
         let flow_result = flow_service
-            .execute_flow(&target, &context, options, flow_items, penalty_servers)
+            .execute_flow(&target, &context, options, flow_items, penalty_servers, Some(session))
             .await?;
 
         // 7. 记录最终CDN结果

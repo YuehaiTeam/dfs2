@@ -4,6 +4,7 @@ use tracing::{debug, info, warn};
 
 use crate::modules::storage::data_store::DataStore;
 
+pub mod batch;
 pub mod chunk;
 pub mod downloads;
 pub mod metadata;
@@ -175,7 +176,7 @@ pub fn routes() -> Router {
         .route(
             "/session/{sessionid}/{resid}",
             get(chunk::get_cdn)
-                .post(chunk::post_batch_cdn)
+                .post(batch::post_batch_cdn)
                 .delete(sessions::delete_session),
         )
         .route(

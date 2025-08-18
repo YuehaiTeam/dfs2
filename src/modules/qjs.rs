@@ -181,13 +181,15 @@ impl JsRunner {
                         }
                         Err(_) => {
                             let catch = ctx.catch();
-                            return Err(anyhow::anyhow!("Error: {:?}", catch));
+                            let error_msg = format_js_exception(&ctx, catch);
+                            return Err(anyhow::anyhow!("{}", error_msg));
                         }
                     }
                 },
                 Err(_) => {
                     let catch = ctx.catch();
-                    return Err(anyhow::anyhow!("Error: {:?}", catch));
+                    let error_msg = format_js_exception(&ctx, catch);
+                    return Err(anyhow::anyhow!("{}", error_msg));
                 }
             }
         })
@@ -336,6 +338,40 @@ impl<'js> rquickjs::FromJs<'js> for JsonValue {
 impl From<JsonValue> for serde_json::Value {
     fn from(val: JsonValue) -> Self {
         val.0
+    }
+}
+
+/// 安全地格式化JavaScript异常，对Exception对象进行选择性序列化
+fn format_js_exception<'js>(ctx: &rquickjs::Ctx<'js>, exception: Value<'js>) -> String {
+    // 检查是否是Exception类型
+    if exception.type_of() == rquickjs::Type::Exception {
+        // 对于Exception对象，尝试获取属性
+        if let Some(obj) = exception.into_object() {
+            // 尝试获取message属性
+            if let Ok(message) = obj.get::<&str, String>("message") {
+                return message;
+            }
+
+            // 如果没有message属性，尝试name属性
+            if let Ok(name) = obj.get::<&str, String>("name") {
+                return name;
+            }
+        }
+
+        // 默认Exception错误消息
+        return "Unknown Error".to_string();
+    } else {
+        // 对于非Exception对象（字符串、数字、对象等），正常序列化
+        match String::from_js(ctx, exception.clone()) {
+            Ok(msg) => msg,
+            Err(_) => {
+                // 如果无法转换为字符串，使用JsonValue安全序列化
+                match JsonValue::from_js(ctx, exception) {
+                    Ok(json_val) => format!("{}", json_val.0),
+                    Err(_) => "[unserializable value]".to_string(),
+                }
+            }
+        }
     }
 }
 

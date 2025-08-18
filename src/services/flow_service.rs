@@ -1,7 +1,7 @@
 use crate::{
     config::SharedConfig,
     error::{DfsError, DfsResult},
-    models::{FlowContext, FlowOptions, FlowResult, FlowTarget, PluginMetadata},
+    models::{FlowContext, FlowJsContext, FlowOptions, FlowResult, FlowTarget, PluginMetadata},
     modules::{
         external::geolocation,
         flow::{FlowComp, FlowCond, FlowItem, FlowMode, FlowUse, ResourcePattern},
@@ -48,6 +48,7 @@ impl FlowService {
         options: &FlowOptions,
         flow_items: &[FlowItem],
         penalty_servers: Vec<String>, // 外部传入惩罚服务器列表
+        session: Option<&crate::models::Session>,
     ) -> DfsResult<FlowResult> {
         let mut server_pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
@@ -63,6 +64,7 @@ impl FlowService {
                     target,
                     context,
                     options,
+                    session,
                     &mut plugin_server_mapping,
                     &penalty_servers,
                     &mut selected_server_id,
@@ -115,6 +117,7 @@ impl FlowService {
         target: &FlowTarget,
         context: &FlowContext,
         options: &FlowOptions,
+        session: Option<&crate::models::Session>,
         plugin_server_mapping: &mut HashMap<String, (Option<String>, bool)>,
         penalty_servers: &[String],
         selected_server_id: &mut Option<String>,
@@ -139,8 +142,14 @@ impl FlowService {
                         }
                     }
                     FlowUse::Plugin { id, indirect } => {
+                        let flow_context = FlowJsContext {
+                            target: target.clone(),
+                            context: context.clone(),
+                            options: options.clone(),
+                            session: session.cloned(),
+                        };
                         let result = self
-                            .execute_plugin(id, indirect, pool.clone(), &context.extras)
+                            .execute_plugin(id, indirect, pool.clone(), &flow_context)
                             .await?;
                         self.process_plugin_result(result, pool, plugin_server_mapping)?;
                     }
@@ -425,7 +434,7 @@ impl FlowService {
         id: &str,
         indirect: &str,
         pool: Vec<(String, u32)>,
-        extras: &serde_json::Value,
+        flow_context: &FlowJsContext,
     ) -> DfsResult<serde_json::Value> {
         let config = self.shared_config.load();
         let plugin_options = config.plugins.get(id);
@@ -433,11 +442,11 @@ impl FlowService {
         if let Some(code) = config.plugin_code.get(id) {
             let js_code = format!(
                 r#"
-                (async (pool, indirect, options, extras, exports) => {{
+                (async (pool, indirect, options, flowContext, exports) => {{
                     /* USER CODE START */
                     {}
                     /* USER CODE END */
-                    let ret = await exports?.(pool, indirect, options, extras) || false;
+                    let ret = await exports?.(pool, indirect, options, flowContext) || false;
                     return [ret, pool];
                 }})({}, {}, {}, {})
                 "#,
@@ -446,12 +455,12 @@ impl FlowService {
                 serde_json::to_string(indirect).unwrap_or_else(|_| "false".to_string()),
                 serde_json::to_string(&plugin_options.unwrap_or(&serde_json::Value::Null))
                     .unwrap_or_else(|_| "null".to_string()),
-                serde_json::to_string(extras).unwrap_or_else(|_| "{}".to_string()),
+                serde_json::to_string(flow_context).unwrap_or_else(|_| "{}".to_string()),
             );
 
             let result =
                 self.js_runner.eval(js_code).await.map_err(|e| {
-                    DfsError::internal_error(format!("Plugin execution failed: {e}"))
+                    DfsError::internal_error(format!("Plugin execution failed: {}", e))
                 })?;
             Ok(result)
         } else {

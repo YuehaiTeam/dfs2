@@ -342,6 +342,7 @@ pub async fn handle_download_request_unified(
                 &options,
                 flow_list,
                 vec![], // penalty_servers for direct download
+                None, // no session in free mode
             )
             .await
             .map_err(|e| {

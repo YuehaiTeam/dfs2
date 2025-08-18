@@ -89,7 +89,7 @@ pub struct DeleteSessionRequest {
 use std::net::IpAddr;
 
 /// 目标资源信息 - "我要访问什么"
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FlowTarget {
     pub resource_id: String,
     pub version: String,
@@ -99,7 +99,7 @@ pub struct FlowTarget {
 }
 
 /// 请求上下文信息 - "在什么情况下访问"
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FlowContext {
     pub client_ip: Option<IpAddr>,
     pub session_id: Option<String>,
@@ -107,7 +107,7 @@ pub struct FlowContext {
 }
 
 /// 执行选项 - "如何访问"
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FlowOptions {
     pub cdn_full_range: bool,
 }
@@ -123,7 +123,7 @@ pub struct FlowResult {
 }
 
 /// 批量chunk请求结构
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BatchChunkRequest {
     /// 要获取CDN地址的chunk列表，格式如 ["0-1023", "1024-2047", "2048-4095"]
     pub chunks: Vec<String>,
@@ -156,4 +156,13 @@ pub struct BandwidthInfo {
     pub server_id: Option<String>,
     pub bytes: u64,
     pub chunk_id: String,
+}
+
+/// JavaScript插件上下文结构
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowJsContext {
+    pub target: FlowTarget,
+    pub context: FlowContext,
+    pub options: FlowOptions,
+    pub session: Option<Session>,
 }
