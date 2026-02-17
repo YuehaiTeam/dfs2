@@ -200,6 +200,9 @@ pub struct ServerConfig {
     /// 服务器配置文件，用于区分具体实现类型（如minio、aws等）
     #[serde(default)]
     pub profile: Option<String>,
+    /// 是否跳过特定的配置文件生成步骤
+    #[serde(default)]
+    pub generation_skip: Vec<String>,
 }
 impl<'js> IntoJs<'js> for ServerConfig {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {

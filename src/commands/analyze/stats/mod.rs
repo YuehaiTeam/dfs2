@@ -1,3 +1,4 @@
+pub mod allocation;
 pub mod duration;
 pub mod quality;
 pub mod retry;

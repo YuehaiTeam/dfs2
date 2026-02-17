@@ -8,6 +8,10 @@ pub fn generate_rclone_config(config: &AppConfig, profile_filter: Option<&str>) 
     let mut sections = Vec::new();
 
     for (server_id, server_config) in &config.servers {
+        // 判断跳过
+        if server_config.generation_skip.contains(&"rclone".to_string()) {
+            continue;
+        }
         // 如果指定了profile过滤器，则只处理匹配的服务器
         if let Some(filter) = profile_filter {
             match &server_config.profile {

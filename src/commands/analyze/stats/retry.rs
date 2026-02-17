@@ -4,6 +4,27 @@ use crate::commands::analyze::models::{
 };
 use std::collections::HashMap;
 
+/// Calculate actual session duration using the last download completion time
+fn calculate_actual_session_duration(session: &SessionLog) -> f64 {
+    let mut latest_completion_time = session.start;
+    
+    for chunk in &session.chunks {
+        for cdn_record in &chunk.cdns {
+            if let Some(time) = cdn_record.time {
+                let completion_time = cdn_record.ts + time as u64;
+                latest_completion_time = latest_completion_time.max(completion_time);
+            }
+        }
+    }
+    
+    if latest_completion_time > session.start {
+        (latest_completion_time - session.start) as f64
+    } else {
+        // Fallback to reported duration if no download times available
+        (session.end - session.start) as f64
+    }
+}
+
 pub fn analyze_retry_patterns(sessions: &[SessionLog]) -> RetryAnalysis {
     if sessions.is_empty() {
         return create_empty_retry_analysis();
@@ -38,8 +59,9 @@ fn calculate_global_retry_stats(sessions: &[SessionLog]) -> GlobalRetryStats {
         let mut session_has_retries = false;
 
         for chunk in &session.chunks {
-            total_retries += chunk.att;
-            if chunk.att > 0 {
+            // Convert attempts to retries: retries = attempts - 1
+            if chunk.att > 1 {
+                total_retries += chunk.att - 1;
                 session_has_retries = true;
             }
         }
@@ -75,9 +97,10 @@ fn calculate_retry_distribution(sessions: &[SessionLog]) -> RetryDistribution {
     for session in sessions {
         let mut max_retries = 0u32;
 
-        // Find the maximum retry count for this session
+        // Find the maximum retry count for this session (retries = attempts - 1)
         for chunk in &session.chunks {
-            max_retries = max_retries.max(chunk.att);
+            let retry_count = if chunk.att > 1 { chunk.att - 1 } else { 0 };
+            max_retries = max_retries.max(retry_count);
         }
 
         *retry_counts.entry(max_retries).or_insert(0) += 1;
@@ -128,9 +151,10 @@ fn calculate_time_impact(sessions: &[SessionLog]) -> TimeImpact {
         let duration = (session.end - session.start) as f64;
         let mut max_retries = 0u32;
 
-        // Find the maximum retry count for this session
+        // Find the maximum retry count for this session (retries = attempts - 1)
         for chunk in &session.chunks {
-            max_retries = max_retries.max(chunk.att);
+            let retry_count = if chunk.att > 1 { chunk.att - 1 } else { 0 };
+            max_retries = max_retries.max(retry_count);
         }
 
         durations_by_retries
@@ -185,11 +209,17 @@ fn analyze_retry_by_server(sessions: &[SessionLog]) -> HashMap<String, ServerRet
                         .or_insert_with(ServerRetryData::new);
 
                     data.total_requests += 1;
-                    data.total_retries += chunk.att;
-
-                    // Track retry reasons
-                    if let Some(reason) = &cdn_record.rsn {
-                        *data.retry_reasons.entry(reason.clone()).or_insert(0) += 1;
+                    // Convert attempts to retries: retries = attempts - 1
+                    if chunk.att > 1 {
+                        data.total_retries += chunk.att - 1;
+                        
+                        // Track retry reasons from error field when there are actual retries
+                        if let Some(error) = &cdn_record.err {
+                            *data.retry_reasons.entry(error.clone()).or_insert(0) += 1;
+                        } else {
+                            // If no error is recorded, use a generic retry reason
+                            *data.retry_reasons.entry("retry_without_error".to_string()).or_insert(0) += 1;
+                        }
                     }
 
                     // Track penalty rate

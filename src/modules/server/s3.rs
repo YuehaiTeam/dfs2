@@ -178,6 +178,10 @@ impl S3Signer {
         &self.endpoint
     }
 
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
     pub fn from_url(url_str: &str) -> Result<Self> {
         let url = Url::parse(url_str)?;
 

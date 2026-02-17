@@ -33,6 +33,7 @@ pub fn generate_s3_section(server_id: &str, server_config: &ServerConfig) -> Res
         s3_signer.secret_key()
     )?;
     writeln!(&mut section, "endpoint = {}", s3_signer.endpoint())?;
+    writeln!(&mut section, "region = {}", s3_signer.region())?;
 
     Ok(section)
 }

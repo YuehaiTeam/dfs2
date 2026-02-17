@@ -16,7 +16,6 @@ use crate::{
         ApiResponse, ChallengeResponse, EmptyResponse, ErrorResponse, ResponseData,
         SessionCreatedResponse,
     },
-    routes::resource::update_session_bandwidth_stats,
     services::session_service,
 };
 
@@ -191,7 +190,7 @@ pub async fn delete_session(
 
     // 在删除之前获取会话统计信息
     match ctx.session_service.get_session_stats(&sessionid).await? {
-        Some(stats) => {
+        Some(_stats) => {
             // 如果有客户端IP，记录结构化日志
             if let Some(ip) = client_ip {
                 let session_logger = crate::modules::analytics::SessionLogger::new(
@@ -215,9 +214,6 @@ pub async fn delete_session(
             }
 
             info!("Session completed: {} {}", resid, sessionid);
-
-            // 更新流量统计（基于会话完成情况）
-            update_session_bandwidth_stats(&ctx.data_store, &sessionid, &resid, &stats).await;
 
             // 删除会话
             ctx.session_service.remove_session(&sessionid).await?;

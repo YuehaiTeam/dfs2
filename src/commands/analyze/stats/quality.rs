@@ -110,34 +110,10 @@ fn generate_quality_recommendation(
     ttfb_coverage: f64,
     speed_coverage: f64,
 ) -> String {
-    let mut recommendations = Vec::new();
-
-    if server_id_coverage < 80.0 {
-        recommendations.push(format!(
-            "Server ID coverage is only {:.1}% - improve server identification in logs",
-            server_id_coverage
-        ));
-    }
-
-    if ttfb_coverage < 30.0 {
-        recommendations.push(format!(
-            "TTFB data coverage is only {:.1}% - improve client telemetry reporting",
-            ttfb_coverage
-        ));
-    }
-
-    if speed_coverage < 25.0 {
-        recommendations.push(format!(
-            "Speed data coverage is only {:.1}% - ensure clients report both size and time",
-            speed_coverage
-        ));
-    }
-
-    if recommendations.is_empty() {
-        "Data quality is acceptable for analysis".to_string()
-    } else {
-        format!("Recommendations: {}", recommendations.join("; "))
-    }
+    format!(
+        "Coverage: Server ID {:.1}%, TTFB {:.1}%, Speed {:.1}%",
+        server_id_coverage, ttfb_coverage, speed_coverage
+    )
 }
 
 pub fn generate_issues_summary(
@@ -172,7 +148,7 @@ fn identify_critical_servers(
                 recommendation: server
                     .recommendation
                     .clone()
-                    .unwrap_or_else(|| "Check server status immediately".to_string()),
+                    .unwrap_or_else(|| "High TTFB detected".to_string()),
             });
         }
     }
@@ -188,7 +164,7 @@ fn identify_critical_servers(
                 recommendation: server
                     .recommendation
                     .clone()
-                    .unwrap_or_else(|| "Bandwidth severely insufficient".to_string()),
+                    .unwrap_or_else(|| "Low download speed".to_string()),
             });
         }
     }
@@ -207,7 +183,7 @@ fn identify_critical_servers(
                 recommendation: server
                     .recommendation
                     .clone()
-                    .unwrap_or_else(|| "Extremely unreliable server".to_string()),
+                    .unwrap_or_else(|| "High retry rate detected".to_string()),
             });
         }
     }

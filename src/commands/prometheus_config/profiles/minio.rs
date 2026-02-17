@@ -26,15 +26,18 @@ fn generate_minio_jwt(access_key: &str, secret_key: &str) -> Result<String> {
         .map_err(|e| anyhow::anyhow!("Failed to generate JWT: {}", e))
 }
 
-fn extract_target_from_endpoint(endpoint: &str) -> Result<String> {
+fn extract_target_from_endpoint(endpoint: &str) -> Result<(String, String)> {
     let parsed_url = Url::parse(endpoint)?;
     let host = parsed_url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid host in endpoint"))?;
 
     match parsed_url.port() {
-        Some(port) => Ok(format!("{}:{}", host, port)),
-        None => Ok(host.to_string()), // 不强制添加默认端口，让Prometheus处理
+        Some(port) => Ok((
+            format!("{}:{}", host, port),
+            parsed_url.scheme().to_string(),
+        )),
+        None => Ok((host.to_string(), parsed_url.scheme().to_string())), // 不强制添加默认端口，让Prometheus处理
     }
 }
 
@@ -51,7 +54,7 @@ pub fn generate_minio_job(server_id: &str, server_config: &ServerConfig) -> Resu
     let jwt_token = generate_minio_jwt(s3_signer.access_key(), s3_signer.secret_key())?;
 
     // 提取target地址
-    let target = extract_target_from_endpoint(s3_signer.endpoint())?;
+    let (target, scheme) = extract_target_from_endpoint(s3_signer.endpoint())?;
 
     // 获取bucket名称
     let bucket = s3_signer.bucket();
@@ -61,7 +64,7 @@ pub fn generate_minio_job(server_id: &str, server_config: &ServerConfig) -> Resu
         job_name: format!("minio-{}", server_id),
         bearer_token: Some(jwt_token),
         metrics_path: Some(format!("/minio/metrics/v3/bucket/api/{}", bucket)),
-        scheme: Some("http".to_string()), // 默认HTTP，可根据URL scheme调整
+        scheme: Some(scheme), // 使用提取的URL scheme
         static_configs: vec![StaticConfig {
             targets: vec![target],
         }],

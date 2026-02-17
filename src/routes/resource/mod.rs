@@ -1,8 +1,4 @@
 use axum::{Router, routing::get};
-use std::collections::HashMap;
-use tracing::{debug, info, warn};
-
-use crate::modules::storage::data_store::DataStore;
 
 pub mod batch;
 pub mod chunk;
@@ -81,85 +77,6 @@ macro_rules! record_flow_metrics {
             $metrics.record_flow_failure();
         }
     };
-}
-
-// 生成32位 hex 格式的 session ID
-// 辅助函数：更新会话模式的流量统计
-async fn update_session_bandwidth_stats(
-    data_store: &DataStore,
-    _session_id: &str,
-    resource_id: &str,
-    stats: &crate::modules::storage::data_store::SessionStats,
-) {
-    // 从每个成功下载的chunk中提取服务器信息和估算流量
-    let mut server_usage: HashMap<String, u64> = HashMap::new();
-    let mut total_bandwidth = 0u64;
-
-    for (chunk_id, download_count) in &stats.download_counts {
-        if *download_count > 0 {
-            // 获取该chunk的CDN记录
-            if let Some(cdn_records) = stats.cdn_records.get(chunk_id) {
-                if let Some(latest_record) = cdn_records.last() {
-                    if let Some(server_id) = &latest_record.server_id {
-                        // 使用CdnRecord中记录的文件大小，如果没有则使用默认值
-                        let estimated_chunk_size = latest_record.size.unwrap_or(1024 * 1024);
-
-                        // 根据下载次数估算流量（通常一次成功即可）
-                        let chunk_bandwidth = estimated_chunk_size
-                            .min(estimated_chunk_size * (*download_count as u64));
-
-                        // 累计到服务器使用量
-                        *server_usage.entry(server_id.clone()).or_default() += chunk_bandwidth;
-                        total_bandwidth += chunk_bandwidth;
-
-                        debug!(
-                            "Session bandwidth calculation: chunk={}, server={}, size={}, downloads={}",
-                            chunk_id, server_id, chunk_bandwidth, download_count
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // 更新流量统计（资源级别和服务器级别）
-    if total_bandwidth > 0 {
-        // 首先更新全局资源统计，使用总带宽量
-        if let Err(e) = data_store
-            .update_resource_daily_bandwidth(resource_id, total_bandwidth)
-            .await
-        {
-            warn!(
-                "Failed to update resource daily bandwidth for {}: {}",
-                resource_id, e
-            );
-        }
-        if let Err(e) = data_store
-            .update_global_daily_bandwidth(total_bandwidth)
-            .await
-        {
-            warn!("Failed to update global daily bandwidth: {}", e);
-        }
-
-        // 分别更新各个服务器的流量统计
-        let server_count = server_usage.len();
-        for (server_id, bandwidth) in server_usage {
-            if let Err(e) = data_store
-                .update_server_daily_bandwidth(&server_id, bandwidth)
-                .await
-            {
-                warn!(
-                    "Failed to update server daily bandwidth for {}: {}",
-                    server_id, e
-                );
-            }
-        }
-
-        info!(
-            "Updated bandwidth stats: resource_id={}, total_bandwidth={}, servers={}",
-            resource_id, total_bandwidth, server_count
-        );
-    }
 }
 
 // 路由设置

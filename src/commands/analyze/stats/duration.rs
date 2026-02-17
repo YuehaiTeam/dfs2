@@ -4,6 +4,7 @@ use crate::commands::analyze::models::{
 };
 use std::collections::HashMap;
 
+
 pub fn analyze_session_duration(sessions: &[SessionLog]) -> SessionDurationAnalysis {
     if sessions.is_empty() {
         return create_empty_duration_analysis();

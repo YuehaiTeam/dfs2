@@ -91,14 +91,18 @@ fn init_tracing() -> DfsResult<()> {
     Ok(())
 }
 
-// 中间件函数来处理真实IP提取
+// 中间件函数来处理真实IP提取 (兼容 TCP 和 Unix Socket)
 async fn real_ip_middleware(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     mut req: Request<Body>,
     next: Next,
 ) -> Response {
-    // 从请求头中提取真实IP
-    let real_connect_info = RealConnectInfo::from_headers_and_addr(req.headers(), addr);
+    // 尝试从扩展中获取 ConnectInfo，对于 UDS 连接可能不存在
+    let fallback_addr = req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| *addr)
+        .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
+    
+    let real_connect_info = RealConnectInfo::from_headers_and_addr(req.headers(), fallback_addr);
 
     // 将真实连接信息添加到请求扩展中
     req.extensions_mut().insert(real_connect_info);
@@ -325,29 +329,60 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
         .layer(axum::Extension(app_context));
 
     // 获取绑定地址
-    let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
-    let addr: SocketAddr = bind_addr.parse().map_err(|e: std::net::AddrParseError| {
-        DfsError::invalid_input("BIND_ADDRESS", e.to_string())
-    })?;
+    let bind_addr = std::env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:4237".to_string());
 
-    info!("Starting HTTP server on {}", addr);
+    info!("Starting HTTP server on {}", bind_addr);
 
     // 启动服务器
-    match axum::serve(
-        tokio::net::TcpListener::bind(addr)
+    if bind_addr.starts_with("unix:") {
+        #[cfg(unix)]
+        {
+            let listener = tokio::net::UnixListener::bind(&bind_addr[5..])
+                .map_err(|e| DfsError::io_error("bind_socket", e.to_string()))?;
+            match axum::serve(
+                listener,
+                app.into_make_service(),
+            )
             .await
-            .map_err(|e| DfsError::io_error("bind_socket", e.to_string()))?,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    {
-        Ok(_) => {
-            info!("Server shutdown gracefully");
-            Ok(())
+            {
+                Ok(_) => {
+                    info!("Server shutdown gracefully");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Server error: {}", e);
+                    Err(DfsError::internal_error(format!("Server error: {e}")))
+                }
+            }
         }
-        Err(e) => {
-            error!("Server error: {}", e);
-            Err(DfsError::internal_error(format!("Server error: {e}")))
+        #[cfg(not(unix))]
+        {
+            return Err(DfsError::invalid_input(
+                "BIND_ADDRESS",
+                "Unix domain sockets are not supported on this platform".to_string(),
+            ));
+        }
+    } else {
+        let addr: SocketAddr = bind_addr.parse().map_err(|e: std::net::AddrParseError| {
+            DfsError::invalid_input("BIND_ADDRESS", e.to_string())
+        })?;
+        let tcp_listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| DfsError::io_error("bind_socket", e.to_string()))?;
+        match axum::serve(
+            tcp_listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!("Server shutdown gracefully");
+                Ok(())
+            }
+            Err(e) => {
+                error!("Server error: {}", e);
+                Err(DfsError::internal_error(format!("Server error: {e}")))
+            }
         }
     }
 }

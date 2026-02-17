@@ -17,6 +17,9 @@ pub fn analyze_sessions(
     eprintln!("Running server performance analysis...");
     let server_performance = server::analyze_server_performance(&sessions);
 
+    eprintln!("Running error rate analysis...");
+    // Error rate analysis is now included in server performance analysis
+
     eprintln!("Running retry pattern analysis...");
     let retry_analysis = retry::analyze_retry_patterns(&sessions);
 

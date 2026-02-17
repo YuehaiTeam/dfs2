@@ -387,16 +387,20 @@ pub async fn handle_download_request_unified(
     )
     .await
     {
+        println!("File size from health info: {}", file_size);
         if file_size < 100 * 1024 {
             // 100KB限制
             // 下载并缓存
+            println!("File size {} within 100KB cache limit, attempting to cache", file_size);
             download_and_cache(&cdn_url, &resid, &version, &path, &ctx.data_store, max_age)
                 .await
                 .ok()
         } else {
+            println!("File size {} exceeds 100KB cache limit, skipping cache", file_size);
             None
         }
     } else {
+        println!("Not eligible for caching based on resource or subpath settings");
         None
     };
 
