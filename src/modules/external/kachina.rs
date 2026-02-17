@@ -187,6 +187,7 @@ pub async fn fetch_file_range(
         client_ip: None, // Kachina解析通常不需要客户端IP信息
         session_id: None,
         extras: serde_json::json!({}),
+        h3_capable: false, // Internal usage, no client context
     };
 
     let options = FlowOptions {

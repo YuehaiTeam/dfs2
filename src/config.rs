@@ -2,8 +2,9 @@ use arc_swap::{ArcSwap, Guard};
 use rquickjs::IntoJs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::modules::auth::challenge::ChallengeType;
 use crate::modules::{flow::FlowItem, server::ServerImpl};
@@ -94,6 +95,83 @@ impl<'js> IntoJs<'js> for VersionProviderConfig {
         obj.set("webhook_token", self.webhook_token.clone())?;
         obj.set("options", self.options.to_string())?; // 转换为字符串以便JS处理
         Ok(obj.into())
+    }
+}
+
+/// Validated certificate hash policy for HTTP/3 only nodes.
+///
+/// Determines how the certificate of an h3_only server is verified:
+/// - `ValidCert`: require a valid (CA-signed) certificate (default when cert_hash is None/empty)
+/// - `Trust`: skip cert verification; fetch and cache the cert hash during health check
+/// - `PinnedHex`: pin to a specific leaf certificate hash (SHA-256 of DER bytes)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CertHashPolicy {
+    /// Require valid certificate (empty/None cert_hash)
+    ValidCert,
+    /// Skip cert verification, must fetch cert hash during health check
+    Trust,
+    /// Pin to specific leaf cert hash (SHA-256 of DER), stored as 32 bytes
+    PinnedHex([u8; 32]),
+}
+
+impl CertHashPolicy {
+    /// Parse and validate a cert_hash string into a CertHashPolicy.
+    ///
+    /// Valid inputs:
+    /// - `None` or empty string → `ValidCert`
+    /// - `"trust"` (case-insensitive) → `Trust`
+    /// - 64 hex characters → `PinnedHex` (normalized to lowercase)
+    pub fn from_option(cert_hash: &Option<String>) -> Result<Self, String> {
+        match cert_hash {
+            None => Ok(CertHashPolicy::ValidCert),
+            Some(s) if s.is_empty() => Ok(CertHashPolicy::ValidCert),
+            Some(s) if s.eq_ignore_ascii_case("trust") => Ok(CertHashPolicy::Trust),
+            Some(s) => {
+                let s = s.trim();
+                if s.len() != 64 {
+                    return Err(format!(
+                        "cert_hash must be exactly 64 hex characters, got {} characters: '{}'",
+                        s.len(),
+                        s
+                    ));
+                }
+                if !s.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(format!("cert_hash contains non-hex characters: '{}'", s));
+                }
+                let mut bytes = [0u8; 32];
+                for i in 0..32 {
+                    bytes[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+                        .map_err(|e| format!("failed to parse hex at position {}: {}", i * 2, e))?;
+                }
+                Ok(CertHashPolicy::PinnedHex(bytes))
+            }
+        }
+    }
+
+    /// Return the normalized lowercase hex string for PinnedHex, or None for other variants.
+    #[allow(dead_code)]
+    pub fn as_hex_string(&self) -> Option<String> {
+        match self {
+            CertHashPolicy::PinnedHex(bytes) => {
+                Some(bytes.iter().map(|b| format!("{:02x}", b)).collect())
+            }
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for CertHashPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CertHashPolicy::ValidCert => write!(f, "valid_cert"),
+            CertHashPolicy::Trust => write!(f, "trust"),
+            CertHashPolicy::PinnedHex(bytes) => {
+                for b in bytes {
+                    write!(f, "{:02x}", b)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -203,7 +281,74 @@ pub struct ServerConfig {
     /// 是否跳过特定的配置文件生成步骤
     #[serde(default)]
     pub generation_skip: Vec<String>,
+    /// Whether this server is HTTP/3 only
+    #[serde(default)]
+    pub h3_only: bool,
+    /// Certificate hash policy for h3_only nodes:
+    /// - None/empty: require valid certificate
+    /// - "trust": skip cert verification, fetch cert hash during health check
+    /// - 64-char hex: pin to specific leaf cert SHA-256 hash
+    #[serde(default)]
+    pub cert_hash: Option<String>,
 }
+impl ServerConfig {
+    /// Validate h3_only and cert_hash configuration.
+    /// Returns a list of errors and warnings for this server.
+    pub fn validate_h3(&self, server_id: &str) -> (Vec<String>, Vec<String>) {
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+
+        if !self.h3_only {
+            // When h3_only=false, warn if cert_hash is set but don't fail
+            if self.cert_hash.is_some() && !self.cert_hash.as_ref().is_none_or(|s| s.is_empty()) {
+                warnings.push(format!(
+                    "Server '{}': cert_hash is set but h3_only is false; cert_hash will be ignored",
+                    server_id
+                ));
+            }
+            return (errors, warnings);
+        }
+
+        // h3_only=true: validate URL scheme is https
+        if !self.url.starts_with("https://") {
+            errors.push(format!(
+                "Server '{}': h3_only=true requires https:// URL scheme, got '{}'",
+                server_id, self.url
+            ));
+        }
+
+        // Validate cert_hash value
+        if let Err(e) = CertHashPolicy::from_option(&self.cert_hash) {
+            errors.push(format!("Server '{}': invalid cert_hash: {}", server_id, e));
+        }
+
+        (errors, warnings)
+    }
+
+    /// Parse and return the validated CertHashPolicy for this server.
+    /// Returns ValidCert if h3_only is false.
+    pub fn cert_hash_policy(&self) -> Result<CertHashPolicy, String> {
+        if !self.h3_only {
+            return Ok(CertHashPolicy::ValidCert);
+        }
+        CertHashPolicy::from_option(&self.cert_hash)
+    }
+
+    /// Return the normalized cert_hash string (lowercase hex) for storage/URLs.
+    /// Returns None if not h3_only or if policy is ValidCert/Trust.
+    #[allow(dead_code)]
+    pub fn normalized_cert_hash(&self) -> Option<String> {
+        if !self.h3_only {
+            return None;
+        }
+        match &self.cert_hash {
+            Some(s) if s.eq_ignore_ascii_case("trust") => Some("trust".to_string()),
+            Some(s) if s.len() == 64 => Some(s.to_ascii_lowercase()),
+            _ => None,
+        }
+    }
+}
+
 impl<'js> IntoJs<'js> for ServerConfig {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
         let obj = rquickjs::Object::new(ctx.clone())?;
@@ -212,6 +357,8 @@ impl<'js> IntoJs<'js> for ServerConfig {
         obj.set("type", self.r#type)?;
         obj.set("health_check_path", self.health_check_path)?;
         obj.set("profile", self.profile)?;
+        obj.set("h3_only", self.h3_only)?;
+        obj.set("cert_hash", self.cert_hash)?;
         Ok(obj.into())
     }
 }
@@ -332,6 +479,19 @@ impl AppConfig {
         &self.challenge
     }
 
+    /// Validate all server h3_only/cert_hash configurations.
+    /// Returns (errors, warnings).
+    pub fn validate_servers_h3(&self) -> (Vec<String>, Vec<String>) {
+        let mut all_errors = Vec::new();
+        let mut all_warnings = Vec::new();
+        for (server_id, server_config) in &self.servers {
+            let (errors, warnings) = server_config.validate_h3(server_id);
+            all_errors.extend(errors);
+            all_warnings.extend(warnings);
+        }
+        (all_errors, all_warnings)
+    }
+
     pub async fn load() -> anyhow::Result<Self> {
         let path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
         let plugin_path = std::env::var("PLUGIN_PATH").unwrap_or_else(|_| "plugins/".to_string());
@@ -372,6 +532,21 @@ impl AppConfig {
                 config.debug_mode = true;
                 info!("Debug mode automatically enabled in debug build");
             }
+        }
+
+        // Validate h3_only/cert_hash server configurations
+        let (h3_errors, h3_warnings) = config.validate_servers_h3();
+        for w in &h3_warnings {
+            warn!("{}", w);
+        }
+        if !h3_errors.is_empty() {
+            for e in &h3_errors {
+                error!("{}", e);
+            }
+            return Err(anyhow::anyhow!(
+                "Server h3_only/cert_hash validation failed:\n{}",
+                h3_errors.join("\n")
+            ));
         }
 
         // create server implementations
@@ -430,6 +605,259 @@ impl SharedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cert_hash_policy_valid_cert() {
+        // None -> ValidCert
+        assert_eq!(
+            CertHashPolicy::from_option(&None).unwrap(),
+            CertHashPolicy::ValidCert
+        );
+        // Empty string -> ValidCert
+        assert_eq!(
+            CertHashPolicy::from_option(&Some("".to_string())).unwrap(),
+            CertHashPolicy::ValidCert
+        );
+    }
+
+    #[test]
+    fn test_cert_hash_policy_trust() {
+        assert_eq!(
+            CertHashPolicy::from_option(&Some("trust".to_string())).unwrap(),
+            CertHashPolicy::Trust
+        );
+        // Case insensitive
+        assert_eq!(
+            CertHashPolicy::from_option(&Some("TRUST".to_string())).unwrap(),
+            CertHashPolicy::Trust
+        );
+        assert_eq!(
+            CertHashPolicy::from_option(&Some("Trust".to_string())).unwrap(),
+            CertHashPolicy::Trust
+        );
+    }
+
+    #[test]
+    fn test_cert_hash_policy_pinned_hex() {
+        let hex = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let policy = CertHashPolicy::from_option(&Some(hex.to_string())).unwrap();
+        match &policy {
+            CertHashPolicy::PinnedHex(bytes) => {
+                assert_eq!(bytes[0], 0xa1);
+                assert_eq!(bytes[1], 0xb2);
+                assert_eq!(bytes[31], 0xb2);
+            }
+            _ => panic!("Expected PinnedHex"),
+        }
+        // Display should emit lowercase hex
+        assert_eq!(policy.to_string(), hex);
+        // as_hex_string should match
+        assert_eq!(policy.as_hex_string().unwrap(), hex);
+    }
+
+    #[test]
+    fn test_cert_hash_policy_pinned_hex_uppercase_normalized() {
+        let hex_upper = "A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2";
+        let policy = CertHashPolicy::from_option(&Some(hex_upper.to_string())).unwrap();
+        // Should be normalized to lowercase
+        let hex_lower = hex_upper.to_ascii_lowercase();
+        assert_eq!(policy.to_string(), hex_lower);
+        assert_eq!(policy.as_hex_string().unwrap(), hex_lower);
+    }
+
+    #[test]
+    fn test_cert_hash_policy_invalid_length() {
+        let result = CertHashPolicy::from_option(&Some("abcdef".to_string()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("64 hex characters"));
+    }
+
+    #[test]
+    fn test_cert_hash_policy_invalid_hex_chars() {
+        // 64 chars but not all hex
+        let bad = "g1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let result = CertHashPolicy::from_option(&Some(bad.to_string()));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("non-hex"));
+    }
+
+    #[test]
+    fn test_cert_hash_policy_display() {
+        assert_eq!(CertHashPolicy::ValidCert.to_string(), "valid_cert");
+        assert_eq!(CertHashPolicy::Trust.to_string(), "trust");
+    }
+
+    #[test]
+    fn test_server_config_validate_h3_disabled() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "http://example.com".to_string(),
+            r#type: "direct".to_string(),
+            h3_only: false,
+            cert_hash: None,
+            ..Default::default()
+        };
+        let (errors, warnings) = server.validate_h3("test");
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_server_config_validate_h3_disabled_with_cert_hash_warns() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "http://example.com".to_string(),
+            r#type: "direct".to_string(),
+            h3_only: false,
+            cert_hash: Some("trust".to_string()),
+            ..Default::default()
+        };
+        let (errors, warnings) = server.validate_h3("test");
+        assert!(errors.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("ignored"));
+    }
+
+    #[test]
+    fn test_server_config_validate_h3_enabled_https_ok() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "https://cdn.example.com".to_string(),
+            r#type: "direct".to_string(),
+            h3_only: true,
+            cert_hash: Some("trust".to_string()),
+            ..Default::default()
+        };
+        let (errors, warnings) = server.validate_h3("test");
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_server_config_validate_h3_enabled_http_fails() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "http://cdn.example.com".to_string(),
+            r#type: "direct".to_string(),
+            h3_only: true,
+            cert_hash: None,
+            ..Default::default()
+        };
+        let (errors, _warnings) = server.validate_h3("test");
+        assert!(!errors.is_empty());
+        assert!(errors[0].contains("https://"));
+    }
+
+    #[test]
+    fn test_server_config_validate_h3_enabled_bad_cert_hash() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "https://cdn.example.com".to_string(),
+            r#type: "direct".to_string(),
+            h3_only: true,
+            cert_hash: Some("invalid_value".to_string()),
+            ..Default::default()
+        };
+        let (errors, _warnings) = server.validate_h3("test");
+        assert!(!errors.is_empty());
+        assert!(errors[0].contains("cert_hash"));
+    }
+
+    #[test]
+    fn test_server_config_cert_hash_policy_non_h3() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "http://example.com".to_string(),
+            r#type: "direct".to_string(),
+            h3_only: false,
+            cert_hash: Some("trust".to_string()),
+            ..Default::default()
+        };
+        // Non-h3 always returns ValidCert
+        assert_eq!(
+            server.cert_hash_policy().unwrap(),
+            CertHashPolicy::ValidCert
+        );
+    }
+
+    #[test]
+    fn test_server_config_cert_hash_policy_h3() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "https://cdn.example.com".to_string(),
+            r#type: "direct".to_string(),
+            h3_only: true,
+            cert_hash: Some("trust".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(server.cert_hash_policy().unwrap(), CertHashPolicy::Trust);
+    }
+
+    #[test]
+    fn test_server_config_serde_backward_compat() {
+        // Old config without h3_only/cert_hash should parse fine
+        let yaml = r#"
+id: "old_server"
+url: "https://cdn.example.com"
+type: "direct"
+"#;
+        let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.h3_only);
+        assert!(config.cert_hash.is_none());
+    }
+
+    #[test]
+    fn test_server_config_serde_with_h3_fields() {
+        let yaml = r#"
+id: "h3_server"
+url: "https://cdn.example.com"
+type: "direct"
+h3_only: true
+cert_hash: "trust"
+"#;
+        let config: ServerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.h3_only);
+        assert_eq!(config.cert_hash, Some("trust".to_string()));
+    }
+
+    #[test]
+    fn test_app_config_validate_servers_h3() {
+        let mut servers = HashMap::new();
+        servers.insert(
+            "good".to_string(),
+            ServerConfig {
+                id: "good".to_string(),
+                url: "https://cdn.example.com".to_string(),
+                r#type: "direct".to_string(),
+                h3_only: true,
+                cert_hash: Some("trust".to_string()),
+                ..Default::default()
+            },
+        );
+        servers.insert(
+            "bad".to_string(),
+            ServerConfig {
+                id: "bad".to_string(),
+                url: "http://cdn.example.com".to_string(),
+                r#type: "direct".to_string(),
+                h3_only: true,
+                cert_hash: None,
+                ..Default::default()
+            },
+        );
+        let config = AppConfig {
+            servers,
+            resources: HashMap::new(),
+            plugins: HashMap::new(),
+            debug_mode: false,
+            challenge: ChallengeConfig::default(),
+            plugin_code: HashMap::new(),
+            server_impl: HashMap::new(),
+        };
+        let (errors, _warnings) = config.validate_servers_h3();
+        assert!(!errors.is_empty());
+        assert!(errors.iter().any(|e| e.contains("bad")));
+    }
 
     #[test]
     fn test_sha256_difficulty_clamping() {

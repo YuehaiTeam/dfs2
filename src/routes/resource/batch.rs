@@ -6,6 +6,7 @@ use tracing::info;
 
 use crate::error::DfsError;
 use crate::modules::network::RealConnectInfo;
+use crate::modules::network::h3_capability::compute_h3_capable;
 use crate::record_request_metrics;
 use crate::responses::ErrorResponse;
 use crate::{container::AppContext, modules::external::geolocation};
@@ -96,6 +97,10 @@ pub async fn post_batch_cdn(
     }
 
     // 4. 限制并发Flow执行（关键：限制为4个）
+    let h3_capable = compute_h3_capable(
+        headers.get("X-DFS-Override").and_then(|v| v.to_str().ok()),
+        headers.get("user-agent").and_then(|v| v.to_str().ok()),
+    );
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FLOWS));
     let batch_data = std::sync::Arc::new(batch_data); // 使用Arc来共享数据
     let tasks_with_chunk_ids: Vec<_> = payload
@@ -119,10 +124,11 @@ pub async fn post_batch_cdn(
                     &resource,
                     &*batch_data_ref,
                     client_ip,
+                    h3_capable,
                 )
                 .await
             });
-            
+
             (original_chunk_id, task) // 返回(chunk_id, task)元组
         })
         .collect();
@@ -202,9 +208,10 @@ pub async fn post_batch_cdn(
                 } else {
                     resid.clone()
                 };
-                
+
                 // 尝试解析chunk范围以计算文件大小
-                let file_size_mb = if let Ok(ranges) = parse_and_validate_ranges(&original_chunk_id) {
+                let file_size_mb = if let Ok(ranges) = parse_and_validate_ranges(&original_chunk_id)
+                {
                     calculate_file_size_from_ranges(&ranges) as f64 / (1024.0 * 1024.0)
                 } else {
                     0.0
@@ -213,7 +220,10 @@ pub async fn post_batch_cdn(
                 // 记录错误日志（与单个CDN获取保持一致的格式）
                 tracing::error!(
                     "BATCH-ERROR {} chunk={} size={:.2}MB {}",
-                    resource_path, original_chunk_id, file_size_mb, e
+                    resource_path,
+                    original_chunk_id,
+                    file_size_mb,
+                    e
                 );
 
                 // 使用原始chunk_id而不是生成虚假的chunk_id
@@ -270,6 +280,7 @@ async fn process_chunk_with_preloaded_data(
     resource: &crate::config::ResourceConfig,
     batch_data: &crate::models::BatchChunkData,
     client_ip: Option<std::net::IpAddr>,
+    h3_capable: bool,
 ) -> crate::error::DfsResult<crate::models::ChunkProcessResult> {
     // 检查chunk是否有效
     if batch_data.invalid_chunks.contains(&chunk_range.to_string()) {
@@ -311,6 +322,7 @@ async fn process_chunk_with_preloaded_data(
         client_ip,
         session_id: Some(session.resource_id.clone()),
         extras: session.extras.clone(),
+        h3_capable,
     };
 
     let options = crate::models::FlowOptions {
@@ -319,7 +331,14 @@ async fn process_chunk_with_preloaded_data(
 
     let flow_result = ctx
         .flow_service
-        .execute_flow(&target, &context, &options, &resource.flow, penalty_servers, Some(session))
+        .execute_flow(
+            &target,
+            &context,
+            &options,
+            &resource.flow,
+            penalty_servers,
+            Some(session),
+        )
         .await?;
 
     // 准备CDN记录
@@ -708,9 +727,9 @@ mod tests {
         // 准备包含无效chunk的请求
         let request_body = crate::models::BatchChunkRequest {
             chunks: vec![
-                "0-1023".to_string(),     // 有效chunk
-                "9999-10000".to_string(), // 无效chunk (不在session.chunks中)
-                "1024-2047".to_string(),  // 有效chunk
+                "0-1023".to_string(),         // 有效chunk
+                "9999-10000".to_string(),     // 无效chunk (不在session.chunks中)
+                "1024-2047".to_string(),      // 有效chunk
                 "invalid-format".to_string(), // 格式无效的chunk
             ],
         };
@@ -745,33 +764,56 @@ mod tests {
         let json_response: serde_json::Value = serde_json::from_str(&body_str).unwrap();
 
         let urls = json_response.get("urls").unwrap().as_object().unwrap();
-        
+
         // 验证所有chunk都有对应的结果，包括错误的chunk
         assert_eq!(urls.len(), 4, "应该返回所有4个chunk的结果");
-        
+
         // 验证成功的chunk返回正确的chunk_id
         assert!(urls.contains_key("0-1023"), "应该包含有效chunk 0-1023");
-        assert!(urls.contains_key("1024-2047"), "应该包含有效chunk 1024-2047");
-        
+        assert!(
+            urls.contains_key("1024-2047"),
+            "应该包含有效chunk 1024-2047"
+        );
+
         // 验证失败的chunk返回原始chunk_id而不是虚假的"error_chunk"或"unknown_chunk"
         assert!(urls.contains_key("9999-10000"), "应该包含chunk 9999-10000");
-        assert!(urls.contains_key("invalid-format"), "应该包含失败的chunk invalid-format");
-        
+        assert!(
+            urls.contains_key("invalid-format"),
+            "应该包含失败的chunk invalid-format"
+        );
+
         // 注意：9999-10000在MockDataStore中被处理为有效（这是预期的，因为mock没有完全模拟所有验证）
         // 重点是验证它返回了正确的chunk_id而不是"error_chunk"
         let chunk_9999_result = urls.get("9999-10000").unwrap();
         // 这个chunk在mock环境中成功了，所以有URL
-        assert!(chunk_9999_result.get("url").is_some(), "chunk 9999-10000在mock环境中应该有url字段");
-        
+        assert!(
+            chunk_9999_result.get("url").is_some(),
+            "chunk 9999-10000在mock环境中应该有url字段"
+        );
+
         // invalid-format是真正格式错误的chunk，应该有error
         let malformed_chunk_result = urls.get("invalid-format").unwrap();
-        assert!(malformed_chunk_result.get("error").is_some(), "格式错误的chunk应该有error字段");
-        assert!(malformed_chunk_result.get("url").is_none() || malformed_chunk_result.get("url").unwrap().is_null(), "格式错误的chunk不应该有url字段");
-        
+        assert!(
+            malformed_chunk_result.get("error").is_some(),
+            "格式错误的chunk应该有error字段"
+        );
+        assert!(
+            malformed_chunk_result.get("url").is_none()
+                || malformed_chunk_result.get("url").unwrap().is_null(),
+            "格式错误的chunk不应该有url字段"
+        );
+
         // 验证成功的chunk有url字段而没有error字段
         let success_chunk_result = urls.get("0-1023").unwrap();
-        assert!(success_chunk_result.get("url").is_some(), "成功的chunk应该有url字段");
-        assert!(success_chunk_result.get("error").is_none() || success_chunk_result.get("error").unwrap().is_null(), "成功的chunk不应该有error字段");
+        assert!(
+            success_chunk_result.get("url").is_some(),
+            "成功的chunk应该有url字段"
+        );
+        assert!(
+            success_chunk_result.get("error").is_none()
+                || success_chunk_result.get("error").unwrap().is_null(),
+            "成功的chunk不应该有error字段"
+        );
 
         println!("✅ POST batch CDN error chunk_id preservation test completed!");
         println!("   - 所有chunk都正确返回原始chunk_id，包括：");

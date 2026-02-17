@@ -12,6 +12,7 @@ use crate::{
     modules::{
         external::geolocation,
         network::RealConnectInfo,
+        network::h3_capability::compute_h3_capable,
         storage::{cache::should_cache_content, data_store::BandwidthUpdateBatch},
     },
     routes::resource::{calculate_actual_bytes_from_range, parse_range_for_flow},
@@ -42,6 +43,7 @@ pub async fn handle_download_request_unified(
     ctx: &AppContext,
     client_ip: Option<std::net::IpAddr>,
     user_agent: Option<String>,
+    h3_override: Option<String>, // X-DFS-Override header value for h3 capability detection
 ) -> DfsResult<DownloadResponse> {
     let config_guard = ctx.shared_config.load();
 
@@ -297,6 +299,7 @@ pub async fn handle_download_request_unified(
         client_ip,
         session_id: original_session_id.clone(),
         extras,
+        h3_capable: compute_h3_capable(h3_override.as_deref(), user_agent.as_deref()),
     };
 
     let options = crate::models::FlowOptions {
@@ -327,6 +330,7 @@ pub async fn handle_download_request_unified(
                 request_file_size,
                 flow_list,
                 &options,
+                context.h3_capable,
             )
             .await
             .map_err(|e| {
@@ -342,7 +346,7 @@ pub async fn handle_download_request_unified(
                 &options,
                 flow_list,
                 vec![], // penalty_servers for direct download
-                None, // no session in free mode
+                None,   // no session in free mode
             )
             .await
             .map_err(|e| {
@@ -391,12 +395,18 @@ pub async fn handle_download_request_unified(
         if file_size < 100 * 1024 {
             // 100KB限制
             // 下载并缓存
-            println!("File size {} within 100KB cache limit, attempting to cache", file_size);
+            println!(
+                "File size {} within 100KB cache limit, attempting to cache",
+                file_size
+            );
             download_and_cache(&cdn_url, &resid, &version, &path, &ctx.data_store, max_age)
                 .await
                 .ok()
         } else {
-            println!("File size {} exceeds 100KB cache limit, skipping cache", file_size);
+            println!(
+                "File size {} exceeds 100KB cache limit, skipping cache",
+                file_size
+            );
             None
         }
     } else {
@@ -586,11 +596,20 @@ pub async fn download_redirect(
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let h3_override = headers
+        .get("X-DFS-Override")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     match handle_download_request_unified(
-        resid, None, // sub_path为None表示普通资源
-        session_id, None, // range为None表示整个文件
-        &ctx, client_ip, user_agent,
+        resid,
+        None, // sub_path为None表示普通资源
+        session_id,
+        None, // range为None表示整个文件
+        &ctx,
+        client_ip,
+        user_agent,
+        h3_override,
     )
     .await
     {
@@ -720,10 +739,20 @@ pub async fn download_json(
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let h3_override = headers
+        .get("X-DFS-Override")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let response_data = match handle_download_request_unified(
-        resid, None, // sub_path为None表示普通资源
-        session_id, range, &ctx, client_ip, user_agent,
+        resid,
+        None, // sub_path为None表示普通资源
+        session_id,
+        range,
+        &ctx,
+        client_ip,
+        user_agent,
+        h3_override,
     )
     .await
     {
@@ -780,6 +809,10 @@ pub async fn download_prefix_redirect(
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let h3_override = headers
+        .get("X-DFS-Override")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     match handle_download_request_unified(
         resid,
@@ -789,6 +822,7 @@ pub async fn download_prefix_redirect(
         &ctx,
         client_ip,
         user_agent,
+        h3_override,
     )
     .await
     {
@@ -915,6 +949,10 @@ pub async fn download_prefix_json(
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let h3_override = headers
+        .get("X-DFS-Override")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let response_data = match handle_download_request_unified(
         resid,
@@ -924,6 +962,7 @@ pub async fn download_prefix_json(
         &ctx,
         client_ip,
         user_agent,
+        h3_override,
     )
     .await
     {

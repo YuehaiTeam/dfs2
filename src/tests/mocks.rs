@@ -143,6 +143,7 @@ impl MockDataStore {
             is_alive: true,
             file_size: Some(1024),
             last_check: chrono::Utc::now().timestamp() as u64,
+            observed_cert_hash: None,
         };
 
         // 为各种测试资源路径预设健康信息

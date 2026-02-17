@@ -1,3 +1,5 @@
+pub mod h3_capability;
+pub mod http3_probe;
 pub mod real_connect_info;
 
 // Re-export commonly used items

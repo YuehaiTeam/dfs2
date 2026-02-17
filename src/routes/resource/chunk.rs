@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::error::DfsError;
 use crate::modules::network::RealConnectInfo;
+use crate::modules::network::h3_capability::compute_h3_capable;
 use crate::responses::{ApiResponse, CdnUrlResponse, ErrorResponse, ResponseData};
 use crate::{container::AppContext, modules::external::geolocation};
 use crate::{record_flow_metrics, record_request_metrics};
@@ -128,6 +129,11 @@ pub async fn get_cdn(
         cdn_full_range: false,
     };
 
+    let h3_capable = compute_h3_capable(
+        headers.get("X-DFS-Override").and_then(|v| v.to_str().ok()),
+        headers.get("user-agent").and_then(|v| v.to_str().ok()),
+    );
+
     let flow_result = ctx
         .session_service
         .run_flow_for_session(
@@ -139,6 +145,7 @@ pub async fn get_cdn(
             file_size,
             flow_list,
             &options,
+            h3_capable,
         )
         .await;
     let resource_path = if let Some(ref sub_path_val) = session.sub_path {

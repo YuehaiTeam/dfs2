@@ -168,6 +168,16 @@ impl ConfigValidator {
             info!("找到 {} 个服务器配置", config.servers.len());
         }
 
+        // 验证服务器h3_only/cert_hash配置
+        let (h3_errors, h3_warnings) = config.validate_servers_h3();
+        for e in &h3_errors {
+            report.add_error(e.clone());
+            report.config_valid = false;
+        }
+        for w in &h3_warnings {
+            report.add_warning(w.clone());
+        }
+
         // 检查是否有资源定义
         if config.resources.is_empty() {
             report.add_warning("配置文件中未定义任何资源".to_string());
@@ -396,7 +406,7 @@ impl ConfigValidator {
                 if let Some(server_impl) = config.get_server(server_id) {
                     // 使用配置的健康检查路径来测试连接性，不缓存结果
                     let is_alive = server_impl
-                        .is_alive(server_id, health_check_path, None)
+                        .is_alive(server_id, server_config, health_check_path, None)
                         .await;
 
                     if is_alive {

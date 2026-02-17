@@ -192,6 +192,7 @@ impl SessionService {
         file_size: Option<u64>,
         flow_items: &[FlowItem],
         options: &FlowOptions,
+        h3_capable: bool, // Whether client supports HTTP/3
     ) -> DfsResult<FlowResult> {
         // 1. 直接使用传入的session（无需重复获取）
 
@@ -221,11 +222,19 @@ impl SessionService {
             client_ip,
             session_id: Some(session_id.to_string()),
             extras: session.extras.clone(),
+            h3_capable,
         };
 
         // 6. 执行Flow（纯函数）
         let flow_result = flow_service
-            .execute_flow(&target, &context, options, flow_items, penalty_servers, Some(session))
+            .execute_flow(
+                &target,
+                &context,
+                options,
+                flow_items,
+                penalty_servers,
+                Some(session),
+            )
             .await?;
 
         // 7. 记录最终CDN结果

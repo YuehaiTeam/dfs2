@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tracing::warn;
 
-use crate::config::ServerConfig;
+use crate::config::{CertHashPolicy, ServerConfig};
 
 pub mod dfs_node;
 pub mod git_lfs;
@@ -15,6 +15,8 @@ pub struct HealthInfo {
     pub is_alive: bool,
     pub file_size: Option<u64>,
     pub last_check: u64,
+    #[serde(default)]
+    pub observed_cert_hash: Option<String>,
 }
 
 /// 从HTTP响应中提取文件大小
@@ -113,13 +115,26 @@ impl ServerImpl {
     pub async fn is_alive(
         &self,
         server_id: &str,
+        server_config: &ServerConfig,
         path: &str,
         redis: Option<&crate::modules::storage::data_store::DataStore>,
     ) -> bool {
-        // Check cache first if Redis store is available
+        // Check cache first if store is available
         if let Some(redis_store) = redis {
             if let Ok(Some(cached_health)) = redis_store.get_health_info(server_id, path).await {
-                return cached_health.is_alive;
+                // Trust mode must learn cert hash at least once.
+                if server_config.h3_only {
+                    let policy = server_config
+                        .cert_hash_policy()
+                        .unwrap_or(CertHashPolicy::ValidCert);
+                    let needs_fresh = matches!(policy, CertHashPolicy::Trust)
+                        && cached_health.observed_cert_hash.is_none();
+                    if !needs_fresh {
+                        return cached_health.is_alive;
+                    }
+                } else {
+                    return cached_health.is_alive;
+                }
             }
         }
 
@@ -135,6 +150,7 @@ impl ServerImpl {
                         is_alive: false,
                         file_size: None,
                         last_check: chrono::Utc::now().timestamp() as u64,
+                        observed_cert_hash: None,
                     };
                     let _ = redis_store
                         .set_health_info(server_id, path, &health_info)
@@ -143,46 +159,81 @@ impl ServerImpl {
                 return false;
             }
         };
-        let ret = crate::container::REQWEST_CLIENT
-            .get(check_url.clone())
-            .header("range", "bytes=0-255")
-            .send()
-            .await;
-        let ret = match ret {
-            Ok(response) => response,
-            Err(e) => {
-                warn!("Keepalive request failed for URL {}: {:?}", check_url, e);
-                // Cache negative result
-                if let Some(redis_store) = redis {
-                    let health_info = HealthInfo {
-                        is_alive: false,
-                        file_size: None,
-                        last_check: chrono::Utc::now().timestamp() as u64,
-                    };
-                    let _ = redis_store
-                        .set_health_info(server_id, path, &health_info)
-                        .await;
+
+        let (is_alive, file_size, observed_cert_hash) = if server_config.h3_only {
+            let policy = match server_config.cert_hash_policy() {
+                Ok(CertHashPolicy::ValidCert) => {
+                    crate::modules::network::http3_probe::CertVerifyPolicy::ValidCert
                 }
-                return false;
+                Ok(CertHashPolicy::Trust) => {
+                    crate::modules::network::http3_probe::CertVerifyPolicy::Trust
+                }
+                Ok(CertHashPolicy::PinnedHex(bytes)) => {
+                    crate::modules::network::http3_probe::CertVerifyPolicy::PinnedHex(bytes)
+                }
+                Err(e) => {
+                    warn!(
+                        "Invalid cert_hash policy for server {} (treat as valid_cert): {}",
+                        server_id, e
+                    );
+                    crate::modules::network::http3_probe::CertVerifyPolicy::ValidCert
+                }
+            };
+
+            match crate::modules::network::http3_probe::probe_h3(&check_url, policy, 5).await {
+                Ok(result) => (result.is_alive, result.file_size, result.observed_cert_hash),
+                Err(e) => {
+                    warn!(
+                        "HTTP/3 keepalive probe failed for URL {}: {:?}",
+                        check_url, e
+                    );
+                    (false, None, None)
+                }
             }
-        };
-        let is_alive = ret.status().is_success();
-        let headers = ret.headers().clone();
-
-        if !is_alive {
-            let status = ret.status();
-            let body = ret.text().await.unwrap_or_default();
-            warn!(
-                "Keepalive check failed for URL {}: status {} / {}",
-                check_url, status, body
-            );
-        }
-
-        // 从响应中提取文件大小信息
-        let file_size = if is_alive {
-            extract_file_size_from_response(&headers)
         } else {
-            None
+            let ret = crate::container::REQWEST_CLIENT
+                .get(check_url.clone())
+                .header("range", "bytes=0-255")
+                .send()
+                .await;
+            let ret = match ret {
+                Ok(response) => response,
+                Err(e) => {
+                    warn!("Keepalive request failed for URL {}: {:?}", check_url, e);
+                    // Cache negative result
+                    if let Some(redis_store) = redis {
+                        let health_info = HealthInfo {
+                            is_alive: false,
+                            file_size: None,
+                            last_check: chrono::Utc::now().timestamp() as u64,
+                            observed_cert_hash: None,
+                        };
+                        let _ = redis_store
+                            .set_health_info(server_id, path, &health_info)
+                            .await;
+                    }
+                    return false;
+                }
+            };
+            let is_alive = ret.status().is_success();
+            let headers = ret.headers().clone();
+
+            if !is_alive {
+                let status = ret.status();
+                let body = ret.text().await.unwrap_or_default();
+                warn!(
+                    "Keepalive check failed for URL {}: status {} / {}",
+                    check_url, status, body
+                );
+            }
+
+            let file_size = if is_alive {
+                extract_file_size_from_response(&headers)
+            } else {
+                None
+            };
+
+            (is_alive, file_size, None)
         };
 
         // 创建健康信息并缓存
@@ -190,6 +241,7 @@ impl ServerImpl {
             is_alive,
             file_size,
             last_check: chrono::Utc::now().timestamp() as u64,
+            observed_cert_hash,
         };
 
         if let Some(redis_store) = redis {

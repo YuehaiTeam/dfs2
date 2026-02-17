@@ -104,6 +104,10 @@ pub struct FlowContext {
     pub client_ip: Option<IpAddr>,
     pub session_id: Option<String>,
     pub extras: serde_json::Value,
+    /// Whether the client supports HTTP/3 (derived from UA + X-DFS-Override header).
+    /// Defaults to `false` for backward compatibility.
+    #[serde(default)]
+    pub h3_capable: bool,
 }
 
 /// 执行选项 - "如何访问"
