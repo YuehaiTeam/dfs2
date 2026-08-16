@@ -1,4 +1,4 @@
-use crate::models::{CdnRecord, Session};
+use crate::models::{CdnRecord, Session, SessionKind};
 use crate::modules::server::HealthInfo;
 use crate::modules::storage::data_store::{
     CacheMetadata, DataStoreBackend, RingBufferMeta, SessionStats,
@@ -27,6 +27,24 @@ impl RedisDataStore {
             }
         }
         format!("{namespace}:{key}")
+    }
+
+    fn session_ttl_seconds(session: &Session) -> i64 {
+        if session.kind == SessionKind::Direct {
+            let now = chrono::Utc::now().timestamp() as u64;
+            let cleanup_interval = std::env::var("SESSION_CLEANUP_INTERVAL_MIN")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(5)
+                * 60;
+            return session
+                .expires_at
+                .unwrap_or(now)
+                .saturating_sub(now)
+                .saturating_add(cleanup_interval)
+                .max(60) as i64;
+        }
+        3600
     }
 }
 
@@ -67,7 +85,17 @@ impl DataStoreBackend for RedisDataStore {
                 serde_json::to_string(&session.extras).map_err(|e| e.to_string())?,
             )
             .hset(&session_key, "created_at", session.created_at)
-            .expire(&session_key, 3600);
+            .hset(
+                &session_key,
+                "kind",
+                serde_json::to_string(&session.kind).map_err(|e| e.to_string())?,
+            )
+            .hset(
+                &session_key,
+                "expires_at",
+                serde_json::to_string(&session.expires_at).map_err(|e| e.to_string())?,
+            )
+            .expire(&session_key, Self::session_ttl_seconds(session));
 
         // 初始化所有chunk的下载计数为0
         for chunk in &session.chunks {
@@ -77,7 +105,7 @@ impl DataStoreBackend for RedisDataStore {
             );
             pipe.hset(&counts_key, chunk, 0);
         }
-        pipe.expire(&counts_key, 3600);
+        pipe.expire(&counts_key, Self::session_ttl_seconds(session));
 
         let _: () = pipe
             .query_async(&mut conn)
@@ -95,7 +123,17 @@ impl DataStoreBackend for RedisDataStore {
         let key = self.redis_key("session", sid);
 
         // 使用Pipeline一次获取所有字段
-        let (resource_id, version, chunks, sub_path, cdn_records, extras, created_at): (
+        let (
+            resource_id,
+            version,
+            chunks,
+            sub_path,
+            cdn_records,
+            extras,
+            created_at,
+            kind,
+            expires_at,
+        ): (
             Option<String>,
             Option<String>,
             Option<String>,
@@ -103,6 +141,8 @@ impl DataStoreBackend for RedisDataStore {
             Option<String>,
             Option<String>,
             Option<u64>,
+            Option<String>,
+            Option<String>,
         ) = redis::pipe()
             .atomic()
             .hget(&key, "resource_id")
@@ -112,6 +152,8 @@ impl DataStoreBackend for RedisDataStore {
             .hget(&key, "cdn_records")
             .hget(&key, "extras")
             .hget(&key, "created_at")
+            .hget(&key, "kind")
+            .hget(&key, "expires_at")
             .query_async(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
@@ -134,6 +176,10 @@ impl DataStoreBackend for RedisDataStore {
                     cdn_records,
                     extras,
                     created_at: created_at.unwrap_or(0), // 如果没有created_at字段，默认为0
+                    kind: kind
+                        .and_then(|value| serde_json::from_str(&value).ok())
+                        .unwrap_or_default(),
+                    expires_at: expires_at.and_then(|value| serde_json::from_str(&value).ok()),
                 }))
             }
             _ => Ok(None),
@@ -182,11 +228,17 @@ impl DataStoreBackend for RedisDataStore {
             return Ok(None); // 无效的chunk
         }
 
-        // 增加下载计数并刷新过期时间
+        let ttl = self
+            .get_session(sid)
+            .await?
+            .map(|session| Self::session_ttl_seconds(&session))
+            .unwrap_or(3600);
+
+        // 增加下载计数并保持会话的生命周期
         let count: [u32; 2] = redis::pipe()
             .atomic()
             .hincr(&counts_key, chunk, 1)
-            .expire(&counts_key, 3600)
+            .expire(&counts_key, ttl)
             .query_async(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
@@ -203,11 +255,17 @@ impl DataStoreBackend for RedisDataStore {
         let session_key = self.redis_key("session", sid);
         let counts_key = self.redis_key("counts", sid);
 
-        // 同时刷新session和下载计数的过期时间
+        let ttl = self
+            .get_session(sid)
+            .await?
+            .map(|session| Self::session_ttl_seconds(&session))
+            .unwrap_or(3600);
+
+        // Direct session 使用固定到期时间，Chunk session 保持原有刷新行为。
         let _: () = redis::pipe()
             .atomic()
-            .expire(&session_key, 3600)
-            .expire(&counts_key, 3600)
+            .expire(&session_key, ttl)
+            .expire(&counts_key, ttl)
             .query_async(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
@@ -239,6 +297,11 @@ impl DataStoreBackend for RedisDataStore {
             .await
             .map_err(|e| e.to_string())?;
         let key = self.redis_key("session", sid);
+        let ttl = self
+            .get_session(sid)
+            .await?
+            .map(|session| Self::session_ttl_seconds(&session))
+            .unwrap_or(3600);
 
         // 先获取现有记录
         let cdn_records: Option<String> = conn
@@ -260,7 +323,7 @@ impl DataStoreBackend for RedisDataStore {
                 "cdn_records",
                 serde_json::to_string(&records).map_err(|e| e.to_string())?,
             )
-            .expire(&key, 3600)
+            .expire(&key, ttl)
             .query_async(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
@@ -941,6 +1004,26 @@ impl DataStoreBackend for RedisDataStore {
 
             // 检查每个会话键的 TTL
             for key in keys {
+                let expires_at: Option<String> = redis::cmd("HGET")
+                    .arg(&key)
+                    .arg("expires_at")
+                    .query_async(&mut conn)
+                    .await
+                    .ok();
+                let direct_expired = expires_at
+                    .and_then(|value| serde_json::from_str::<Option<u64>>(&value).ok())
+                    .flatten()
+                    .is_some_and(|expires_at| chrono::Utc::now().timestamp() as u64 >= expires_at);
+
+                if direct_expired {
+                    if let Some(session_id) = self.extract_session_id(&key) {
+                        if let Ok(Some(session_info)) = self.get_session_info(&session_id).await {
+                            expired_sessions.push(session_info);
+                        }
+                    }
+                    continue;
+                }
+
                 match redis::cmd("TTL")
                     .arg(&key)
                     .query_async::<i64>(&mut conn)

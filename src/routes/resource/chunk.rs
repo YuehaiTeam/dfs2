@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::error::DfsError;
 use crate::modules::network::RealConnectInfo;
-use crate::modules::network::h3_capability::compute_h3_capable;
+use crate::modules::network::capabilities::compute_capabilities;
 use crate::responses::{ApiResponse, CdnUrlResponse, ErrorResponse, ResponseData};
 use crate::{container::AppContext, modules::external::geolocation};
 use crate::{record_flow_metrics, record_request_metrics};
@@ -54,9 +54,13 @@ pub async fn get_cdn(
         .get("range")
         .ok_or_else(|| DfsError::invalid_input("range", "Range parameter is required"))?;
 
+    let count_key = crate::services::SessionService::scoped_download_key(
+        session.sub_path.as_deref(),
+        range_str,
+    );
     let _count = ctx
         .session_service
-        .check_download_limit(&sessionid, range_str)
+        .check_download_limit(&sessionid, &count_key)
         .await?;
 
     // 解析ranges参数
@@ -129,7 +133,7 @@ pub async fn get_cdn(
         cdn_full_range: false,
     };
 
-    let h3_capable = compute_h3_capable(
+    let capabilities = compute_capabilities(
         headers.get("X-DFS-Override").and_then(|v| v.to_str().ok()),
         headers.get("user-agent").and_then(|v| v.to_str().ok()),
     );
@@ -145,7 +149,7 @@ pub async fn get_cdn(
             file_size,
             flow_list,
             &options,
-            h3_capable,
+            capabilities,
         )
         .await;
     let resource_path = if let Some(ref sub_path_val) = session.sub_path {

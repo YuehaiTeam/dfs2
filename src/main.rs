@@ -30,7 +30,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validation::ConfigValidator;
 
-use crate::commands::{analyze, prometheus_config, rclone_config};
+use crate::commands::{analyze, dfsync_servers, prometheus_config, rclone_config};
 use crate::modules::{analytics, network::RealConnectInfo};
 
 /// DFS2 - Distributed File System Server
@@ -67,6 +67,15 @@ enum Commands {
     },
     /// Generate rclone configuration
     GenerateRclone {
+        /// Filter servers by profile (e.g., "minio")
+        #[arg(long, help = "Filter servers by profile")]
+        profile: Option<String>,
+        /// Output file path, use "-" for stdout
+        #[arg(short = 'o', long, help = "Output file path", default_value = "-")]
+        output: String,
+    },
+    /// Generate dfsync servers YAML
+    GenerateDfsyncServers {
         /// Filter servers by profile (e.g., "minio")
         #[arg(long, help = "Filter servers by profile")]
         profile: Option<String>,
@@ -175,6 +184,32 @@ async fn handle_generate_rclone(profile_filter: Option<&str>, output_path: &str)
     }
 }
 
+async fn handle_generate_dfsync_servers(
+    profile_filter: Option<&str>,
+    output_path: &str,
+) -> DfsResult<()> {
+    // 直接读取配置文件，跳过插件加载和验证
+    let config_path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "config.yaml".to_string());
+    let content = tokio::fs::read_to_string(config_path).await.map_err(|e| {
+        error!("Failed to read configuration file: {}", e);
+        DfsError::internal_error(format!("Configuration file error: {e}"))
+    })?;
+    let config: config::AppConfig = serde_yaml::from_str(&content).map_err(|e| {
+        error!("Failed to parse configuration: {}", e);
+        DfsError::internal_error(format!("Configuration parse error: {e}"))
+    })?;
+
+    match dfsync_servers::generate_dfsync_servers(&config, profile_filter) {
+        Ok(output) => write_output(&output, output_path).await,
+        Err(e) => {
+            error!("Failed to generate dfsync servers: {}", e);
+            Err(DfsError::internal_error(format!(
+                "dfsync servers generation error: {e}"
+            )))
+        }
+    }
+}
+
 async fn handle_validate() -> DfsResult<()> {
     info!("运行配置验证模式...");
 
@@ -208,6 +243,8 @@ async fn handle_validate() -> DfsResult<()> {
 async fn main() -> DfsResult<()> {
     dotenv().ok();
 
+    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+
     // 解析命令行参数
     let args = Args::parse();
 
@@ -231,6 +268,9 @@ async fn main() -> DfsResult<()> {
         }
         Some(Commands::GenerateRclone { profile, output }) => {
             return handle_generate_rclone(profile.as_deref(), &output).await;
+        }
+        Some(Commands::GenerateDfsyncServers { profile, output }) => {
+            return handle_generate_dfsync_servers(profile.as_deref(), &output).await;
         }
         Some(Commands::Validate) => {
             return handle_validate().await;
@@ -311,6 +351,22 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
         .start_background_task()
         .await;
     info!("Version updater background task started");
+
+    let version_file_service = std::sync::Arc::new(services::VersionFileService::new(
+        app_container.shared_config.clone(),
+        app_container.data_store.clone(),
+        app_context.resource_service.clone(),
+    ));
+    match version_file_service.census_all(false).await {
+        Ok(errors) => {
+            for error in &errors {
+                warn!("Version-file census: {}", error);
+            }
+        }
+        Err(e) => warn!("Initial version-file census failed: {}", e),
+    }
+    version_file_service.start_background_task().await;
+    info!("Version-file census background task started");
 
     // 启动会话清理任务
     let cleanup_task = std::sync::Arc::new(analytics::SessionCleanupTask::new(

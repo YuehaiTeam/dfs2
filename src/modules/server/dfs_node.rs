@@ -2,8 +2,15 @@ use anyhow::Result;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::error;
+use tracing::{error, warn};
 use url::Url;
+
+const ZERO_UUID: &str = "00000000000000000000000000000000";
+
+/// Validate that a string is a valid 32-character hex UUID
+fn is_valid_uuid_hex(uuid: &str) -> bool {
+    uuid.len() == 32 && uuid.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
 #[derive(Clone, Debug)]
 pub struct DfsNodeSigner {
@@ -42,13 +49,21 @@ impl DfsNodeSigner {
         sign_token: &str,
         ranges: Option<&[(u32, u32)]>,
     ) -> String {
-        // Build HMAC message: {uuid}\n/path/to/file\n{4byte hex unix过期时间}\n{ranges...}
+        // Validate UUID: must be 32 hex chars, fallback to all-zeros
+        let uuid = if is_valid_uuid_hex(uuid) {
+            uuid
+        } else {
+            warn!("Invalid UUID format '{}', falling back to zero UUID", uuid);
+            ZERO_UUID
+        };
+
+        // Build HMAC message: {uuid}\n/path/to/file\n{8byte hex expire}\n{ranges...}
         let mut message = format!("{uuid}\n{path}\n{expire_time:08x}\n");
 
-        // Add ranges if provided
+        // Add ranges if provided (hex format: {:08x}{:08x} per range)
         if let Some(ranges) = ranges {
             for (start, end) in ranges {
-                message.push_str(&format!("{start}-{end}\n"));
+                message.push_str(&format!("{start:08x}{end:08x}"));
             }
         }
 
@@ -71,10 +86,10 @@ impl DfsNodeSigner {
         // Build final signature: {uuid}{expire_time}{hmac}{ranges...}
         let mut signature = format!("{uuid}{expire_time:08x}{hmac_hex}");
 
-        // Append ranges to signature
+        // Append ranges to signature (hex format: {:08x}{:08x} per range)
         if let Some(ranges) = ranges {
             for (start, end) in ranges {
-                signature.push_str(&format!("{start}-{end}"));
+                signature.push_str(&format!("{start:08x}{end:08x}"));
             }
         }
 
@@ -190,8 +205,28 @@ mod tests {
         let signature =
             DfsNodeSigner::create_signature(uuid, path, expire_time, sign_token, Some(&ranges));
 
-        // The signature should end with the ranges
-        assert!(signature.ends_with("0-255256-511"));
+        // The signature should end with hex-encoded ranges
+        assert!(signature.ends_with("000000000000ff00000100000001ff"));
+    }
+
+    #[test]
+    fn test_create_signature_invalid_uuid_fallback() {
+        let path = "/test/file.txt";
+        let expire_time = 0x12345678;
+        let sign_token = "test_token";
+
+        // Non-hex UUID should fallback to zero UUID
+        let sig1 = DfsNodeSigner::create_signature("myapp", path, expire_time, sign_token, None);
+        assert!(sig1.starts_with(ZERO_UUID));
+
+        // Too short UUID should fallback
+        let sig2 = DfsNodeSigner::create_signature("abcd1234", path, expire_time, sign_token, None);
+        assert!(sig2.starts_with(ZERO_UUID));
+
+        // Valid 32-hex UUID should be used as-is
+        let valid_uuid = "abcdef01234567890abcdef012345678";
+        let sig3 = DfsNodeSigner::create_signature(valid_uuid, path, expire_time, sign_token, None);
+        assert!(sig3.starts_with(valid_uuid));
     }
 
     #[test]

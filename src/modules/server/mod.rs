@@ -4,8 +4,11 @@ use std::collections::BTreeMap;
 use tracing::warn;
 
 use crate::config::{CertHashPolicy, ServerConfig};
+use crate::modules::network::h3_middleware::{CertVerifyPolicy, H3TransportInfo};
 
 pub mod dfs_node;
+pub mod dfs_sftp;
+pub mod dfs_wt;
 pub mod git_lfs;
 pub mod s3;
 
@@ -17,6 +20,28 @@ pub struct HealthInfo {
     pub last_check: u64,
     #[serde(default)]
     pub observed_cert_hash: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+}
+
+impl HealthInfo {
+    pub fn connectivity(is_alive: bool, file_size: Option<u64>) -> Self {
+        Self {
+            is_alive,
+            file_size,
+            last_check: chrono::Utc::now().timestamp() as u64,
+            observed_cert_hash: None,
+            content_hash: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FileProbe {
+    pub is_alive: bool,
+    pub file_size: Option<u64>,
+    pub observed_cert_hash: Option<String>,
+    pub body: Option<Vec<u8>>,
 }
 
 /// 从HTTP响应中提取文件大小
@@ -40,11 +65,40 @@ fn extract_file_size_from_response(headers: &HeaderMap) -> Option<u64> {
         .and_then(|s| s.parse().ok())
 }
 
+fn to_http3_url(url: &str) -> anyhow::Result<String> {
+    let parsed = url::Url::parse(url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("probe URL is missing a host"))?;
+    let host = if host.contains(':') {
+        format!("[{}]", host.trim_start_matches('[').trim_end_matches(']'))
+    } else {
+        host.to_string()
+    };
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let authority = if port == 443 {
+        host
+    } else {
+        format!("{host}:{port}")
+    };
+    let mut path = parsed.path().to_string();
+    if path.is_empty() {
+        path.push('/');
+    }
+    if let Some(query) = parsed.query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    Ok(format!("http3://{authority}{path}"))
+}
+
 #[derive(Clone, Debug)]
 pub enum ServerImpl {
     Direct(String),
     S3(s3::S3Signer),
     DfsNode(dfs_node::DfsNodeSigner),
+    DfsWt(dfs_wt::DfsWtSigner),
+    DfsSftp(dfs_sftp::DfsSftpSigner),
     GitLfs(git_lfs::GitLfsSigner),
 }
 
@@ -63,6 +117,15 @@ impl ServerImpl {
             "git_lfs" => {
                 let signer = git_lfs::GitLfsSigner::from_url(&config.url)?;
                 Ok(ServerImpl::GitLfs(signer))
+            }
+            "dfs_webtransport" => {
+                let signer = dfs_wt::DfsWtSigner::from_url(&config.url)?;
+                Ok(ServerImpl::DfsWt(signer))
+            }
+            "dfs_sftp" => {
+                let fingerprint = config.ssh_fingerprint.as_deref().unwrap_or("");
+                let signer = dfs_sftp::DfsSftpSigner::from_url(&config.url, fingerprint)?;
+                Ok(ServerImpl::DfsSftp(signer))
             }
             _ => Err(anyhow::anyhow!(
                 "Unsupported server type: {}",
@@ -99,6 +162,14 @@ impl ServerImpl {
                 signer.generate_presigned_url(path, Some(headers))
             }
             ServerImpl::DfsNode(signer) => {
+                let session_id = session_id.unwrap_or("00000000000000000000000000000000");
+                signer.generate_presigned_url(path, session_id, ranges)
+            }
+            ServerImpl::DfsWt(signer) => {
+                let session_id = session_id.unwrap_or("00000000000000000000000000000000");
+                signer.generate_presigned_url(path, session_id, ranges)
+            }
+            ServerImpl::DfsSftp(signer) => {
                 let session_id = session_id.unwrap_or("00000000000000000000000000000000");
                 signer.generate_presigned_url(path, session_id, ranges)
             }
@@ -146,12 +217,7 @@ impl ServerImpl {
                 warn!("Keepalive URL generation failed for path {}: {:?}", path, e);
                 // Cache negative result
                 if let Some(redis_store) = redis {
-                    let health_info = HealthInfo {
-                        is_alive: false,
-                        file_size: None,
-                        last_check: chrono::Utc::now().timestamp() as u64,
-                        observed_cert_hash: None,
-                    };
+                    let health_info = HealthInfo::connectivity(false, None);
                     let _ = redis_store
                         .set_health_info(server_id, path, &health_info)
                         .await;
@@ -160,81 +226,162 @@ impl ServerImpl {
             }
         };
 
-        let (is_alive, file_size, observed_cert_hash) = if server_config.h3_only {
-            let policy = match server_config.cert_hash_policy() {
-                Ok(CertHashPolicy::ValidCert) => {
-                    crate::modules::network::http3_probe::CertVerifyPolicy::ValidCert
-                }
-                Ok(CertHashPolicy::Trust) => {
-                    crate::modules::network::http3_probe::CertVerifyPolicy::Trust
-                }
-                Ok(CertHashPolicy::PinnedHex(bytes)) => {
-                    crate::modules::network::http3_probe::CertVerifyPolicy::PinnedHex(bytes)
-                }
-                Err(e) => {
-                    warn!(
-                        "Invalid cert_hash policy for server {} (treat as valid_cert): {}",
-                        server_id, e
-                    );
-                    crate::modules::network::http3_probe::CertVerifyPolicy::ValidCert
-                }
-            };
-
-            match crate::modules::network::http3_probe::probe_h3(&check_url, policy, 5).await {
-                Ok(result) => (result.is_alive, result.file_size, result.observed_cert_hash),
-                Err(e) => {
-                    warn!(
-                        "HTTP/3 keepalive probe failed for URL {}: {:?}",
-                        check_url, e
-                    );
-                    (false, None, None)
-                }
-            }
-        } else {
-            let ret = crate::container::REQWEST_CLIENT
-                .get(check_url.clone())
-                .header("range", "bytes=0-255")
-                .send()
-                .await;
-            let ret = match ret {
-                Ok(response) => response,
-                Err(e) => {
-                    warn!("Keepalive request failed for URL {}: {:?}", check_url, e);
-                    // Cache negative result
-                    if let Some(redis_store) = redis {
-                        let health_info = HealthInfo {
-                            is_alive: false,
-                            file_size: None,
-                            last_check: chrono::Utc::now().timestamp() as u64,
-                            observed_cert_hash: None,
-                        };
-                        let _ = redis_store
-                            .set_health_info(server_id, path, &health_info)
-                            .await;
+        let (is_alive, file_size, observed_cert_hash) =
+            if server_config.h3_only || server_config.r#type == "dfs_webtransport" {
+                let policy = match server_config.cert_hash_policy() {
+                    Ok(CertHashPolicy::ValidCert) => CertVerifyPolicy::ValidCert,
+                    Ok(CertHashPolicy::Trust) => CertVerifyPolicy::Trust,
+                    Ok(CertHashPolicy::PinnedHex(bytes)) => CertVerifyPolicy::PinnedHex(bytes),
+                    Err(e) => {
+                        warn!(
+                            "Invalid cert_hash policy for server {} (treat as valid_cert): {}",
+                            server_id, e
+                        );
+                        CertVerifyPolicy::ValidCert
                     }
-                    return false;
+                };
+
+                let probe_url = match to_http3_url(&check_url) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        warn!("Invalid HTTP/3 keepalive URL {}: {:?}", check_url, e);
+                        return false;
+                    }
+                };
+                match crate::container::FETCH_CLIENT
+                    .get(&probe_url)
+                    .with_extension(policy)
+                    .header("range", "bytes=0-255")
+                    .send()
+                    .await
+                {
+                    Ok(response) => {
+                        let is_alive = response.status().is_success();
+                        let file_size = if is_alive {
+                            extract_file_size_from_response(response.headers())
+                        } else {
+                            None
+                        };
+                        let observed_cert_hash = response
+                            .extensions()
+                            .get::<H3TransportInfo>()
+                            .and_then(|info| info.observed_cert_hash.clone());
+                        if !is_alive {
+                            warn!(
+                                "HTTP/3 keepalive check failed for URL {}: status {}",
+                                check_url,
+                                response.status()
+                            );
+                        }
+                        (is_alive, file_size, observed_cert_hash)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "HTTP/3 keepalive probe failed for URL {}: {:?}",
+                            check_url, e
+                        );
+                        (false, None, None)
+                    }
                 }
-            };
-            let is_alive = ret.status().is_success();
-            let headers = ret.headers().clone();
+            } else if server_config.ssh_only || server_config.r#type == "dfs_sftp" {
+                // SSH/SFTP health check: rewrite URL then use the multi-protocol client.
+                let probe_caps = crate::modules::network::capabilities::ClientCapabilities {
+                    h3: true,
+                    wrtc: true,
+                    wt: true,
+                    ssh: true,
+                    sftp: true,
+                };
+                let rewritten = crate::modules::network::capabilities::rewrite_url(
+                    &check_url,
+                    server_config,
+                    None,
+                    &probe_caps,
+                )
+                .unwrap_or_else(|_| check_url.clone());
 
-            if !is_alive {
-                let status = ret.status();
-                let body = ret.text().await.unwrap_or_default();
-                warn!(
-                    "Keepalive check failed for URL {}: status {} / {}",
-                    check_url, status, body
-                );
-            }
+                let ret = crate::container::FETCH_CLIENT
+                    .get(&rewritten)
+                    .header("range", "bytes=0-255")
+                    .send()
+                    .await;
+                let ret = match ret {
+                    Ok(response) => response,
+                    Err(e) => {
+                        let safe_url = rewritten.split('#').next().unwrap_or(&rewritten);
+                        warn!(
+                            "SSH/SFTP keepalive request failed for URL {}: {:?}",
+                            safe_url, e
+                        );
+                        if let Some(redis_store) = redis {
+                            let health_info = HealthInfo::connectivity(false, None);
+                            let _ = redis_store
+                                .set_health_info(server_id, path, &health_info)
+                                .await;
+                        }
+                        return false;
+                    }
+                };
+                let is_alive = ret.status().is_success();
+                let headers = ret.headers().clone();
 
-            let file_size = if is_alive {
-                extract_file_size_from_response(&headers)
+                if !is_alive {
+                    let status = ret.status();
+                    let body = ret.text().await.unwrap_or_default();
+                    let safe_url = rewritten.split('#').next().unwrap_or(&rewritten);
+                    warn!(
+                        "SSH/SFTP keepalive check failed for URL {}: status {} / {}",
+                        safe_url, status, body
+                    );
+                }
+
+                let file_size = if is_alive {
+                    extract_file_size_from_response(&headers)
+                } else {
+                    None
+                };
+
+                (is_alive, file_size, None)
             } else {
-                None
-            };
+                let ret = crate::container::FETCH_CLIENT
+                    .get(check_url.clone())
+                    .header("range", "bytes=0-255")
+                    .send()
+                    .await;
+                let ret = match ret {
+                    Ok(response) => response,
+                    Err(e) => {
+                        warn!("Keepalive request failed for URL {}: {:?}", check_url, e);
+                        // Cache negative result
+                        if let Some(redis_store) = redis {
+                            let health_info = HealthInfo::connectivity(false, None);
+                            let _ = redis_store
+                                .set_health_info(server_id, path, &health_info)
+                                .await;
+                        }
+                        return false;
+                    }
+                };
+                let is_alive = ret.status().is_success();
+                let headers = ret.headers().clone();
 
-            (is_alive, file_size, None)
-        };
+                if !is_alive {
+                    let status = ret.status();
+                    let body = ret.text().await.unwrap_or_default();
+                    warn!(
+                        "Keepalive check failed for URL {}: status {} / {}",
+                        check_url, status, body
+                    );
+                }
+
+                let file_size = if is_alive {
+                    extract_file_size_from_response(&headers)
+                } else {
+                    None
+                };
+
+                (is_alive, file_size, None)
+            };
 
         // 创建健康信息并缓存
         let health_info = HealthInfo {
@@ -242,6 +389,7 @@ impl ServerImpl {
             file_size,
             last_check: chrono::Utc::now().timestamp() as u64,
             observed_cert_hash,
+            content_hash: None,
         };
 
         if let Some(redis_store) = redis {
@@ -251,5 +399,193 @@ impl ServerImpl {
         }
 
         is_alive
+    }
+
+    /// Fetch a small file in full (used for version-file content comparison).
+    pub async fn fetch_small_file(
+        &self,
+        server_config: &ServerConfig,
+        path: &str,
+        redis: Option<&crate::modules::storage::data_store::DataStore>,
+        max_bytes: u64,
+    ) -> FileProbe {
+        let check_url = match self.url(path, None, None, redis).await {
+            Ok(url) => url,
+            Err(e) => {
+                warn!("Version-file URL generation failed for path {}: {:?}", path, e);
+                return FileProbe {
+                    is_alive: false,
+                    file_size: None,
+                    observed_cert_hash: None,
+                    body: None,
+                };
+            }
+        };
+
+        let (is_alive, file_size, observed_cert_hash, body) =
+            execute_full_probe(&check_url, server_config, max_bytes).await;
+        FileProbe {
+            is_alive,
+            file_size,
+            observed_cert_hash,
+            body,
+        }
+    }
+}
+
+async fn read_limited_body(
+    response: reqwest::Response,
+    max_bytes: u64,
+) -> (Option<u64>, Option<Vec<u8>>) {
+    let file_size = extract_file_size_from_response(response.headers())
+        .or_else(|| response.content_length());
+    if file_size.is_some_and(|size| size > max_bytes) {
+        return (file_size, None);
+    }
+    match response.bytes().await {
+        Ok(bytes) if bytes.len() as u64 <= max_bytes => {
+            let len = file_size.or(Some(bytes.len() as u64));
+            (len, Some(bytes.to_vec()))
+        }
+        Ok(bytes) => (file_size.or(Some(bytes.len() as u64)), None),
+        Err(e) => {
+            warn!("Failed to read probe body: {:?}", e);
+            (file_size, None)
+        }
+    }
+}
+
+async fn execute_full_probe(
+    check_url: &str,
+    server_config: &ServerConfig,
+    max_bytes: u64,
+) -> (bool, Option<u64>, Option<String>, Option<Vec<u8>>) {
+    if server_config.h3_only || server_config.r#type == "dfs_webtransport" {
+        let policy = match server_config.cert_hash_policy() {
+            Ok(CertHashPolicy::ValidCert) => CertVerifyPolicy::ValidCert,
+            Ok(CertHashPolicy::Trust) => CertVerifyPolicy::Trust,
+            Ok(CertHashPolicy::PinnedHex(bytes)) => CertVerifyPolicy::PinnedHex(bytes),
+            Err(e) => {
+                warn!(
+                    "Invalid cert_hash policy for full probe (treat as valid_cert): {}",
+                    e
+                );
+                CertVerifyPolicy::ValidCert
+            }
+        };
+        let probe_url = match to_http3_url(check_url) {
+            Ok(url) => url,
+            Err(e) => {
+                warn!("Invalid HTTP/3 version-file URL {}: {:?}", check_url, e);
+                return (false, None, None, None);
+            }
+        };
+        match crate::container::FETCH_CLIENT
+            .get(&probe_url)
+            .with_extension(policy)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let observed_cert_hash = response
+                    .extensions()
+                    .get::<H3TransportInfo>()
+                    .and_then(|info| info.observed_cert_hash.clone());
+                if !response.status().is_success() {
+                    warn!(
+                        "HTTP/3 version-file probe failed for URL {}: status {}",
+                        check_url,
+                        response.status()
+                    );
+                    return (false, None, observed_cert_hash, None);
+                }
+                let (file_size, body) = read_limited_body(response, max_bytes).await;
+                (true, file_size, observed_cert_hash, body)
+            }
+            Err(e) => {
+                warn!("HTTP/3 version-file probe failed for URL {}: {:?}", check_url, e);
+                (false, None, None, None)
+            }
+        }
+    } else if server_config.ssh_only || server_config.r#type == "dfs_sftp" {
+        let probe_caps = crate::modules::network::capabilities::ClientCapabilities {
+            h3: true,
+            wrtc: true,
+            wt: true,
+            ssh: true,
+            sftp: true,
+        };
+        let rewritten = crate::modules::network::capabilities::rewrite_url(
+            check_url,
+            server_config,
+            None,
+            &probe_caps,
+        )
+        .unwrap_or_else(|_| check_url.to_string());
+        match crate::container::FETCH_CLIENT.get(&rewritten).send().await {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    let safe_url = rewritten.split('#').next().unwrap_or(&rewritten);
+                    warn!(
+                        "SSH/SFTP version-file probe failed for URL {}: status {} / {}",
+                        safe_url, status, body
+                    );
+                    return (false, None, None, None);
+                }
+                let (file_size, body) = read_limited_body(response, max_bytes).await;
+                (true, file_size, None, body)
+            }
+            Err(e) => {
+                let safe_url = rewritten.split('#').next().unwrap_or(&rewritten);
+                warn!(
+                    "SSH/SFTP version-file request failed for URL {}: {:?}",
+                    safe_url, e
+                );
+                (false, None, None, None)
+            }
+        }
+    } else {
+        match crate::container::FETCH_CLIENT.get(check_url).send().await {
+            Ok(response) => {
+                if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    warn!(
+                        "Version-file probe failed for URL {}: status {} / {}",
+                        check_url, status, body
+                    );
+                    return (false, None, None, None);
+                }
+                let (file_size, body) = read_limited_body(response, max_bytes).await;
+                (true, file_size, None, body)
+            }
+            Err(e) => {
+                warn!("Version-file request failed for URL {}: {:?}", check_url, e);
+                (false, None, None, None)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_http3_url;
+
+    #[test]
+    fn converts_https_probe_url_to_http3() {
+        assert_eq!(
+            to_http3_url("https://example.com/file?sig=abc").expect("valid probe URL"),
+            "http3://example.com/file?sig=abc"
+        );
+    }
+
+    #[test]
+    fn preserves_non_default_probe_port() {
+        assert_eq!(
+            to_http3_url("https://example.com:8443/file").expect("valid probe URL"),
+            "http3://example.com:8443/file"
+        );
     }
 }

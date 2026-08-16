@@ -64,6 +64,9 @@ fn default_resource_type() -> String {
 fn default_cache_max_age() -> u32 {
     300
 } // 5分钟
+fn default_version_file_split_ttl() -> u32 {
+    300
+}
 
 /// Version provider configuration for dynamic version fetching
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -270,6 +273,13 @@ impl<'js> IntoJs<'js> for ChallengeConfig {
 pub struct ServerConfig {
     pub id: String,
     pub url: String,
+    /// Optional sync endpoint override used by generators (e.g. dfsync servers export).
+    ///
+    /// Typical use case:
+    /// - `url` is for DFS2 runtime signer semantics
+    /// - `sync_url` is for external sync tools expecting direct WebDAV/TUS basic-auth URL
+    #[serde(default)]
+    pub sync_url: Option<String>,
     pub r#type: String,
     /// 可选的健康检查路径，用于验证服务器连接性
     /// 如果未设置，则跳过该服务器的连接性检查
@@ -290,29 +300,159 @@ pub struct ServerConfig {
     /// - 64-char hex: pin to specific leaf cert SHA-256 hash
     #[serde(default)]
     pub cert_hash: Option<String>,
+    /// Whether this server requires SSH tunnel (HTTP over SSH port forwarding).
+    /// Mutually exclusive with h3_only, dfs_webtransport, dfs_rtc, dfs_sftp.
+    #[serde(default)]
+    pub ssh_only: bool,
+    /// SSH host key fingerprint (SHA-256, 64 hex chars). Required when ssh_only=true.
+    /// No "trust" mode — fingerprint must always be pinned.
+    #[serde(default)]
+    pub ssh_fingerprint: Option<String>,
+    /// Internal host for SSH direct-tcpip tunnel target (optional, default "tunnel").
+    #[serde(default)]
+    pub ssh_internal_host: Option<String>,
+    /// Internal port for SSH direct-tcpip tunnel target (optional, default 80).
+    #[serde(default)]
+    pub ssh_internal_port: Option<u16>,
+    /// SSH authentication mode (reserved for future use).
+    /// Currently: "dfs_node" type uses DFS signature as password, others use none-auth.
+    #[serde(default)]
+    pub ssh_auth_mode: Option<String>,
 }
 impl ServerConfig {
-    /// Validate h3_only and cert_hash configuration.
+    /// Whether this server uses QUIC-based transport that requires cert_hash support.
+    fn needs_cert_hash(&self) -> bool {
+        self.h3_only || self.r#type == "dfs_webtransport"
+    }
+
+    /// Validate h3_only / dfs_webtransport / ssh_only transport configuration.
     /// Returns a list of errors and warnings for this server.
-    pub fn validate_h3(&self, server_id: &str) -> (Vec<String>, Vec<String>) {
+    pub fn validate_transport(&self, server_id: &str) -> (Vec<String>, Vec<String>) {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
 
-        if !self.h3_only {
-            // When h3_only=false, warn if cert_hash is set but don't fail
+        // ── SSH-only validation ──
+        if self.ssh_only {
+            // Mutual exclusivity: ssh_only cannot coexist with h3/wt/rtc/sftp
+            if self.h3_only {
+                errors.push(format!(
+                    "Server '{}': ssh_only and h3_only are mutually exclusive",
+                    server_id
+                ));
+            }
+            let stype = self.r#type.as_str();
+            if stype == "dfs_webtransport" || stype == "dfs_rtc" || stype == "dfs_sftp" {
+                errors.push(format!(
+                    "Server '{}': ssh_only is mutually exclusive with type '{}'",
+                    server_id, stype
+                ));
+            }
+
+            // ssh_only requires http:// URL (not https)
+            if !self.url.starts_with("http://") {
+                errors.push(format!(
+                    "Server '{}': ssh_only requires http:// URL scheme, got '{}'",
+                    server_id, self.url
+                ));
+            }
+
+            // ssh_fingerprint is REQUIRED and must be 64 hex chars
+            match &self.ssh_fingerprint {
+                None => {
+                    errors.push(format!(
+                        "Server '{}': ssh_only requires ssh_fingerprint (64 hex chars SHA-256)",
+                        server_id
+                    ));
+                }
+                Some(s) if s.is_empty() => {
+                    errors.push(format!(
+                        "Server '{}': ssh_only requires ssh_fingerprint (64 hex chars SHA-256)",
+                        server_id
+                    ));
+                }
+                Some(s) if s.eq_ignore_ascii_case("trust") => {
+                    errors.push(format!(
+                        "Server '{}': ssh_fingerprint does not support 'trust' mode; must be 64 hex chars",
+                        server_id
+                    ));
+                }
+                Some(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                        errors.push(format!(
+                            "Server '{}': ssh_fingerprint must be exactly 64 hex characters, got '{}'",
+                            server_id, s
+                        ));
+                    }
+                }
+            }
+
+            return (errors, warnings);
+        }
+
+        // ── dfs_sftp type validation ──
+        if self.r#type == "dfs_sftp" {
+            if self.h3_only {
+                errors.push(format!(
+                    "Server '{}': dfs_sftp is mutually exclusive with h3_only",
+                    server_id
+                ));
+            }
+            // dfs_sftp URL must start with sftp://
+            if !self.url.starts_with("sftp://") {
+                errors.push(format!(
+                    "Server '{}': dfs_sftp requires sftp:// URL scheme, got '{}'",
+                    server_id, self.url
+                ));
+            }
+            // ssh_fingerprint is REQUIRED for dfs_sftp (no trust mode)
+            match &self.ssh_fingerprint {
+                None => {
+                    errors.push(format!(
+                        "Server '{}': dfs_sftp requires ssh_fingerprint (64 hex chars SHA-256)",
+                        server_id
+                    ));
+                }
+                Some(s) if s.is_empty() => {
+                    errors.push(format!(
+                        "Server '{}': dfs_sftp requires ssh_fingerprint (64 hex chars SHA-256)",
+                        server_id
+                    ));
+                }
+                Some(s) if s.eq_ignore_ascii_case("trust") => {
+                    errors.push(format!(
+                        "Server '{}': dfs_sftp ssh_fingerprint does not support 'trust' mode; must be 64 hex chars",
+                        server_id
+                    ));
+                }
+                Some(s) => {
+                    let trimmed = s.trim();
+                    if trimmed.len() != 64 || !trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                        errors.push(format!(
+                            "Server '{}': dfs_sftp ssh_fingerprint must be exactly 64 hex characters, got '{}'",
+                            server_id, s
+                        ));
+                    }
+                }
+            }
+            return (errors, warnings);
+        }
+
+        if !self.needs_cert_hash() {
+            // When not a QUIC transport, warn if cert_hash is set but don't fail
             if self.cert_hash.is_some() && !self.cert_hash.as_ref().is_none_or(|s| s.is_empty()) {
                 warnings.push(format!(
-                    "Server '{}': cert_hash is set but h3_only is false; cert_hash will be ignored",
+                    "Server '{}': cert_hash is set but transport does not use it; cert_hash will be ignored",
                     server_id
                 ));
             }
             return (errors, warnings);
         }
 
-        // h3_only=true: validate URL scheme is https
+        // QUIC transport: validate URL scheme is https
         if !self.url.starts_with("https://") {
             errors.push(format!(
-                "Server '{}': h3_only=true requires https:// URL scheme, got '{}'",
+                "Server '{}': QUIC transport requires https:// URL scheme, got '{}'",
                 server_id, self.url
             ));
         }
@@ -326,19 +466,19 @@ impl ServerConfig {
     }
 
     /// Parse and return the validated CertHashPolicy for this server.
-    /// Returns ValidCert if h3_only is false.
+    /// Returns ValidCert if transport doesn't need cert_hash.
     pub fn cert_hash_policy(&self) -> Result<CertHashPolicy, String> {
-        if !self.h3_only {
+        if !self.needs_cert_hash() {
             return Ok(CertHashPolicy::ValidCert);
         }
         CertHashPolicy::from_option(&self.cert_hash)
     }
 
     /// Return the normalized cert_hash string (lowercase hex) for storage/URLs.
-    /// Returns None if not h3_only or if policy is ValidCert/Trust.
+    /// Returns None if transport doesn't need cert_hash or if policy is ValidCert/Trust.
     #[allow(dead_code)]
     pub fn normalized_cert_hash(&self) -> Option<String> {
-        if !self.h3_only {
+        if !self.needs_cert_hash() {
             return None;
         }
         match &self.cert_hash {
@@ -359,6 +499,11 @@ impl<'js> IntoJs<'js> for ServerConfig {
         obj.set("profile", self.profile)?;
         obj.set("h3_only", self.h3_only)?;
         obj.set("cert_hash", self.cert_hash)?;
+        obj.set("ssh_only", self.ssh_only)?;
+        obj.set("ssh_fingerprint", self.ssh_fingerprint)?;
+        obj.set("ssh_internal_host", self.ssh_internal_host)?;
+        obj.set("ssh_internal_port", self.ssh_internal_port)?;
+        obj.set("ssh_auth_mode", self.ssh_auth_mode)?;
         Ok(obj.into())
     }
 }
@@ -407,6 +552,12 @@ pub struct ResourceConfig {
     /// 动态版本提供者配置 (可选)
     #[serde(default)]
     pub version_provider: Option<VersionProviderConfig>,
+    /// Pointer files compared across replicas (optional; type-2 resources only)
+    #[serde(default)]
+    pub version_files: Vec<String>,
+    /// Seconds to tolerate a version-file split (rolling deploy). 0 fails immediately.
+    #[serde(default = "default_version_file_split_ttl")]
+    pub version_file_split_ttl: u32,
 }
 impl<'js> IntoJs<'js> for ResourceConfig {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
@@ -428,6 +579,8 @@ impl<'js> IntoJs<'js> for ResourceConfig {
         if let Some(version_provider) = self.version_provider {
             obj.set("version_provider", version_provider)?;
         }
+        obj.set("version_files", self.version_files)?;
+        obj.set("version_file_split_ttl", self.version_file_split_ttl)?;
         Ok(obj.into())
     }
 }
@@ -479,13 +632,13 @@ impl AppConfig {
         &self.challenge
     }
 
-    /// Validate all server h3_only/cert_hash configurations.
+    /// Validate all server transport (h3_only / dfs_webtransport) configurations.
     /// Returns (errors, warnings).
-    pub fn validate_servers_h3(&self) -> (Vec<String>, Vec<String>) {
+    pub fn validate_servers_transport(&self) -> (Vec<String>, Vec<String>) {
         let mut all_errors = Vec::new();
         let mut all_warnings = Vec::new();
         for (server_id, server_config) in &self.servers {
-            let (errors, warnings) = server_config.validate_h3(server_id);
+            let (errors, warnings) = server_config.validate_transport(server_id);
             all_errors.extend(errors);
             all_warnings.extend(warnings);
         }
@@ -534,8 +687,8 @@ impl AppConfig {
             }
         }
 
-        // Validate h3_only/cert_hash server configurations
-        let (h3_errors, h3_warnings) = config.validate_servers_h3();
+        // Validate transport (h3_only / dfs_webtransport) server configurations
+        let (h3_errors, h3_warnings) = config.validate_servers_transport();
         for w in &h3_warnings {
             warn!("{}", w);
         }
@@ -544,7 +697,7 @@ impl AppConfig {
                 error!("{}", e);
             }
             return Err(anyhow::anyhow!(
-                "Server h3_only/cert_hash validation failed:\n{}",
+                "Server transport validation failed:\n{}",
                 h3_errors.join("\n")
             ));
         }
@@ -688,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn test_server_config_validate_h3_disabled() {
+    fn test_server_config_validate_transport_disabled() {
         let server = ServerConfig {
             id: "test".to_string(),
             url: "http://example.com".to_string(),
@@ -697,13 +850,13 @@ mod tests {
             cert_hash: None,
             ..Default::default()
         };
-        let (errors, warnings) = server.validate_h3("test");
+        let (errors, warnings) = server.validate_transport("test");
         assert!(errors.is_empty());
         assert!(warnings.is_empty());
     }
 
     #[test]
-    fn test_server_config_validate_h3_disabled_with_cert_hash_warns() {
+    fn test_server_config_validate_transport_disabled_with_cert_hash_warns() {
         let server = ServerConfig {
             id: "test".to_string(),
             url: "http://example.com".to_string(),
@@ -712,14 +865,14 @@ mod tests {
             cert_hash: Some("trust".to_string()),
             ..Default::default()
         };
-        let (errors, warnings) = server.validate_h3("test");
+        let (errors, warnings) = server.validate_transport("test");
         assert!(errors.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("ignored"));
     }
 
     #[test]
-    fn test_server_config_validate_h3_enabled_https_ok() {
+    fn test_server_config_validate_transport_h3_enabled_https_ok() {
         let server = ServerConfig {
             id: "test".to_string(),
             url: "https://cdn.example.com".to_string(),
@@ -728,13 +881,13 @@ mod tests {
             cert_hash: Some("trust".to_string()),
             ..Default::default()
         };
-        let (errors, warnings) = server.validate_h3("test");
+        let (errors, warnings) = server.validate_transport("test");
         assert!(errors.is_empty());
         assert!(warnings.is_empty());
     }
 
     #[test]
-    fn test_server_config_validate_h3_enabled_http_fails() {
+    fn test_server_config_validate_transport_h3_enabled_http_fails() {
         let server = ServerConfig {
             id: "test".to_string(),
             url: "http://cdn.example.com".to_string(),
@@ -743,13 +896,13 @@ mod tests {
             cert_hash: None,
             ..Default::default()
         };
-        let (errors, _warnings) = server.validate_h3("test");
+        let (errors, _warnings) = server.validate_transport("test");
         assert!(!errors.is_empty());
         assert!(errors[0].contains("https://"));
     }
 
     #[test]
-    fn test_server_config_validate_h3_enabled_bad_cert_hash() {
+    fn test_server_config_validate_transport_h3_enabled_bad_cert_hash() {
         let server = ServerConfig {
             id: "test".to_string(),
             url: "https://cdn.example.com".to_string(),
@@ -758,9 +911,39 @@ mod tests {
             cert_hash: Some("invalid_value".to_string()),
             ..Default::default()
         };
-        let (errors, _warnings) = server.validate_h3("test");
+        let (errors, _warnings) = server.validate_transport("test");
         assert!(!errors.is_empty());
         assert!(errors[0].contains("cert_hash"));
+    }
+
+    #[test]
+    fn test_server_config_validate_transport_dfs_webtransport_ok() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "https://wt.example.com".to_string(),
+            r#type: "dfs_webtransport".to_string(),
+            h3_only: false,
+            cert_hash: Some("trust".to_string()),
+            ..Default::default()
+        };
+        let (errors, warnings) = server.validate_transport("test");
+        assert!(errors.is_empty());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn test_server_config_validate_transport_dfs_webtransport_http_fails() {
+        let server = ServerConfig {
+            id: "test".to_string(),
+            url: "http://wt.example.com".to_string(),
+            r#type: "dfs_webtransport".to_string(),
+            h3_only: false,
+            cert_hash: Some("trust".to_string()),
+            ..Default::default()
+        };
+        let (errors, _warnings) = server.validate_transport("test");
+        assert!(!errors.is_empty());
+        assert!(errors[0].contains("https://"));
     }
 
     #[test]
@@ -821,7 +1004,7 @@ cert_hash: "trust"
     }
 
     #[test]
-    fn test_app_config_validate_servers_h3() {
+    fn test_app_config_validate_servers_transport() {
         let mut servers = HashMap::new();
         servers.insert(
             "good".to_string(),
@@ -854,7 +1037,7 @@ cert_hash: "trust"
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
         };
-        let (errors, _warnings) = config.validate_servers_h3();
+        let (errors, _warnings) = config.validate_servers_transport();
         assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("bad")));
     }
@@ -920,6 +1103,8 @@ cert_hash: "trust"
             legacy_client_full_range: false,
             changelog: None,
             version_provider: None,
+            version_files: vec![],
+            version_file_split_ttl: 300,
         };
 
         let resource_without_challenge = ResourceConfig {
@@ -938,6 +1123,8 @@ cert_hash: "trust"
             legacy_client_full_range: false,
             changelog: None,
             version_provider: None,
+            version_files: vec![],
+            version_file_split_ttl: 300,
         };
 
         resources.insert(

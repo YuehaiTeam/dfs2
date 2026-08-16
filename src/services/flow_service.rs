@@ -1,19 +1,21 @@
 use crate::{
-    config::{CertHashPolicy, ServerConfig, SharedConfig},
+    config::SharedConfig,
     error::{DfsError, DfsResult},
     models::{FlowContext, FlowJsContext, FlowOptions, FlowResult, FlowTarget, PluginMetadata},
     modules::{
         external::geolocation,
         flow::{FlowComp, FlowCond, FlowItem, FlowMode, FlowUse, ResourcePattern},
+        network::capabilities,
         qjs::JsRunner,
         server::HealthInfo,
         storage::data_store::DataStore,
+        version_file::VersionFileDecision,
     },
+    services::VersionFileService,
 };
 use rand::Rng;
 use std::collections::HashMap;
 use tracing::{debug, info};
-use url::Url;
 
 #[derive(Clone)]
 pub struct FlowService {
@@ -22,6 +24,7 @@ pub struct FlowService {
     js_runner: JsRunner,
     bandwidth_cache: crate::services::BandwidthCacheService,
     resource_service: crate::services::ResourceService,
+    version_file_service: VersionFileService,
 }
 
 impl FlowService {
@@ -32,12 +35,18 @@ impl FlowService {
         bandwidth_cache: crate::services::BandwidthCacheService,
         resource_service: crate::services::ResourceService,
     ) -> Self {
+        let version_file_service = VersionFileService::new(
+            shared_config.clone(),
+            data_store.clone(),
+            resource_service.clone(),
+        );
         Self {
             shared_config,
             data_store,
             js_runner,
             bandwidth_cache,
             resource_service,
+            version_file_service,
         }
     }
 
@@ -103,15 +112,14 @@ impl FlowService {
             return Err(DfsError::internal_error("NO_RES_AVAILABLE"));
         }
 
-        // Post-pipeline h3_only URL rewrite: catch plugin literal URLs
+        // Post-pipeline URL rewrite: catch plugin literal URLs
         let mut final_url = server_pool[0].0.clone();
         if let Some(ref server_id) = selected_server_id {
             let config = self.shared_config.load();
-            if let Some(server_config) = config.servers.get(server_id)
-                && server_config.h3_only
-            {
+            if let Some(server_config) = config.servers.get(server_id) {
                 let health_info = self.get_health_info_for_server(server_id, target).await;
-                final_url = rewrite_h3_url(final_url, server_config, health_info.as_ref())?;
+                final_url =
+                    capabilities::rewrite_url(&final_url, server_config, health_info.as_ref(), &context.capabilities)?;
             }
         }
 
@@ -155,17 +163,49 @@ impl FlowService {
                             continue;
                         }
 
-                        // h3_only gate: skip h3_only servers when client is not h3-capable
+                        // Transport capability gates: skip servers when client lacks capability
                         let config = self.shared_config.load();
-                        if let Some(server_config) = config.servers.get(id)
-                            && server_config.h3_only
-                            && !context.h3_capable
-                        {
-                            debug!(
-                                server = %id,
-                                "Skipping h3_only server: client is not h3-capable"
-                            );
-                            continue;
+                        if let Some(server_config) = config.servers.get(id) {
+                            // SSH-only gate: skip if client doesn't support SSH tunnel
+                            if server_config.ssh_only && !context.capabilities.ssh {
+                                debug!(
+                                    server = %id,
+                                    "Skipping ssh_only server: client is not ssh-capable"
+                                );
+                                continue;
+                            }
+                            // dfs_sftp gate: skip if client doesn't support SFTP
+                            let is_sftp = server_config.r#type == "dfs_sftp";
+                            if is_sftp && !context.capabilities.sftp {
+                                debug!(
+                                    server = %id,
+                                    "Skipping dfs_sftp server: client is not sftp-capable"
+                                );
+                                continue;
+                            }
+                            let is_wt = server_config.r#type == "dfs_webtransport";
+                            if server_config.h3_only && is_wt {
+                                // Dual mode: need at least one of h3 or wt
+                                if !context.capabilities.h3 && !context.capabilities.wt {
+                                    debug!(
+                                        server = %id,
+                                        "Skipping h3_only+wt server: client supports neither h3 nor wt"
+                                    );
+                                    continue;
+                                }
+                            } else if server_config.h3_only && !context.capabilities.h3 {
+                                debug!(
+                                    server = %id,
+                                    "Skipping h3_only server: client is not h3-capable"
+                                );
+                                continue;
+                            } else if is_wt && !context.capabilities.wt {
+                                debug!(
+                                    server = %id,
+                                    "Skipping dfs_webtransport server: client is not wt-capable"
+                                );
+                                continue;
+                            }
                         }
 
                         pool.push((id.clone(), *weight));
@@ -182,20 +222,57 @@ impl FlowService {
                             .await?;
                         self.process_plugin_result(result, pool, plugin_server_mapping)?;
 
-                        // h3_only gate for plugin-returned entries that resolve to a server_id
-                        if !context.h3_capable {
+                        // Transport capability gates for plugin-returned entries
+                        {
                             let config = self.shared_config.load();
                             pool.retain(|(url, _weight)| {
                                 if let Some((Some(server_id), _)) = plugin_server_mapping.get(url)
                                     && let Some(server_config) = config.servers.get(server_id)
-                                    && server_config.h3_only
                                 {
-                                    debug!(
-                                        server = %server_id,
-                                        url = %url,
-                                        "Skipping h3_only plugin server: client is not h3-capable"
-                                    );
-                                    return false;
+                                    // SSH-only gate
+                                    if server_config.ssh_only && !context.capabilities.ssh {
+                                        debug!(
+                                            server = %server_id,
+                                            url = %url,
+                                            "Skipping ssh_only plugin server: client is not ssh-capable"
+                                        );
+                                        return false;
+                                    }
+                                    // dfs_sftp gate
+                                    let is_sftp = server_config.r#type == "dfs_sftp";
+                                    if is_sftp && !context.capabilities.sftp {
+                                        debug!(
+                                            server = %server_id,
+                                            url = %url,
+                                            "Skipping dfs_sftp plugin server: client is not sftp-capable"
+                                        );
+                                        return false;
+                                    }
+                                    let is_wt = server_config.r#type == "dfs_webtransport";
+                                    if server_config.h3_only && is_wt {
+                                        if !context.capabilities.h3 && !context.capabilities.wt {
+                                            debug!(
+                                                server = %server_id,
+                                                url = %url,
+                                                "Skipping h3_only+wt plugin server: client supports neither"
+                                            );
+                                            return false;
+                                        }
+                                    } else if server_config.h3_only && !context.capabilities.h3 {
+                                        debug!(
+                                            server = %server_id,
+                                            url = %url,
+                                            "Skipping h3_only plugin server: client is not h3-capable"
+                                        );
+                                        return false;
+                                    } else if is_wt && !context.capabilities.wt {
+                                        debug!(
+                                            server = %server_id,
+                                            url = %url,
+                                            "Skipping dfs_webtransport plugin server: client is not wt-capable"
+                                        );
+                                        return false;
+                                    }
                                 }
                                 true
                             });
@@ -634,6 +711,27 @@ impl FlowService {
                     DfsError::path_not_found(&validated_resource_id, &effective_version)
                 })?;
 
+            if self
+                .version_file_service
+                .is_version_file_request(
+                    &validated_resource_id,
+                    &effective_version,
+                    &health_check_path,
+                )
+                .await
+            {
+                match self
+                    .version_file_service
+                    .evaluate_path(&validated_resource_id, &health_check_path, &server.0)
+                    .await
+                {
+                    VersionFileDecision::SplitFailed | VersionFileDecision::Mismatch => {
+                        return Ok(false);
+                    }
+                    VersionFileDecision::Match | VersionFileDecision::Unknown => {}
+                }
+            }
+
             Ok(server_impl
                 .is_alive(
                     &server.0,
@@ -714,12 +812,15 @@ impl FlowService {
                 .await
                 .map_err(|e| DfsError::internal_error(format!("URL generation failed: {e}")))?;
 
-            // Apply h3_only URL rewrite if applicable
-            if let Some(server_config) = config.servers.get(&server.0)
-                && server_config.h3_only
-            {
+            // Apply transport URL rewrite if applicable
+            if let Some(server_config) = config.servers.get(&server.0) {
                 let health_info = self.get_health_info_for_server(&server.0, target).await;
-                return rewrite_h3_url(url, server_config, health_info.as_ref());
+                return capabilities::rewrite_url(
+                    &url,
+                    server_config,
+                    health_info.as_ref(),
+                    &context.capabilities,
+                );
             }
 
             Ok(url)
@@ -728,7 +829,7 @@ impl FlowService {
         }
     }
 
-    /// Retrieve cached HealthInfo for a server, used for h3_only cert hash resolution.
+    /// Retrieve cached HealthInfo for a server, used for transport cert hash resolution.
     async fn get_health_info_for_server(
         &self,
         server_id: &str,
@@ -753,77 +854,6 @@ impl FlowService {
     }
 }
 
-/// Rewrite a URL for h3_only servers: change scheme from https to http3
-/// and optionally append #cert={hash} fragment based on the server's cert hash policy.
-///
-/// Only rewrites URLs with "https" scheme. Non-https URLs are returned unchanged.
-fn rewrite_h3_url(
-    original_url: String,
-    server_config: &ServerConfig,
-    health_info: Option<&HealthInfo>,
-) -> DfsResult<String> {
-    let url = Url::parse(&original_url).map_err(|e| {
-        DfsError::internal_error(format!("Failed to parse URL for h3 rewrite: {e}"))
-    })?;
-
-    // Only rewrite https URLs
-    if url.scheme() != "https" {
-        return Ok(original_url);
-    }
-
-    // Determine cert fragment based on policy
-    let fragment = match server_config.cert_hash_policy() {
-        Ok(CertHashPolicy::ValidCert) => {
-            // No fragment needed
-            None
-        }
-        Ok(CertHashPolicy::Trust) => {
-            // Need observed_cert_hash from health_info
-            if let Some(hash) = health_info.and_then(|h| h.observed_cert_hash.as_ref()) {
-                let normalized = hash.to_ascii_lowercase();
-                Some(format!("cert={}", normalized))
-            } else {
-                return Err(DfsError::internal_error(
-                    "h3_only server with cert_hash=trust but no observed cert hash available",
-                ));
-            }
-        }
-        Ok(CertHashPolicy::PinnedHex(bytes)) => {
-            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-            Some(format!("cert={}", hex))
-        }
-        Err(e) => {
-            return Err(DfsError::internal_error(format!(
-                "Invalid cert_hash policy: {e}"
-            )));
-        }
-    };
-
-    // Build the rewritten URL by replacing the scheme via string manipulation.
-    // url::Url::set_scheme() rejects transitions from special schemes (https) to
-    // non-special schemes (http3), so we construct the result manually.
-    // We strip the existing fragment (url crate separates it) and append ours.
-    let without_fragment = {
-        let s = url.as_str();
-        // url.fragment() returns the part after '#', or None
-        if url.fragment().is_some() {
-            // Remove the trailing #fragment
-            &s[..s.rfind('#').unwrap_or(s.len())]
-        } else {
-            s
-        }
-    };
-
-    // Replace "https://" prefix with "http3://"
-    let rewritten = format!("http3://{}", &without_fragment["https://".len()..]);
-
-    // Append fragment if needed
-    match fragment {
-        Some(frag) => Ok(format!("{}#{}", rewritten, frag)),
-        None => Ok(rewritten),
-    }
-}
-
 /// 简化版路径标准化函数（用于FlowService内部）
 fn normalize_path_simple(path: &str) -> String {
     // 防止目录遍历攻击
@@ -843,6 +873,7 @@ fn normalize_path_simple(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+        use crate::modules::network::capabilities::{rewrite_url, ClientCapabilities};
     use crate::tests::common::TestEnvironment;
     use serde_json::json;
     use size::Size;
@@ -862,7 +893,7 @@ mod tests {
             client_ip: Some("192.168.1.100".parse().unwrap()), // 私有IP，模拟中国用户
             session_id: Some("test_session".to_string()),
             extras: json!({"test_flag": true}),
-            h3_capable: false,
+            capabilities: Default::default(),
         };
 
         let options = FlowOptions {
@@ -1914,7 +1945,7 @@ mod tests {
         let mut selected_server_weight = None;
 
         let (target, mut context, options) = create_test_context();
-        context.h3_capable = false;
+        context.capabilities.h3 = false;
 
         // Flow item with h3_only server
         let item = FlowItem {
@@ -1961,7 +1992,7 @@ mod tests {
         let mut selected_server_weight = None;
 
         let (target, mut context, options) = create_test_context();
-        context.h3_capable = true;
+        context.capabilities.h3 = true;
 
         let item = FlowItem {
             rules: vec![],
@@ -2010,7 +2041,7 @@ mod tests {
         let mut selected_server_weight = None;
 
         let (target, mut context, options) = create_test_context();
-        context.h3_capable = false;
+        context.capabilities.h3 = false;
 
         let item = FlowItem {
             rules: vec![],
@@ -2058,7 +2089,7 @@ mod tests {
         let mut selected_server_weight = None;
 
         let (target, mut context, options) = create_test_context();
-        context.h3_capable = false;
+        context.capabilities.h3 = false;
 
         // Flow item with both h3_only and normal servers
         let item = FlowItem {
@@ -2104,7 +2135,7 @@ mod tests {
 
         // Now test with h3_capable = true
         pool.clear();
-        context.h3_capable = true;
+        context.capabilities.h3 = true;
 
         let _should_break = service
             .execute_flow_item(
@@ -2142,7 +2173,7 @@ mod tests {
         let mut selected_server_weight = None;
 
         let (target, mut context, options) = create_test_context();
-        context.h3_capable = true;
+        context.capabilities.h3 = true;
 
         // h3_server is both h3_only AND penalized
         let penalty_servers = vec!["h3_server".to_string()];
@@ -2198,7 +2229,7 @@ mod tests {
         let mut selected_server_weight = None;
 
         let (target, mut context, options) = create_test_context();
-        context.h3_capable = false;
+        context.capabilities.h3 = false;
 
         let item = FlowItem {
             rules: vec![],
@@ -2238,6 +2269,14 @@ mod tests {
 
     // ======================== rewrite_h3_url tests ========================
 
+    /// Helper to create ClientCapabilities with h3 enabled (for rewrite tests)
+    fn h3_caps() -> ClientCapabilities {
+        ClientCapabilities {
+            h3: true,
+            ..Default::default()
+        }
+    }
+
     /// Helper to create a ServerConfig for rewrite tests
     fn make_server_config(h3_only: bool, cert_hash: Option<&str>) -> crate::config::ServerConfig {
         crate::config::ServerConfig {
@@ -2257,6 +2296,7 @@ mod tests {
             file_size: Some(1024),
             last_check: 1000,
             observed_cert_hash: observed_cert_hash.map(|s| s.to_string()),
+            content_hash: None,
         }
     }
 
@@ -2264,7 +2304,7 @@ mod tests {
     fn test_rewrite_h3_url_https_to_http3_with_query_params() {
         let server = make_server_config(true, None); // ValidCert → no fragment
         let url = "https://cdn.example.com/path/to/file.zip?token=abc&expires=123".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert_eq!(
             result, "http3://cdn.example.com/path/to/file.zip?token=abc&expires=123",
             "Query params should be preserved and scheme changed to http3"
@@ -2276,7 +2316,7 @@ mod tests {
         let hex = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let server = make_server_config(true, Some(hex));
         let url = "https://cdn.example.com/file.zip#old-fragment".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert!(
             result.starts_with("http3://cdn.example.com/file.zip#cert="),
             "Existing fragment should be replaced, got: {}",
@@ -2297,7 +2337,7 @@ mod tests {
     fn test_rewrite_h3_url_non_https_not_rewritten() {
         let server = make_server_config(true, None);
         let url = "http://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url.clone(), &server, None).unwrap();
+        let result = rewrite_url(&url.clone(), &server, None, &h3_caps()).unwrap();
         assert_eq!(result, url, "Non-https URLs should not be rewritten");
     }
 
@@ -2306,7 +2346,7 @@ mod tests {
         // cert_hash = None → ValidCert → no fragment
         let server = make_server_config(true, None);
         let url = "https://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert_eq!(result, "http3://cdn.example.com/file.zip");
         assert!(!result.contains('#'), "No fragment when cert_hash is empty");
     }
@@ -2316,7 +2356,7 @@ mod tests {
         // cert_hash = Some("") → ValidCert → no fragment
         let server = make_server_config(true, Some(""));
         let url = "https://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert_eq!(result, "http3://cdn.example.com/file.zip");
     }
 
@@ -2326,7 +2366,7 @@ mod tests {
         let observed = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let health = make_health_info(Some(observed));
         let url = "https://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, Some(&health)).unwrap();
+        let result = rewrite_url(&url, &server, Some(&health), &h3_caps()).unwrap();
         assert_eq!(
             result,
             format!("http3://cdn.example.com/file.zip#cert={}", observed),
@@ -2340,7 +2380,7 @@ mod tests {
         let observed_upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
         let health = make_health_info(Some(observed_upper));
         let url = "https://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, Some(&health)).unwrap();
+        let result = rewrite_url(&url, &server, Some(&health), &h3_caps()).unwrap();
         assert!(
             result.ends_with(&format!("#cert={}", observed_upper.to_ascii_lowercase())),
             "Hash should be normalized to lowercase"
@@ -2352,7 +2392,7 @@ mod tests {
         let server = make_server_config(true, Some("trust"));
         let health = make_health_info(None); // no observed hash
         let url = "https://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, Some(&health));
+        let result = rewrite_url(&url, &server, Some(&health), &h3_caps());
         assert!(
             result.is_err(),
             "Trust mode without observed hash should return error"
@@ -2363,7 +2403,7 @@ mod tests {
     fn test_rewrite_h3_url_trust_no_health_info_errors() {
         let server = make_server_config(true, Some("trust"));
         let url = "https://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, None);
+        let result = rewrite_url(&url, &server, None, &h3_caps());
         assert!(
             result.is_err(),
             "Trust mode without health_info should return error"
@@ -2375,7 +2415,7 @@ mod tests {
         let hex = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
         let server = make_server_config(true, Some(hex));
         let url = "https://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert_eq!(
             result,
             format!("http3://cdn.example.com/file.zip#cert={}", hex),
@@ -2389,7 +2429,7 @@ mod tests {
         let hex_lower = hex_upper.to_ascii_lowercase();
         let server = make_server_config(true, Some(hex_upper));
         let url = "https://cdn.example.com/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert_eq!(
             result,
             format!("http3://cdn.example.com/file.zip#cert={}", hex_lower),
@@ -2401,7 +2441,7 @@ mod tests {
     fn test_rewrite_h3_url_preserves_port() {
         let server = make_server_config(true, None);
         let url = "https://cdn.example.com:8443/file.zip".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert_eq!(
             result, "http3://cdn.example.com:8443/file.zip",
             "Port should be preserved"
@@ -2415,7 +2455,7 @@ mod tests {
         // Use non-default port (8443) to test port preservation.
         // Note: port 443 is the default for https and gets normalized away by url::Url.
         let url = "https://cdn.example.com:8443/path/to/file.zip?token=abc&sig=xyz".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert_eq!(
             result,
             format!(
@@ -2427,16 +2467,14 @@ mod tests {
     }
 
     #[test]
-    fn test_rewrite_h3_url_non_h3_server_valid_cert() {
-        // Non-h3_only server: cert_hash_policy returns ValidCert regardless
+    fn test_rewrite_url_non_h3_server_passthrough() {
+        // Non-h3_only server with type=direct: rewrite_url should passthrough
         let server = make_server_config(false, Some("trust"));
         let url = "https://cdn.example.com/file.zip".to_string();
-        // Note: rewrite_h3_url doesn't check h3_only itself - that's done by callers.
-        // But cert_hash_policy() returns ValidCert when h3_only=false.
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &ClientCapabilities::default()).unwrap();
         assert_eq!(
-            result, "http3://cdn.example.com/file.zip",
-            "Non-h3 server gets ValidCert policy, so no fragment"
+            result, "https://cdn.example.com/file.zip",
+            "Non-h3 direct server should passthrough unchanged"
         );
     }
 
@@ -2524,12 +2562,16 @@ mod tests {
             legacy_client_full_range: false,
             changelog: None,
             version_provider: None,
+            version_files: vec![],
+            version_file_split_ttl: 300,
         };
         let mut ver_map = HashMap::new();
         ver_map.insert("h3_pinned".to_string(), "/files/app.zip".to_string());
         ver_map.insert("default".to_string(), "/files/app.zip".to_string());
         h3_resource.versions.insert("1.0.0".to_string(), ver_map);
-        config.resources.insert("h3_app".to_string(), h3_resource);
+        config
+            .resources
+            .insert("h3_app".to_string(), h3_resource);
 
         // Resource using mixed pool (h3 + regular)
         let mut mixed_resource = ResourceConfig {
@@ -2562,6 +2604,8 @@ mod tests {
             legacy_client_full_range: false,
             changelog: None,
             version_provider: None,
+            version_files: vec![],
+            version_file_split_ttl: 300,
         };
         let mut ver_map2 = HashMap::new();
         ver_map2.insert("default".to_string(), "/files/app.zip".to_string());
@@ -2593,7 +2637,7 @@ mod tests {
             client_ip: Some("10.0.0.1".parse().unwrap()),
             session_id: Some("test_sid".to_string()),
             extras: json!({}),
-            h3_capable: false, // Client does NOT support h3
+            capabilities: Default::default(), // Client does NOT support h3
         };
         let options = FlowOptions {
             cdn_full_range: false,
@@ -2608,7 +2652,6 @@ mod tests {
             }],
             r#break: false,
         }];
-
         let result = service
             .execute_flow(&target, &context, &options, &flow_items, vec![], None)
             .await;
@@ -2632,6 +2675,7 @@ mod tests {
             file_size: Some(1024),
             last_check: chrono::Utc::now().timestamp() as u64,
             observed_cert_hash: None,
+            content_hash: None,
         };
         env.data_store
             .set_health_info("regular_cdn", "/files/app.zip", &health)
@@ -2651,7 +2695,7 @@ mod tests {
             client_ip: Some("10.0.0.1".parse().unwrap()),
             session_id: Some("test_sid".to_string()),
             extras: json!({}),
-            h3_capable: false,
+            capabilities: Default::default(),
         };
         let options = FlowOptions {
             cdn_full_range: false,
@@ -2672,7 +2716,6 @@ mod tests {
             ],
             r#break: false,
         }];
-
         let result = service
             .execute_flow(&target, &context, &options, &flow_items, vec![], None)
             .await;
@@ -2699,7 +2742,7 @@ mod tests {
     #[test]
     fn test_rewrite_h3_url_invalid_url() {
         let server = make_server_config(true, None);
-        let result = rewrite_h3_url("not a valid url".to_string(), &server, None);
+        let result = rewrite_url(&"not a valid url".to_string(), &server, None, &h3_caps());
         assert!(result.is_err(), "Invalid URL should return error");
     }
 
@@ -2707,7 +2750,7 @@ mod tests {
     fn test_rewrite_h3_url_empty_path() {
         let server = make_server_config(true, None);
         let url = "https://cdn.example.com".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert_eq!(
             result, "http3://cdn.example.com/",
             "URL with no path should still get a trailing slash from url crate normalization"
@@ -2718,7 +2761,7 @@ mod tests {
     fn test_rewrite_h3_url_with_auth_and_query() {
         let server = make_server_config(true, None);
         let url = "https://cdn.example.com/path?Signature=abc123&Expires=999".to_string();
-        let result = rewrite_h3_url(url, &server, None).unwrap();
+        let result = rewrite_url(&url, &server, None, &h3_caps()).unwrap();
         assert!(result.starts_with("http3://"), "Should rewrite to http3://");
         assert!(
             result.contains("Signature=abc123"),
@@ -2737,7 +2780,7 @@ mod tests {
 
         // Pinned: always has cert fragment
         let pinned_server = make_server_config(true, Some(hex));
-        let pinned_result = rewrite_h3_url(url.clone(), &pinned_server, None).unwrap();
+        let pinned_result = rewrite_url(&url.clone(), &pinned_server, None, &h3_caps()).unwrap();
         assert!(
             pinned_result.contains("#cert="),
             "PinnedHex should produce #cert= fragment"
@@ -2746,7 +2789,7 @@ mod tests {
         // Trust: has cert fragment when health info has observed hash
         let trust_server = make_server_config(true, Some("trust"));
         let health = make_health_info(Some(hex));
-        let trust_result = rewrite_h3_url(url, &trust_server, Some(&health)).unwrap();
+        let trust_result = rewrite_url(&url, &trust_server, Some(&health), &h3_caps()).unwrap();
         assert!(
             trust_result.contains("#cert="),
             "Trust mode with observed hash should produce #cert= fragment"

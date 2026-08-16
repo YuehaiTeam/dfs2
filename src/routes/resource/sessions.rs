@@ -4,7 +4,6 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use std::collections::HashMap;
 use tracing::{error, info};
 
 use crate::{
@@ -77,15 +76,46 @@ pub async fn handle_create_session_unified(
     // Challenge验证成功，移除challenge
     let _ = ctx.challenge_service.remove_challenge(&req.sid).await;
 
-    // 创建会话（统一逻辑）
+    let now = chrono::Utc::now().timestamp() as u64;
+    let existing = match ctx.data_store.get_session(&req.sid).await? {
+        Some(session) if session.is_direct_expired(now) => {
+            let _ = ctx.session_service.remove_session(&req.sid).await;
+            None
+        }
+        other => other,
+    };
+
+    if let Some(existing) = existing.as_ref() {
+        if existing.resource_id != resid {
+            return Err(DfsError::download_not_allowed(
+                &resid,
+                "sid is already associated with a different download",
+            ));
+        }
+    }
+
+    // 同 sid 再创建：保留已有退避记录，只刷新当前认证的文件
+    let cdn_records = match ctx.session_service.get_session_stats(&req.sid).await {
+        Ok(Some(stats)) => stats.cdn_records,
+        _ => existing
+            .as_ref()
+            .map(|session| session.cdn_records.clone())
+            .unwrap_or_default(),
+    };
+
     let session = Session {
         resource_id: resid.clone(),
         version: version.clone(),
         chunks: req.chunks.clone(),
-        sub_path: sub_path.clone(), // 关键差异：前缀资源保存sub_path
-        cdn_records: HashMap::new(),
+        sub_path: sub_path.clone(),
+        cdn_records,
         extras: req.extras.clone(),
-        created_at: chrono::Utc::now().timestamp() as u64,
+        created_at: existing
+            .as_ref()
+            .map(|session| session.created_at)
+            .unwrap_or(now),
+        kind: crate::models::SessionKind::Chunk,
+        expires_at: None,
     };
 
     ctx.session_service
@@ -408,6 +438,113 @@ mod tests {
         assert_eq!(stored_session.resource_id, "game_assets");
 
         println!("✅ Prefix session creation test completed!");
+    }
+
+    async fn solve_stored_md5_challenge(
+        env: &TestEnvironment,
+        session_id: &str,
+    ) -> String {
+        let stored_challenge_data = env
+            .data_store
+            .get_challenge(session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let challenge_json: serde_json::Value =
+            serde_json::from_str(&stored_challenge_data).unwrap();
+        let original_data = hex::decode(challenge_json["original_data"].as_str().unwrap()).unwrap();
+        format!("{:x}", md5::compute(&original_data))
+    }
+
+    #[tokio::test]
+    async fn test_reuse_sid_reauths_and_keeps_penalty_records() {
+        let env = TestEnvironment::new().await;
+        let session_id = "reuse-prefix-sid";
+
+        env.services
+            .challenge_service
+            .generate_and_store_challenge(session_id, "game_assets", Some("a/one.bin"))
+            .await
+            .unwrap();
+        let first = handle_create_session_unified(
+            "game_assets".to_string(),
+            Some("a/one.bin".to_string()),
+            env.app_context.clone(),
+            CreateSessionRequest {
+                version: "3.0.0".to_string(),
+                chunks: vec!["0-".to_string()],
+                sid: session_id.to_string(),
+                challenge: solve_stored_md5_challenge(&env, session_id).await,
+                extras: serde_json::json!({}),
+            },
+        )
+        .await;
+        assert!(first.is_ok());
+
+        env.services
+            .session_service
+            .record_final_cdn_selection(
+                session_id,
+                "0-",
+                crate::models::CdnRecord {
+                    url: "https://test1.example.com/a".to_string(),
+                    server_id: Some("test_server_1".to_string()),
+                    skip_penalty: false,
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    weight: 20,
+                    size: Some(10),
+                },
+            )
+            .await
+            .unwrap();
+
+        let rechallenge = handle_create_session_unified(
+            "game_assets".to_string(),
+            Some("b/two.bin".to_string()),
+            env.app_context.clone(),
+            CreateSessionRequest {
+                version: "3.0.0".to_string(),
+                chunks: vec!["0-".to_string()],
+                sid: session_id.to_string(),
+                challenge: "".to_string(),
+                extras: serde_json::json!({}),
+            },
+        )
+        .await;
+        let rechallenge = axum::response::IntoResponse::into_response(rechallenge);
+        assert_eq!(rechallenge.into_parts().0.status, StatusCode::PAYMENT_REQUIRED);
+
+        let second = handle_create_session_unified(
+            "game_assets".to_string(),
+            Some("b/two.bin".to_string()),
+            env.app_context.clone(),
+            CreateSessionRequest {
+                version: "3.0.0".to_string(),
+                chunks: vec!["0-".to_string()],
+                sid: session_id.to_string(),
+                challenge: solve_stored_md5_challenge(&env, session_id).await,
+                extras: serde_json::json!({}),
+            },
+        )
+        .await;
+        assert!(second.is_ok());
+
+        let stored = env
+            .services
+            .session_service
+            .get_validated_session(session_id)
+            .await
+            .unwrap();
+        assert_eq!(stored.sub_path, Some("b/two.bin".to_string()));
+        assert_eq!(stored.resource_id, "game_assets");
+
+        let sticky = env
+            .services
+            .session_service
+            .get_sticky_penalty_servers(session_id)
+            .await
+            .unwrap();
+        assert_eq!(sticky, vec!["test_server_1".to_string()]);
     }
 
     // 测试已删除: test_create_prefix_session_invalid_resource_type - 边界情况

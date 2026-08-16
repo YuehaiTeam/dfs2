@@ -22,6 +22,32 @@ pub struct Session {
     #[serde(default = "default_empty_json")]
     pub extras: serde_json::Value, // 额外的用户自定义数据
     pub created_at: u64,          // session创建时间戳
+    #[serde(default)]
+    pub kind: SessionKind,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    #[default]
+    Chunk,
+    Direct,
+}
+
+impl Session {
+    pub const DIRECT_TTL_SECONDS: u64 = 300;
+
+    pub fn make_direct(&mut self) {
+        self.kind = SessionKind::Direct;
+        self.expires_at = Some(chrono::Utc::now().timestamp() as u64 + Self::DIRECT_TTL_SECONDS);
+    }
+
+    pub fn is_direct_expired(&self, now: u64) -> bool {
+        self.kind == SessionKind::Direct
+            && self.expires_at.is_some_and(|expires_at| now >= expires_at)
+    }
 }
 
 #[derive(Deserialize, ToSchema, Debug)]
@@ -88,6 +114,8 @@ pub struct DeleteSessionRequest {
 // Flow上下文结构体 (从domain/flow_context.rs合并)
 use std::net::IpAddr;
 
+pub use crate::modules::network::capabilities::ClientCapabilities;
+
 /// 目标资源信息 - "我要访问什么"
 #[derive(Debug, Clone, Serialize)]
 pub struct FlowTarget {
@@ -104,10 +132,10 @@ pub struct FlowContext {
     pub client_ip: Option<IpAddr>,
     pub session_id: Option<String>,
     pub extras: serde_json::Value,
-    /// Whether the client supports HTTP/3 (derived from UA + X-DFS-Override header).
-    /// Defaults to `false` for backward compatibility.
+    /// Client transport capabilities (HTTP/3, WebRTC, WebTransport).
+    /// Derived from UA markers + X-DFS-Override header.
     #[serde(default)]
-    pub h3_capable: bool,
+    pub capabilities: ClientCapabilities,
 }
 
 /// 执行选项 - "如何访问"

@@ -13,6 +13,7 @@ pub struct ValidationReport {
     pub servers_valid: bool,
     pub redis_valid: bool,
     pub version_providers_valid: bool,
+    pub version_files_valid: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -25,6 +26,7 @@ impl ValidationReport {
             servers_valid: true,
             redis_valid: true,
             version_providers_valid: true,
+            version_files_valid: true,
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -44,6 +46,7 @@ impl ValidationReport {
             && self.servers_valid
             && self.redis_valid
             && self.version_providers_valid
+            && self.version_files_valid
     }
 
     pub fn print_report(&self) {
@@ -85,6 +88,14 @@ impl ValidationReport {
         println!(
             "🔄 版本提供者: {}",
             if self.version_providers_valid {
+                "✅ 有效"
+            } else {
+                "❌ 无效"
+            }
+        );
+        println!(
+            "📄 版本文件: {}",
+            if self.version_files_valid {
                 "✅ 有效"
             } else {
                 "❌ 无效"
@@ -149,7 +160,10 @@ impl ConfigValidator {
         // 5. 验证版本提供者配置和功能
         Self::validate_version_providers(config, data_store, &mut report).await;
 
-        // 6. 验证环境变量配置
+        // 6. 验证版本文件跨节点一致性（配置了 version_files 时）
+        Self::validate_version_files(config, data_store, &mut report).await;
+
+        // 7. 验证环境变量配置
         Self::validate_environment_variables(&mut report).await;
 
         info!("配置验证完成");
@@ -169,7 +183,7 @@ impl ConfigValidator {
         }
 
         // 验证服务器h3_only/cert_hash配置
-        let (h3_errors, h3_warnings) = config.validate_servers_h3();
+        let (h3_errors, h3_warnings) = config.validate_servers_transport();
         for e in &h3_errors {
             report.add_error(e.clone());
             report.config_valid = false;
@@ -216,6 +230,21 @@ impl ConfigValidator {
                     "资源 '{resource_id}' 缺少版本配置：必须配置 'latest' 字段或 'version_provider'"
                 ));
                 report.config_valid = false;
+            }
+
+            for version_file in &resource.version_files {
+                if version_file.trim().is_empty() {
+                    report.add_error(format!(
+                        "资源 '{resource_id}' 的 version_files 包含空路径"
+                    ));
+                    report.config_valid = false;
+                }
+                if version_file.contains("..") {
+                    report.add_error(format!(
+                        "资源 '{resource_id}' 的 version_files 路径 '{version_file}' 非法"
+                    ));
+                    report.config_valid = false;
+                }
             }
         }
 
@@ -604,6 +633,69 @@ impl ConfigValidator {
 
         if successful_validations == 0 && !resources_with_providers.is_empty() {
             report.add_warning("所有版本提供者测试都失败了，请检查插件配置和网络连接".to_string());
+        }
+    }
+
+    /// Compare configured version files across replicas. No majority is a hard failure.
+    async fn validate_version_files(
+        config: &AppConfig,
+        data_store: &DataStore,
+        report: &mut ValidationReport,
+    ) {
+        let has_version_files = config
+            .resources
+            .values()
+            .any(|resource| !resource.version_files.is_empty());
+        if !has_version_files {
+            info!("未配置 version_files，跳过版本文件一致性检查");
+            return;
+        }
+
+        info!("验证版本文件跨节点一致性...");
+        let shared_config = SharedConfig::new(config.clone());
+        let version_cache = std::sync::Arc::new(
+            crate::modules::version_provider::VersionCache::new(data_store.clone()),
+        );
+        let js_runner = JsRunner::new(shared_config.clone(), data_store.clone()).await;
+        let plugin_provider = std::sync::Arc::new(
+            crate::modules::version_provider::PluginVersionProvider::new(
+                js_runner,
+                shared_config.clone(),
+            ),
+        );
+        let version_updater = std::sync::Arc::new(
+            crate::modules::version_provider::VersionUpdater::new(
+                shared_config.clone(),
+                version_cache.clone(),
+                plugin_provider,
+            ),
+        );
+        let resource_service = crate::services::ResourceService::new(
+            shared_config.clone(),
+            version_cache,
+            version_updater,
+        );
+        let version_file_service = crate::services::VersionFileService::new(
+            shared_config,
+            data_store.clone(),
+            resource_service,
+        );
+
+        match version_file_service.census_all(true).await {
+            Ok(errors) => {
+                if errors.is_empty() {
+                    info!("版本文件一致性检查通过");
+                } else {
+                    for error in errors {
+                        report.add_error(error);
+                    }
+                    report.version_files_valid = false;
+                }
+            }
+            Err(e) => {
+                report.add_error(format!("版本文件一致性检查失败: {e}"));
+                report.version_files_valid = false;
+            }
         }
     }
 

@@ -60,10 +60,19 @@ regex = "1.11"
 rayon = "1.8"
 serde_urlencoded = "0.7"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
-rustls = "0.23"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 h3 = "0.0"
 h3-quinn = "0.0"
 webpki-roots = "0.26"
+reqwest-middleware = "0.4"
+russh = "0.48"
+russh-sftp = "2.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+async-stream = "0.3"
+futures = "0.3"
+http = "1"
 
 [dev-dependencies]
 tempfile = "3.14"

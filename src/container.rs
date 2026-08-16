@@ -7,11 +7,15 @@ use crate::{
     metrics::Metrics,
     modules::storage::data_store::{DataStore, create_data_store},
     modules::{
+        network::h3_middleware::H3Middleware,
+        network::sftp_middleware::SftpMiddleware,
+        network::ssh_middleware::{SshMiddleware, SshPoolInner},
         qjs::JsRunner,
         version_provider::{PluginVersionProvider, VersionCache, VersionUpdater},
     },
     services::{
         BandwidthCacheService, ChallengeService, FlowService, ResourceService, SessionService,
+        VersionFileService,
     },
 };
 
@@ -37,6 +41,24 @@ lazy_static::lazy_static! {
         .unwrap();
 }
 
+lazy_static::lazy_static! {
+    /// Multi-protocol client for upstream probes and server-side fetches.
+    pub static ref FETCH_CLIENT: reqwest_middleware::ClientWithMiddleware = {
+        let ssh_pool = SshPoolInner::new(std::time::Duration::from_secs(120));
+        let base = reqwest::Client::builder()
+            .user_agent("DFS2-Fetch/1.0")
+            .read_timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to build fetch reqwest client");
+        reqwest_middleware::ClientBuilder::new(base)
+            .with(H3Middleware::new())
+            .with(SshMiddleware::with_pool(Arc::clone(&ssh_pool)))
+            .with(SftpMiddleware::new(ssh_pool))
+            .build()
+    };
+}
+
 #[allow(dead_code)]
 #[derive(Clone)]
 pub struct AppContext {
@@ -49,6 +71,7 @@ pub struct AppContext {
     pub metrics: Arc<Metrics>,
     pub shared_config: SharedConfig,
     pub data_store: DataStore,
+    pub version_file_service: VersionFileService,
 }
 
 impl AppContext {
@@ -62,6 +85,7 @@ impl AppContext {
         metrics: Arc<Metrics>,
         shared_config: SharedConfig,
         data_store: DataStore,
+        version_file_service: VersionFileService,
     ) -> Self {
         Self {
             session_service,
@@ -73,6 +97,7 @@ impl AppContext {
             metrics,
             shared_config,
             data_store,
+            version_file_service,
         }
     }
 
@@ -145,6 +170,11 @@ impl AppContainer {
             self.shared_config.clone(),
             session_service.clone(),
         );
+        let version_file_service = VersionFileService::new(
+            self.shared_config.clone(),
+            self.data_store.clone(),
+            resource_service.clone(),
+        );
 
         AppContext::new(
             session_service,
@@ -156,6 +186,7 @@ impl AppContainer {
             self.metrics.clone(),
             self.shared_config.clone(),
             self.data_store.clone(),
+            version_file_service,
         )
     }
 }

@@ -54,6 +54,8 @@ impl SessionBuilder {
             cdn_records: self.cdn_records,
             extras: self.extras,
             created_at: chrono::Utc::now().timestamp() as u64,
+            kind: crate::models::SessionKind::Chunk,
+            expires_at: None,
         }
     }
 }
@@ -114,6 +116,8 @@ impl BatchTestBuilder {
             cdn_records: self.cdn_records,
             extras: json!({}),
             created_at: chrono::Utc::now().timestamp() as u64,
+            kind: crate::models::SessionKind::Chunk,
+            expires_at: None,
         };
 
         (self.session_id, session, all_chunks)

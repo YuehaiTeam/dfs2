@@ -92,43 +92,19 @@ impl ResourceService {
     ) -> Option<String> {
         let config = self.shared_config.load();
         let resource = config.get_resource(resource_id)?;
+        version_path_for_resource(resource, version, server_id, sub_path)
+    }
 
-        // 首先尝试获取特定版本的配置
-        let path = if let Some(version_map) = resource.versions.get(version) {
-            // 版本存在，获取路径
-            if let Some(server_id) = server_id {
-                version_map
-                    .get(server_id)
-                    .or_else(|| version_map.get("default"))
-            } else {
-                version_map.get("default")
-            }
-        } else {
-            // 版本不存在，尝试使用default模板
-            None
-        };
-
-        // 如果没有找到路径，尝试使用default模板
-        let path = path.or_else(|| {
-            let default_template = resource.versions.get("default")?;
-            if let Some(server_id) = server_id {
-                default_template
-                    .get(server_id)
-                    .or_else(|| default_template.get("default"))
-            } else {
-                default_template.get("default")
-            }
-        })?;
-
-        // 执行版本号占位符替换
-        let base_path = path.replace("${version}", version);
-
-        // 新增：条件性子路径处理
-        match (resource.resource_type.as_str(), sub_path) {
-            ("prefix", Some(sub)) => Some(combine_prefix_path(&base_path, sub)),
-            ("prefix", None) => None,  // 前缀资源必须有sub_path
-            (_, _) => Some(base_path), // 其他资源忽略sub_path
-        }
+    pub fn resolve_version_file_path(
+        &self,
+        resource_id: &str,
+        version: &str,
+        server_id: Option<&str>,
+        version_file: &str,
+    ) -> Option<String> {
+        let config = self.shared_config.load();
+        let resource = config.get_resource(resource_id)?;
+        version_file_path_for_resource(resource, version, server_id, version_file)
     }
 
     /// 获取资源changelog，优先使用版本提供者的结果
@@ -163,6 +139,86 @@ impl ResourceService {
             .update_resource_immediately(resource_id)
             .await
     }
+}
+
+pub fn version_base_path_for_resource(
+    resource: &crate::config::ResourceConfig,
+    version: &str,
+    server_id: Option<&str>,
+) -> Option<String> {
+    let path = if let Some(version_map) = resource.versions.get(version) {
+        if let Some(server_id) = server_id {
+            version_map
+                .get(server_id)
+                .or_else(|| version_map.get("default"))
+        } else {
+            version_map.get("default")
+        }
+    } else {
+        None
+    };
+
+    let path = path.or_else(|| {
+        let default_template = resource.versions.get("default")?;
+        if let Some(server_id) = server_id {
+            default_template
+                .get(server_id)
+                .or_else(|| default_template.get("default"))
+        } else {
+            default_template.get("default")
+        }
+    })?;
+
+    Some(path.replace("${version}", version))
+}
+
+pub fn version_path_for_resource(
+    resource: &crate::config::ResourceConfig,
+    version: &str,
+    server_id: Option<&str>,
+    sub_path: Option<&str>,
+) -> Option<String> {
+    let base_path = version_base_path_for_resource(resource, version, server_id)?;
+    match (resource.resource_type.as_str(), sub_path) {
+        ("prefix", Some(sub)) => Some(combine_prefix_path(&base_path, sub)),
+        ("prefix", None) => None,
+        (_, _) => Some(base_path),
+    }
+}
+
+pub fn version_file_path_for_resource(
+    resource: &crate::config::ResourceConfig,
+    version: &str,
+    server_id: Option<&str>,
+    version_file: &str,
+) -> Option<String> {
+    let base_path = version_base_path_for_resource(resource, version, server_id)?;
+    let prefix = if resource.resource_type == "prefix" {
+        base_path
+    } else if let Some((parent, _)) = base_path.rsplit_once('/') {
+        if parent.is_empty() {
+            "/".to_string()
+        } else {
+            parent.to_string()
+        }
+    } else {
+        base_path
+    };
+    Some(combine_prefix_path(&prefix, version_file))
+}
+
+pub fn collect_resource_server_ids(resource: &crate::config::ResourceConfig) -> Vec<String> {
+    let mut ids = resource.server.clone();
+    for item in &resource.flow {
+        for flow_use in &item.r#use {
+            if let crate::modules::flow::config::FlowUse::Server { id, .. } = flow_use {
+                if !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+    }
+    ids
 }
 
 /// 安全地组合前缀路径和子路径
@@ -218,6 +274,37 @@ mod tests {
         assert_eq!(
             combine_prefix_path("/games/base", "../../../hack"),
             "/games/base/hack"
+        );
+    }
+
+    #[test]
+    fn test_version_file_path_for_prefix_resource() {
+        let mut resource = crate::config::ResourceConfig {
+            latest: "1.0.0".to_string(),
+            versions: std::collections::HashMap::new(),
+            tries: vec![],
+            server: vec![],
+            flow: vec![],
+            challenge: None,
+            download: crate::config::DownloadPolicy::Free,
+            resource_type: "prefix".to_string(),
+            cache_enabled: false,
+            cache_subpaths: vec![],
+            cache_max_age: 300,
+            legacy_client_support: false,
+            legacy_client_full_range: false,
+            changelog: None,
+            version_provider: None,
+            version_files: vec!["version.json".to_string()],
+            version_file_split_ttl: 300,
+        };
+        let mut version_map = std::collections::HashMap::new();
+        version_map.insert("default".to_string(), "/game/v3/".to_string());
+        resource.versions.insert("1.0.0".to_string(), version_map);
+
+        assert_eq!(
+            version_file_path_for_resource(&resource, "1.0.0", None, "version.json").as_deref(),
+            Some("/game/v3/version.json")
         );
     }
 }

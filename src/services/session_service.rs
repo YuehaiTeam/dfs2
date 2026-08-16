@@ -4,6 +4,7 @@ use crate::{
     models::{CdnRecord, Session},
     models::{FlowContext, FlowOptions, FlowResult, FlowTarget},
     modules::flow::FlowItem,
+    modules::network::ClientCapabilities,
     modules::storage::data_store::DataStore,
     services::FlowService,
 };
@@ -23,6 +24,19 @@ impl SessionService {
     pub async fn get_validated_session(&self, session_id: &str) -> DfsResult<Session> {
         match self.data_store.get_session(session_id).await? {
             Some(session) => {
+                if session.is_direct_expired(chrono::Utc::now().timestamp() as u64) {
+                    if let Err(e) = self.remove_session(session_id).await {
+                        tracing::warn!(
+                            "Failed to remove expired direct session {}: {}",
+                            session_id,
+                            e
+                        );
+                    }
+                    return Err(DfsError::SessionNotFound {
+                        session_id: session_id.to_string(),
+                    });
+                }
+
                 // 自动刷新session过期时间
                 if let Err(e) = self.refresh_session(session_id).await {
                     tracing::warn!("Failed to refresh session {}: {}", session_id, e);
@@ -44,7 +58,7 @@ impl SessionService {
     }
 
     /// 统一的下载次数检查逻辑
-    pub async fn check_download_limit(&self, session_id: &str, range: &str) -> DfsResult<u32> {
+    pub async fn record_download_attempt(&self, session_id: &str, range: &str) -> DfsResult<u32> {
         match self
             .data_store
             .increment_download_count(session_id, range)
@@ -59,17 +73,31 @@ impl SessionService {
                     );
                 }
 
-                if count > *MAX_CHUNK_DOWNLOADS {
-                    return Err(DfsError::invalid_input(
-                        "download_count",
-                        "Too many download attempts",
-                    ));
-                }
                 Ok(count)
             }
             None => Err(DfsError::SessionNotFound {
                 session_id: session_id.to_string(),
             }),
+        }
+    }
+
+    /// 记录并限制分块或受保护下载的重试次数。
+    pub async fn check_download_limit(&self, session_id: &str, range: &str) -> DfsResult<u32> {
+        let count = self.record_download_attempt(session_id, range).await?;
+        if count > *MAX_CHUNK_DOWNLOADS {
+            return Err(DfsError::invalid_input(
+                "download_count",
+                "Too many download attempts",
+            ));
+        }
+        Ok(count)
+    }
+
+    /// 下载次数按文件+range 隔离，避免同 sid 下多个文件共享 `0-` 计数。
+    pub fn scoped_download_key(sub_path: Option<&str>, range: &str) -> String {
+        match sub_path {
+            Some(path) if !path.is_empty() => format!("{path}:{range}"),
+            _ => range.to_string(),
         }
     }
 
@@ -123,20 +151,29 @@ impl SessionService {
         chunk_key: &str,
     ) -> DfsResult<Vec<String>> {
         match self.data_store.get_cdn_records(session_id, chunk_key).await {
-            Ok(previous_records) => {
-                let penalty_servers: Vec<String> = previous_records
-                    .iter()
-                    .filter_map(|record| {
-                        if !record.skip_penalty {
-                            record.server_id.clone()
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                Ok(penalty_servers)
-            }
+            Ok(previous_records) => Ok(penalty_servers_from_records(
+                std::iter::once(previous_records.as_slice()),
+            )),
             Err(_) => Ok(Vec::new()), // 没有历史记录，不进行惩罚
+        }
+    }
+
+    /// Free / 粘滞 sid：汇总该 sid 下所有文件、所有 range 的已调度节点。
+    /// 目录下载时，文件 1 连不上的节点在文件 2 上也会被回避。
+    pub async fn get_sticky_penalty_servers(&self, session_id: &str) -> DfsResult<Vec<String>> {
+        match self.data_store.get_session_stats(session_id).await {
+            Ok(Some(stats)) => Ok(penalty_servers_from_records(
+                stats.cdn_records.values().map(|v| v.as_slice()),
+            )),
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to load sticky penalty servers for {}: {}",
+                    session_id,
+                    e
+                );
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -192,7 +229,7 @@ impl SessionService {
         file_size: Option<u64>,
         flow_items: &[FlowItem],
         options: &FlowOptions,
-        h3_capable: bool, // Whether client supports HTTP/3
+        capabilities: ClientCapabilities,
     ) -> DfsResult<FlowResult> {
         // 1. 直接使用传入的session（无需重复获取）
 
@@ -202,8 +239,8 @@ impl SessionService {
         // 3. 验证ranges是否在session.chunks中
         self.validate_ranges_against_session(&requested_ranges, &session.chunks)?;
 
-        // 4. 获取需要惩罚的服务器列表
-        let penalty_servers = self.get_penalty_servers(session_id, &chunk_key).await?;
+        // 4. 退避按 sid 汇总，目录里上一个文件踩过的节点这次也会被回避
+        let penalty_servers = self.get_sticky_penalty_servers(session_id).await?;
 
         // 5. 构建Flow参数
         let target = FlowTarget {
@@ -222,7 +259,7 @@ impl SessionService {
             client_ip,
             session_id: Some(session_id.to_string()),
             extras: session.extras.clone(),
-            h3_capable,
+            capabilities,
         };
 
         // 6. 执行Flow（纯函数）
@@ -254,6 +291,68 @@ impl SessionService {
 
         Ok(flow_result)
     }
+
+    /// Free 下载：文件身份来自请求，惩罚按 sid 跨文件累计。
+    pub async fn run_flow_for_sticky_download(
+        &self,
+        session: &Session,
+        session_id: &str,
+        target: &crate::models::FlowTarget,
+        flow_service: &FlowService,
+        context: &FlowContext,
+        options: &FlowOptions,
+        flow_items: &[FlowItem],
+    ) -> DfsResult<FlowResult> {
+        let penalty_servers = self.get_sticky_penalty_servers(session_id).await?;
+        let flow_result = flow_service
+            .execute_flow(
+                target,
+                context,
+                options,
+                flow_items,
+                penalty_servers,
+                Some(session),
+            )
+            .await?;
+
+        if !flow_result.url.is_empty() {
+            let chunk_key = self.generate_chunk_key_from_ranges(
+                target.ranges.as_deref().unwrap_or(&[]),
+            );
+            let cdn_record = CdnRecord {
+                url: flow_result.url.clone(),
+                server_id: flow_result.selected_server_id.clone(),
+                skip_penalty: false,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+                weight: flow_result.selected_server_weight.unwrap_or(0),
+                size: target.file_size,
+            };
+            self.record_final_cdn_selection(session_id, &chunk_key, cdn_record)
+                .await?;
+        }
+
+        Ok(flow_result)
+    }
+}
+
+fn penalty_servers_from_records<'a, I>(record_sets: I) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a [CdnRecord]>,
+{
+    let mut servers = Vec::new();
+    for records in record_sets {
+        for record in records {
+            if record.skip_penalty {
+                continue;
+            }
+            if let Some(server_id) = &record.server_id {
+                if !servers.contains(server_id) {
+                    servers.push(server_id.clone());
+                }
+            }
+        }
+    }
+    servers
 }
 
 pub fn generate_session_id() -> String {
@@ -283,6 +382,8 @@ mod tests {
                 "client_ip": "192.168.1.100"
             }),
             created_at: chrono::Utc::now().timestamp() as u64,
+            kind: crate::models::SessionKind::Chunk,
+            expires_at: None,
         }
     }
 
@@ -392,6 +493,19 @@ mod tests {
         let ranges = vec![];
         let chunk_key = service.generate_chunk_key_from_ranges(&ranges);
         assert_eq!(chunk_key, "0-");
+    }
+
+    #[test]
+    fn test_scoped_download_key_isolates_files() {
+        assert_eq!(SessionService::scoped_download_key(None, "0-"), "0-");
+        assert_eq!(
+            SessionService::scoped_download_key(Some("a/one.bin"), "0-"),
+            "a/one.bin:0-"
+        );
+        assert_ne!(
+            SessionService::scoped_download_key(Some("a/one.bin"), "0-"),
+            SessionService::scoped_download_key(Some("b/two.bin"), "0-")
+        );
     }
 
     #[tokio::test]
@@ -518,5 +632,59 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].url, cdn_record.url);
         assert_eq!(records[0].server_id, cdn_record.server_id);
+    }
+
+    #[tokio::test]
+    async fn test_sticky_penalty_servers_across_files() {
+        let data_store =
+            Arc::new(MockDataStore::new()) as crate::modules::storage::data_store::DataStore;
+        let service = SessionService::new(data_store.clone());
+        let session_id = "sticky_penalty_sid";
+
+        service
+            .store_session(session_id, &create_test_session())
+            .await
+            .unwrap();
+
+        let file1_record = CdnRecord {
+            url: "https://a.example.com/file1".to_string(),
+            server_id: Some("server_a".to_string()),
+            skip_penalty: false,
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            weight: 20,
+            size: Some(100),
+        };
+        let file2_skip = CdnRecord {
+            url: "https://b.example.com/file2".to_string(),
+            server_id: Some("server_b".to_string()),
+            skip_penalty: true,
+            timestamp: chrono::Utc::now().timestamp() as u64,
+            weight: 10,
+            size: Some(100),
+        };
+
+        service
+            .record_final_cdn_selection(session_id, "file1:0-", file1_record)
+            .await
+            .unwrap();
+        service
+            .record_final_cdn_selection(session_id, "file2:0-", file2_skip)
+            .await
+            .unwrap();
+
+        let by_chunk = service
+            .get_penalty_servers(session_id, "file2:0-")
+            .await
+            .unwrap();
+        assert!(
+            by_chunk.is_empty(),
+            "per-chunk lookup should not see file1's server"
+        );
+
+        let sticky = service
+            .get_sticky_penalty_servers(session_id)
+            .await
+            .unwrap();
+        assert_eq!(sticky, vec!["server_a".to_string()]);
     }
 }

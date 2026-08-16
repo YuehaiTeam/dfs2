@@ -282,13 +282,13 @@ pub struct ServerImpactStatistics {
     pub cpi_score: f64,
     /// Performance grade based on CPI (S/A/B/C/D/F)
     pub grade: String,
-    
+
     // === Core CPI v5 Components (Concurrency Context-Aware) ===
     /// File size distribution and performance stats (for reference)
     pub file_size_stats: FileSizeDistribution,
     /// Percentage of times this server appears in session tail
     pub tail_appearance_rate: f64,
-    
+
     // === CPI v5 Primary Metrics ===
     /// Average concurrency level when this server was active
     pub avg_concurrency_level: f64,
@@ -300,7 +300,7 @@ pub struct ServerImpactStatistics {
     pub critical_path_reliability: f64,
     /// Adaptability across different concurrency levels  
     pub adaptability_score: f64,
-    
+
     // === Legacy Metrics (for compatibility) ===
     /// Performance variance coefficient - stability component
     pub performance_cv: f64,
@@ -445,8 +445,8 @@ pub struct ChunkAllocationImpact {
 pub struct ServerSessionPerformance {
     pub server_id: String,
     pub total_bytes: u64,
-    pub total_duration: f64,  // From first start to last completion
-    pub actual_speed: f64,    // Average MB/s
+    pub total_duration: f64,     // From first start to last completion
+    pub actual_speed: f64,       // Average MB/s
     pub session_time_usage: f64, // Fraction of session time used
     pub data_contribution: f64,  // Fraction of total session data
     pub efficiency_score: f64,   // Relative efficiency (0-1)
@@ -468,18 +468,18 @@ pub struct BottleneckAnalysis {
 /// Types of server behavior in session analysis
 #[derive(Debug, Clone, PartialEq)]
 pub enum BottleneckType {
-    TrueBottleneck,    // Low efficiency, high time usage, drags session
-    Workhorse,         // High efficiency, high usage, carries session
+    TrueBottleneck,       // Low efficiency, high time usage, drags session
+    Workhorse,            // High efficiency, high usage, carries session
     EfficiencyBottleneck, // Medium efficiency but unreasonable time usage
-    Normal,            // Regular performance
-    Underutilized,     // Good efficiency but low usage
+    Normal,               // Regular performance
+    Underutilized,        // Good efficiency but low usage
 }
 
 impl BottleneckType {
     pub fn as_str(&self) -> &'static str {
         match self {
             BottleneckType::TrueBottleneck => "true_bottleneck",
-            BottleneckType::Workhorse => "workhorse", 
+            BottleneckType::Workhorse => "workhorse",
             BottleneckType::EfficiencyBottleneck => "efficiency_bottleneck",
             BottleneckType::Normal => "normal",
             BottleneckType::Underutilized => "underutilized",

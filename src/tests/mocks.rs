@@ -15,6 +15,7 @@ use crate::modules::storage::data_store::{
 use crate::modules::version_provider::{PluginVersionProvider, VersionCache, VersionUpdater};
 use crate::services::{
     BandwidthCacheService, ChallengeService, FlowService, ResourceService, SessionService,
+    VersionFileService,
 };
 
 /// 统一的测试环境，包含所有必要的服务和Mock
@@ -89,6 +90,11 @@ impl TestEnvironment {
 
         // 创建AppContext
         let metrics = Arc::new(Metrics::new(shared_config.clone()).unwrap());
+        let version_file_service = VersionFileService::new(
+            shared_config.clone(),
+            data_store.clone(),
+            resource_service.clone(),
+        );
         let app_context = AppContext::new(
             session_service.clone(),
             resource_service.clone(),
@@ -99,6 +105,7 @@ impl TestEnvironment {
             metrics,
             shared_config.clone(),
             data_store.clone(),
+            version_file_service,
         );
 
         Self {
@@ -144,6 +151,7 @@ impl MockDataStore {
             file_size: Some(1024),
             last_check: chrono::Utc::now().timestamp() as u64,
             observed_cert_hash: None,
+            content_hash: None,
         };
 
         // 为各种测试资源路径预设健康信息
@@ -157,6 +165,22 @@ impl MockDataStore {
         health_info.insert("test_server_1:/web/file.bin".to_string(), healthy.clone());
         health_info.insert(
             "test_server_1:/game/v3/textures/player.png".to_string(),
+            healthy.clone(),
+        );
+        health_info.insert(
+            "test_server_1:/free/v1/a/one.bin".to_string(),
+            healthy.clone(),
+        );
+        health_info.insert(
+            "test_server_2:/free/v1/a/one.bin".to_string(),
+            healthy.clone(),
+        );
+        health_info.insert(
+            "test_server_1:/free/v1/b/two.bin".to_string(),
+            healthy.clone(),
+        );
+        health_info.insert(
+            "test_server_2:/free/v1/b/two.bin".to_string(),
             healthy.clone(),
         );
 
@@ -836,6 +860,8 @@ pub fn create_default_test_config() -> AppConfig {
         legacy_client_full_range: false,
         changelog: None,
         version_provider: None,
+        version_files: vec![],
+        version_file_split_ttl: 300,
     };
 
     let mut version_map = HashMap::new();
@@ -873,6 +899,8 @@ pub fn create_default_test_config() -> AppConfig {
         legacy_client_full_range: false,
         changelog: None,
         version_provider: None,
+        version_files: vec![],
+        version_file_split_ttl: 300,
     };
 
     let mut prefix_version_map = HashMap::new();
@@ -884,6 +912,85 @@ pub fn create_default_test_config() -> AppConfig {
     config
         .resources
         .insert("game_assets".to_string(), prefix_resource_config);
+
+    // Free 前缀资源：sid 只做跨文件粘滞回退
+    let mut free_prefix_config = ResourceConfig {
+        latest: "1.0.0".to_string(),
+        versions: HashMap::new(),
+        tries: vec![],
+        server: vec![],
+        flow: vec![crate::modules::flow::config::FlowItem {
+            rules: vec![],
+            mode: crate::modules::flow::config::FlowMode::AND,
+            r#use: vec![
+                crate::modules::flow::config::FlowUse::Server {
+                    id: "test_server_1".to_string(),
+                    weight: 20,
+                },
+                crate::modules::flow::config::FlowUse::Server {
+                    id: "test_server_2".to_string(),
+                    weight: 10,
+                },
+            ],
+            r#break: false,
+        }],
+        challenge: None,
+        download: DownloadPolicy::Free,
+        resource_type: "prefix".to_string(),
+        cache_enabled: false,
+        cache_subpaths: vec![],
+        cache_max_age: 300,
+        legacy_client_support: false,
+        legacy_client_full_range: false,
+        changelog: None,
+        version_provider: None,
+        version_files: vec![],
+        version_file_split_ttl: 300,
+    };
+    let mut free_prefix_versions = HashMap::new();
+    free_prefix_versions.insert("default".to_string(), "/free/v1/".to_string());
+    free_prefix_config
+        .versions
+        .insert("1.0.0".to_string(), free_prefix_versions);
+    config
+        .resources
+        .insert("free_assets".to_string(), free_prefix_config);
+
+    let mut free_other_config = ResourceConfig {
+        latest: "1.0.0".to_string(),
+        versions: HashMap::new(),
+        tries: vec![],
+        server: vec![],
+        flow: vec![crate::modules::flow::config::FlowItem {
+            rules: vec![],
+            mode: crate::modules::flow::config::FlowMode::AND,
+            r#use: vec![crate::modules::flow::config::FlowUse::Server {
+                id: "test_server_1".to_string(),
+                weight: 10,
+            }],
+            r#break: false,
+        }],
+        challenge: None,
+        download: DownloadPolicy::Free,
+        resource_type: "file".to_string(),
+        cache_enabled: false,
+        cache_subpaths: vec![],
+        cache_max_age: 300,
+        legacy_client_support: false,
+        legacy_client_full_range: false,
+        changelog: None,
+        version_provider: None,
+        version_files: vec![],
+        version_file_split_ttl: 300,
+    };
+    let mut free_other_versions = HashMap::new();
+    free_other_versions.insert("default".to_string(), "/test/file.bin".to_string());
+    free_other_config
+        .versions
+        .insert("1.0.0".to_string(), free_other_versions);
+    config
+        .resources
+        .insert("free_other".to_string(), free_other_config);
 
     // 添加MD5挑战资源
     let mut md5_resource_config = ResourceConfig {
@@ -915,6 +1022,8 @@ pub fn create_default_test_config() -> AppConfig {
         legacy_client_full_range: false,
         changelog: None,
         version_provider: None,
+        version_files: vec![],
+        version_file_split_ttl: 300,
     };
 
     let mut md5_version_map = HashMap::new();
@@ -956,6 +1065,8 @@ pub fn create_default_test_config() -> AppConfig {
         legacy_client_full_range: false,
         changelog: None,
         version_provider: None,
+        version_files: vec![],
+        version_file_split_ttl: 300,
     };
 
     let mut sha256_version_map = HashMap::new();
@@ -997,6 +1108,8 @@ pub fn create_default_test_config() -> AppConfig {
         legacy_client_full_range: false,
         changelog: None,
         version_provider: None,
+        version_files: vec![],
+        version_file_split_ttl: 300,
     };
 
     let mut web_version_map = HashMap::new();
@@ -1047,6 +1160,8 @@ pub fn create_default_test_config() -> AppConfig {
                 "include_prerelease": false
             }),
         }),
+        version_files: vec![],
+        version_file_split_ttl: 300,
     };
 
     let mut test_version_map = HashMap::new();

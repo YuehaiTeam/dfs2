@@ -12,7 +12,7 @@ use crate::{
     modules::{
         external::geolocation,
         network::RealConnectInfo,
-        network::h3_capability::compute_h3_capable,
+        network::capabilities::compute_capabilities,
         storage::{cache::should_cache_content, data_store::BandwidthUpdateBatch},
     },
     routes::resource::{calculate_actual_bytes_from_range, parse_range_for_flow},
@@ -59,7 +59,7 @@ pub async fn handle_download_request_unified(
     let original_session_id = session_id.clone();
 
     // 提取 extras 信息和session对象用于 Flow 规则
-    let (extras, enabled_session) = match &resource_config.download {
+    let (mut extras, mut enabled_session) = match &resource_config.download {
         DownloadPolicy::Disabled => {
             return Err(DfsError::download_not_allowed(
                 &resid,
@@ -81,6 +81,13 @@ pub async fn handle_download_request_unified(
                 .session_service
                 .get_validated_session(session_id)
                 .await?;
+
+            if session.resource_id != resid || session.sub_path != sub_path {
+                return Err(DfsError::download_not_allowed(
+                    &resid,
+                    "session is bound to a different file",
+                ));
+            }
 
             // 验证 chunks：比较请求的 range 与 session chunks 是否一致
             if let Some(requested_range) = &range {
@@ -113,6 +120,78 @@ pub async fn handle_download_request_unified(
         .resource_service
         .get_version_path(&resid, &version, None, sub_path.as_deref())
         .ok_or_else(|| DfsError::path_not_found(&resid, &version))?;
+
+    let is_version_file = ctx
+        .version_file_service
+        .is_version_file_request(&resid, &version, &path)
+        .await;
+    if is_version_file
+        && ctx
+            .version_file_service
+            .is_split_failed(&resid, &path)
+            .await
+    {
+        return Err(DfsError::download_not_allowed(
+            &resid,
+            "version file has no replica majority",
+        ));
+    }
+
+    if matches!(resource_config.download, DownloadPolicy::Free) {
+        if let Some(sid) = original_session_id.as_deref() {
+            let mut stored_session = ctx.data_store.get_session(sid).await?;
+            if stored_session.as_ref().is_some_and(|session| {
+                session.is_direct_expired(chrono::Utc::now().timestamp() as u64)
+            }) {
+                ctx.session_service.remove_session(sid).await?;
+                stored_session = None;
+            }
+
+            let session = match stored_session {
+                Some(session) => {
+                    // Free sid 只做粘滞回退，不锁死单个文件。同一资源下换 sub_path 必须能复用。
+                    if session.resource_id != resid {
+                        return Err(DfsError::download_not_allowed(
+                            &resid,
+                            "sid is already associated with a different download",
+                        ));
+                    }
+                    if let Err(e) = ctx.session_service.refresh_session(sid).await {
+                        warn!("Failed to refresh free sticky session {sid}: {e}");
+                    }
+                    session
+                }
+                None => {
+                    let mut session = crate::models::Session {
+                        resource_id: resid.clone(),
+                        version: version.clone(),
+                        chunks: vec![range.clone().unwrap_or_else(|| "0-".to_string())],
+                        sub_path: None,
+                        cdn_records: std::collections::HashMap::new(),
+                        extras: serde_json::json!({"client_ip": client_ip.map(|ip| ip.to_string())}),
+                        created_at: chrono::Utc::now().timestamp() as u64,
+                        kind: crate::models::SessionKind::Direct,
+                        expires_at: None,
+                    };
+                    session.make_direct();
+                    ctx.session_service.store_session(sid, &session).await?;
+                    session
+                }
+            };
+            extras = session.extras.clone();
+            enabled_session = Some(session);
+        }
+    } else if let Some(session) = enabled_session.as_mut() {
+        if session.kind != crate::models::SessionKind::Direct {
+            session.make_direct();
+            if !session.chunks.iter().any(|chunk| chunk == "0-") {
+                session.chunks.push("0-".to_string());
+            }
+            ctx.session_service
+                .store_session(original_session_id.as_deref().unwrap_or_default(), session)
+                .await?;
+        }
+    }
 
     // 检查资源是否启用缓存，如果是，先检查缓存
     if resource_config.cache_enabled {
@@ -299,7 +378,7 @@ pub async fn handle_download_request_unified(
         client_ip,
         session_id: original_session_id.clone(),
         extras,
-        h3_capable: compute_h3_capable(h3_override.as_deref(), user_agent.as_deref()),
+        capabilities: compute_capabilities(h3_override.as_deref(), user_agent.as_deref()),
     };
 
     let options = crate::models::FlowOptions {
@@ -318,25 +397,53 @@ pub async fn handle_download_request_unified(
         .unwrap_or(0.0);
     let flow_list = &resource_config.flow;
     let flow_result = if let (Some(sid), Some(session)) = (&original_session_id, &enabled_session) {
-        // Enabled模式：有session，使用SessionService统一处理
         let requested_ranges = parsed_ranges.unwrap_or_default();
-        ctx.session_service
-            .run_flow_for_session(
-                session,
-                sid,
-                requested_ranges,
-                &ctx.flow_service,
-                client_ip,
-                request_file_size,
-                flow_list,
-                &options,
-                context.h3_capable,
-            )
-            .await
-            .map_err(|e| {
-                error!("ERROR {} size={:.2}MB {}", resource_path, file_size_mb, e);
-                DfsError::internal_error(format!("Failed to generate download URL: {e}"))
-            })?
+        let chunk_key = ctx
+            .session_service
+            .generate_chunk_key_from_ranges(&requested_ranges);
+        let count_key =
+            crate::services::SessionService::scoped_download_key(sub_path.as_deref(), &chunk_key);
+        if matches!(resource_config.download, DownloadPolicy::Enabled) {
+            ctx.session_service
+                .check_download_limit(sid, &count_key)
+                .await?;
+            ctx.session_service
+                .run_flow_for_session(
+                    session,
+                    sid,
+                    requested_ranges,
+                    &ctx.flow_service,
+                    client_ip,
+                    request_file_size,
+                    flow_list,
+                    &options,
+                    context.capabilities.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    error!("ERROR {} size={:.2}MB {}", resource_path, file_size_mb, e);
+                    DfsError::internal_error(format!("Failed to generate download URL: {e}"))
+                })?
+        } else {
+            ctx.session_service
+                .record_download_attempt(sid, &count_key)
+                .await?;
+            ctx.session_service
+                .run_flow_for_sticky_download(
+                    session,
+                    sid,
+                    &target,
+                    &ctx.flow_service,
+                    &context,
+                    &options,
+                    flow_list,
+                )
+                .await
+                .map_err(|e| {
+                    error!("ERROR {} size={:.2}MB {}", resource_path, file_size_mb, e);
+                    DfsError::internal_error(format!("Failed to generate download URL: {e}"))
+                })?
+        }
     } else {
         // Free模式：无session，直接使用FlowService
         ctx.flow_service
@@ -378,25 +485,26 @@ pub async fn handle_download_request_unified(
     );
 
     // 检查是否应该缓存
-    let cached_result = if let Some((file_size, max_age)) = should_cache_content(
-        &config_guard,
-        &ctx.data_store,
-        &resid,
-        sub_path.as_deref(), // 传入子路径用于模式匹配
-        flow_result
-            .selected_server_id
-            .as_deref()
-            .unwrap_or("unknown"),
-        &path,
-    )
-    .await
+    let cached_result = if !is_version_file
+        && let Some((file_size, max_age)) = should_cache_content(
+            &config_guard,
+            &ctx.data_store,
+            &resid,
+            sub_path.as_deref(), // 传入子路径用于模式匹配
+            flow_result
+                .selected_server_id
+                .as_deref()
+                .unwrap_or("unknown"),
+            &path,
+        )
+        .await
     {
         println!("File size from health info: {}", file_size);
-        if file_size < 100 * 1024 {
-            // 100KB限制
+        if file_size < 256 * 1024 {
+            // 256KB限制
             // 下载并缓存
             println!(
-                "File size {} within 100KB cache limit, attempting to cache",
+                "File size {} within 256KB cache limit, attempting to cache",
                 file_size
             );
             download_and_cache(&cdn_url, &resid, &version, &path, &ctx.data_store, max_age)
@@ -404,7 +512,7 @@ pub async fn handle_download_request_unified(
                 .ok()
         } else {
             println!(
-                "File size {} exceeds 100KB cache limit, skipping cache",
+                "File size {} exceeds 256KB cache limit, skipping cache",
                 file_size
             );
             None
@@ -450,7 +558,7 @@ pub async fn handle_download_request_unified(
         }
     }
 
-    // 如果是 enabled 模式且有 session，记录日志并销毁 session
+    // Direct session 保留到其短生命周期结束，以支持使用同一 sid 的节点回退。
     if matches!(resource_config.download, DownloadPolicy::Enabled) {
         if let Some(ref sid) = original_session_id {
             // 在删除之前记录直接下载日志
@@ -484,15 +592,6 @@ pub async fn handle_download_request_unified(
                     };
                     error!("Failed to log {}: {}", log_type, e);
                 }
-            }
-
-            if let Err(e) = ctx.session_service.remove_session(sid).await {
-                let session_type = if sub_path.is_some() {
-                    "session after prefix download"
-                } else {
-                    "session after download"
-                };
-                warn!("Failed to remove {}: {}", session_type, e);
             }
         }
     }
@@ -591,7 +690,7 @@ pub async fn download_redirect(
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
 
     // 获取 session 参数
-    let session_id = params.get("session").cloned();
+    let session_id = params.get("session").or_else(|| params.get("sid")).cloned();
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -804,7 +903,7 @@ pub async fn download_prefix_redirect(
         .or_else(|| Some(real_connect_info.remote_addr.ip()));
 
     // 获取 session 参数
-    let session_id = params.get("session").cloned();
+    let session_id = params.get("session").or_else(|| params.get("sid")).cloned();
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -899,9 +998,13 @@ pub async fn download_prefix_json(
             .get_resource(&resid)
             .map(|r| r.legacy_client_support)
             .unwrap_or(false);
+        let is_free = config_guard
+            .get_resource(&resid)
+            .map(|r| r.download == DownloadPolicy::Free)
+            .unwrap_or(false);
         drop(config_guard);
 
-        if is_legacy_resource {
+        if is_legacy_resource && !is_free {
             // 历史客户端处理：sid 可能为空（第一次请求）
             let sid = params.get("sid").map(|s| s.as_str()).unwrap_or("");
 
@@ -980,4 +1083,165 @@ pub async fn download_prefix_json(
     };
 
     Ok(ApiResponse::success(response_data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::common::*;
+
+    #[tokio::test]
+    async fn test_free_prefix_sid_reused_across_files() {
+        let env = TestEnvironment::new().await;
+        let sid = "folder-sticky-sid".to_string();
+
+        let first = handle_download_request_unified(
+            "free_assets".to_string(),
+            Some("a/one.bin".to_string()),
+            Some(sid.clone()),
+            None,
+            &env.app_context,
+            Some("127.0.0.1".parse().unwrap()),
+            None,
+            None,
+        )
+        .await
+        .expect("first file should schedule");
+
+        let first_url = match first {
+            DownloadResponse::Redirect(url) => url,
+            other => panic!("expected redirect, got {other:?}"),
+        };
+        assert!(
+            first_url.contains("/free/v1/a/one.bin") || first_url.contains("a/one.bin"),
+            "first URL should use request path: {first_url}"
+        );
+
+        let penalties = env
+            .services
+            .session_service
+            .get_sticky_penalty_servers(&sid)
+            .await
+            .unwrap();
+        assert!(
+            !penalties.is_empty(),
+            "first file should record a server for later avoidance"
+        );
+
+        let second = handle_download_request_unified(
+            "free_assets".to_string(),
+            Some("b/two.bin".to_string()),
+            Some(sid.clone()),
+            None,
+            &env.app_context,
+            Some("127.0.0.1".parse().unwrap()),
+            None,
+            None,
+        )
+        .await
+        .expect("same sid must work for a second file in the folder");
+
+        let second_url = match second {
+            DownloadResponse::Redirect(url) => url,
+            other => panic!("expected redirect, got {other:?}"),
+        };
+        assert!(
+            second_url.contains("/free/v1/b/two.bin") || second_url.contains("b/two.bin"),
+            "second URL should follow the new request path: {second_url}"
+        );
+
+        let stored = env.data_store.get_session(&sid).await.unwrap().unwrap();
+        assert_eq!(stored.resource_id, "free_assets");
+        assert_eq!(stored.sub_path, None);
+    }
+
+    #[tokio::test]
+    async fn test_free_sid_rejects_different_resource() {
+        let env = TestEnvironment::new().await;
+        let sid = "cross-resource-sid".to_string();
+
+        handle_download_request_unified(
+            "free_assets".to_string(),
+            Some("a/one.bin".to_string()),
+            Some(sid.clone()),
+            None,
+            &env.app_context,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let err = handle_download_request_unified(
+            "free_other".to_string(),
+            None,
+            Some(sid),
+            None,
+            &env.app_context,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("sid must not move to another resource");
+
+        match err {
+            DfsError::DownloadNotAllowed { reason, .. } => {
+                assert!(reason.contains("already associated"));
+            }
+            other => panic!("expected download_not_allowed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_enabled_download_rejects_other_file() {
+        let env = TestEnvironment::new().await;
+        let sid = "enabled-bound-file";
+
+        env.services
+            .challenge_service
+            .generate_and_store_challenge(sid, "game_assets", Some("a/one.bin"))
+            .await
+            .unwrap();
+        let stored = env.data_store.get_challenge(sid).await.unwrap().unwrap();
+        let challenge_json: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        let original_data = hex::decode(challenge_json["original_data"].as_str().unwrap()).unwrap();
+        let answer = format!("{:x}", md5::compute(&original_data));
+
+        crate::routes::resource::sessions::handle_create_session_unified(
+            "game_assets".to_string(),
+            Some("a/one.bin".to_string()),
+            env.app_context.clone(),
+            crate::models::CreateSessionRequest {
+                version: "3.0.0".to_string(),
+                chunks: vec!["0-".to_string()],
+                sid: sid.to_string(),
+                challenge: answer,
+                extras: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = handle_download_request_unified(
+            "game_assets".to_string(),
+            Some("b/two.bin".to_string()),
+            Some(sid.to_string()),
+            None,
+            &env.app_context,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("enabled session must not download another file");
+
+        match err {
+            DfsError::DownloadNotAllowed { reason, .. } => {
+                assert!(reason.contains("different file"));
+            }
+            other => panic!("expected bound-to-file error, got {other:?}"),
+        }
+    }
 }

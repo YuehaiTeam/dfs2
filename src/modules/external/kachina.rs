@@ -2,7 +2,7 @@ use bytes::Bytes;
 use serde_json::{Value, json};
 
 use crate::config::SharedConfig;
-use crate::container::REQWEST_CLIENT;
+use crate::container::FETCH_CLIENT;
 use crate::error::{DfsError, DfsResult};
 use crate::models::{FlowContext, FlowOptions, FlowTarget};
 use crate::services::FlowService;
@@ -187,7 +187,7 @@ pub async fn fetch_file_range(
         client_ip: None, // Kachina解析通常不需要客户端IP信息
         session_id: None,
         extras: serde_json::json!({}),
-        h3_capable: false, // Internal usage, no client context
+        capabilities: Default::default(), // Internal usage, no client context
     };
 
     let options = FlowOptions {
@@ -217,7 +217,7 @@ pub async fn fetch_file_range(
     };
 
     // 使用全局 HTTP 客户端下载文件
-    let mut request = REQWEST_CLIENT.get(&cdn_url);
+    let mut request = FETCH_CLIENT.get(&cdn_url);
 
     if !range_header.is_empty() {
         request = request.header("Range", &range_header);

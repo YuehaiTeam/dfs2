@@ -1,14 +1,15 @@
 use crate::commands::analyze::models::{
-    CdnRecordLog, DataCoverage, DetailedStatistics, ReliabilityAnalysis, ServerDetailedStats,
-    ServerPerformanceAnalysis, ServerReliabilityStats, ServerSpeedStats, ServerTtfbStats,
-    SessionLog, SpeedAnalysis, TtfbAnalysis, FileSizePerformance, FileSizeStats, 
-    ServerImpactStatistics, ServerSessionPerformance, BottleneckAnalysis, BottleneckType,
-    ErrorAnalysis, ServerErrorStats, FileSizeDistribution, GlobalPerformanceStats,
+    BottleneckAnalysis, BottleneckType, CdnRecordLog, DataCoverage, DetailedStatistics,
+    ErrorAnalysis, FileSizeDistribution, FileSizePerformance, FileSizeStats,
+    GlobalPerformanceStats, ReliabilityAnalysis, ServerDetailedStats, ServerErrorStats,
+    ServerImpactStatistics, ServerPerformanceAnalysis, ServerReliabilityStats,
+    ServerSessionPerformance, ServerSpeedStats, ServerTtfbStats, SessionLog, SpeedAnalysis,
+    TtfbAnalysis,
 };
 use crate::commands::analyze::stats::allocation;
-use std::collections::HashMap;
-use regex::Regex;
 use rayon::prelude::*;
+use regex::Regex;
+use std::collections::HashMap;
 
 /// 会话并发度时间线缓存 - 性能优化核心数据结构
 #[derive(Debug, Clone)]
@@ -35,19 +36,19 @@ impl SessionConcurrencyTimeline {
     /// 快速查询指定时间点的并发度 - O(log N) 复杂度
     fn get_concurrency_at_time(&self, timestamp: u64) -> usize {
         let mut concurrency: usize = 0;
-        
+
         // 只需要检查timestamp之前的所有事件
         for event in &self.timeline {
             if event.timestamp > timestamp {
                 break; // 事件已按时间排序，可以提前退出
             }
-            
+
             match event.event_type {
                 EventType::DownloadStart => concurrency += 1,
                 EventType::DownloadEnd => concurrency = concurrency.saturating_sub(1),
             }
         }
-        
+
         concurrency
     }
 }
@@ -55,21 +56,21 @@ impl SessionConcurrencyTimeline {
 /// 为单个会话预计算并发度时间线
 fn precompute_session_timeline(session: &SessionLog) -> SessionConcurrencyTimeline {
     let mut events = Vec::new();
-    
+
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             let download_start = cdn_record.ts;
-            
+
             if let Some(duration) = cdn_record.time {
                 let download_end = download_start + duration as u64;
-                
+
                 // 添加开始和结束事件
                 events.push(ConcurrencyEvent {
                     timestamp: download_start,
                     event_type: EventType::DownloadStart,
                     server_id: cdn_record.srv.clone(),
                 });
-                
+
                 events.push(ConcurrencyEvent {
                     timestamp: download_end,
                     event_type: EventType::DownloadEnd,
@@ -78,10 +79,10 @@ fn precompute_session_timeline(session: &SessionLog) -> SessionConcurrencyTimeli
             }
         }
     }
-    
+
     // 按时间排序，确保查询时可以提前退出
     events.sort_by_key(|e| e.timestamp);
-    
+
     SessionConcurrencyTimeline {
         session_id: session.sid.clone().unwrap_or_default(),
         timeline: events,
@@ -90,7 +91,9 @@ fn precompute_session_timeline(session: &SessionLog) -> SessionConcurrencyTimeli
 }
 
 /// 并行预计算所有会话的并发度时间线 - 主要性能提升点
-fn precompute_all_session_timelines(sessions: &[SessionLog]) -> HashMap<String, SessionConcurrencyTimeline> {
+fn precompute_all_session_timelines(
+    sessions: &[SessionLog],
+) -> HashMap<String, SessionConcurrencyTimeline> {
     sessions
         .par_iter() // 使用 Rayon 并行处理
         .filter_map(|session| {
@@ -232,20 +235,11 @@ fn analyze_ttfb(cdn_records: &[CdnRecordWithMeta]) -> TtfbAnalysis {
 
 fn classify_ttfb_performance(avg_ttfb_ms: f64) -> (String, Option<String>) {
     if avg_ttfb_ms > 4000.0 {
-        (
-            "critical".to_string(),
-            None,
-        )
+        ("critical".to_string(), None)
     } else if avg_ttfb_ms > 2500.0 {
-        (
-            "warning".to_string(),
-            None,
-        )
+        ("warning".to_string(), None)
     } else if avg_ttfb_ms > 1500.0 {
-        (
-            "needs_attention".to_string(),
-            None,
-        )
+        ("needs_attention".to_string(), None)
     } else if avg_ttfb_ms < 800.0 {
         ("excellent".to_string(), None)
     } else {
@@ -268,11 +262,12 @@ fn analyze_speed(cdn_records: &[CdnRecordWithMeta]) -> SpeedAnalysis {
                 // Only include successful downloads (no error)
                 if record_meta.record.err.is_none() 
                     && time >= 10  // Minimum 50ms to avoid unrealistic high speeds (reduced from 100ms)
-                    && size >= 10240  // Minimum 10KB for accurate measurement
+                    && size >= 10240
+                // Minimum 10KB for accurate measurement
                 {
                     // Convert to MB/s (size in bytes, time in milliseconds)
                     let speed_mbps = (size as f64 / 1024.0 / 1024.0) / (time as f64 / 1000.0);
-                    
+
                     // Apply maximum speed filter (1000MB/s to avoid filtering high-speed downloads, increased from 500MB/s)
                     if speed_mbps <= 1000.0 {
                         server_speeds
@@ -338,20 +333,11 @@ fn analyze_speed(cdn_records: &[CdnRecordWithMeta]) -> SpeedAnalysis {
 
 fn classify_speed_performance(avg_speed_mbps: f64) -> (String, Option<String>) {
     if avg_speed_mbps < 1.0 {
-        (
-            "critical".to_string(),
-            None,
-        )
+        ("critical".to_string(), None)
     } else if avg_speed_mbps < 2.0 {
-        (
-            "warning".to_string(),
-            None,
-        )
+        ("warning".to_string(), None)
     } else if avg_speed_mbps < 3.0 {
-        (
-            "needs_attention".to_string(),
-            None,
-        )
+        ("needs_attention".to_string(), None)
     } else if avg_speed_mbps > 5.0 {
         ("excellent".to_string(), None)
     } else {
@@ -477,20 +463,11 @@ fn classify_reliability_performance(
     penalty_rate: f64,
 ) -> (String, Option<String>) {
     if avg_retries > 2.5 || penalty_rate > 60.0 {
-        (
-            "critical".to_string(),
-            None,
-        )
+        ("critical".to_string(), None)
     } else if avg_retries > 1.5 || penalty_rate > 30.0 {
-        (
-            "warning".to_string(),
-            None,
-        )
+        ("warning".to_string(), None)
     } else if avg_retries > 0.8 || penalty_rate > 15.0 {
-        (
-            "needs_attention".to_string(),
-            None,
-        )
+        ("needs_attention".to_string(), None)
     } else if avg_retries < 0.5 && penalty_rate < 8.0 {
         ("excellent".to_string(), None)
     } else {
@@ -523,7 +500,7 @@ fn analyze_error_rates(cdn_records: &[CdnRecordWithMeta]) -> ErrorAnalysis {
 
     for (server_id, data) in server_stats {
         if data.total_requests == 0 || data.error_count == 0 {
-            continue;  // Skip servers with no requests or no errors
+            continue; // Skip servers with no requests or no errors
         }
 
         let error_rate_percentage = (data.error_count as f64 / data.total_requests as f64) * 100.0;
@@ -544,7 +521,11 @@ fn analyze_error_rates(cdn_records: &[CdnRecordWithMeta]) -> ErrorAnalysis {
     }
 
     // Sort by error rate (highest first)
-    error_stats.sort_by(|a, b| b.error_rate_percentage.partial_cmp(&a.error_rate_percentage).unwrap());
+    error_stats.sort_by(|a, b| {
+        b.error_rate_percentage
+            .partial_cmp(&a.error_rate_percentage)
+            .unwrap()
+    });
 
     // Show all servers with errors (no limit)
     let highest_error_servers = error_stats.clone();
@@ -577,23 +558,23 @@ impl ServerErrorData {
 fn clean_error_message(error: &str) -> String {
     // Create regex patterns to match URLs
     let url_patterns = [
-        r"https?://[^\s]+",     // HTTP/HTTPS URLs
-        r"ftp://[^\s]+",        // FTP URLs  
-        r"www\.[^\s]+",         // www. domains
+        r"https?://[^\s]+",                    // HTTP/HTTPS URLs
+        r"ftp://[^\s]+",                       // FTP URLs
+        r"www\.[^\s]+",                        // www. domains
         r"[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}[^\s]*", // General domains
     ];
-    
+
     let mut cleaned = error.to_string();
-    
+
     for pattern in &url_patterns {
         if let Ok(re) = Regex::new(pattern) {
             cleaned = re.replace_all(&cleaned, "[URL_REMOVED]").to_string();
         }
     }
-    
+
     // Also clean up multiple consecutive spaces and trim
     cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    
+
     cleaned
 }
 
@@ -624,16 +605,27 @@ fn analyze_detailed_server_stats(cdn_records: &[CdnRecordWithMeta]) -> Vec<Serve
     analyze_detailed_server_stats_enhanced(cdn_records, &[])
 }
 
-fn analyze_detailed_server_stats_enhanced(cdn_records: &[CdnRecordWithMeta], sessions: &[SessionLog]) -> Vec<ServerDetailedStats> {
+fn analyze_detailed_server_stats_enhanced(
+    cdn_records: &[CdnRecordWithMeta],
+    sessions: &[SessionLog],
+) -> Vec<ServerDetailedStats> {
     // Analyze file size performance and session impact
     let file_size_performance = analyze_file_size_performance(cdn_records, sessions);
     let session_impacts = analyze_session_impact(sessions);
-    
+
     // Call the original analysis function with enhanced data
-    analyze_detailed_server_stats_with_enhanced_data(cdn_records, file_size_performance, session_impacts)
+    analyze_detailed_server_stats_with_enhanced_data(
+        cdn_records,
+        file_size_performance,
+        session_impacts,
+    )
 }
 
-fn analyze_detailed_server_stats_with_enhanced_data(cdn_records: &[CdnRecordWithMeta], file_size_performance: HashMap<String, FileSizePerformance>, session_impacts: HashMap<String, ServerImpactStatistics>) -> Vec<ServerDetailedStats> {
+fn analyze_detailed_server_stats_with_enhanced_data(
+    cdn_records: &[CdnRecordWithMeta],
+    file_size_performance: HashMap<String, FileSizePerformance>,
+    session_impacts: HashMap<String, ServerImpactStatistics>,
+) -> Vec<ServerDetailedStats> {
     let mut server_ttfbs: HashMap<String, Vec<f64>> = HashMap::new();
     let mut server_speeds: HashMap<String, Vec<f64>> = HashMap::new();
     let mut server_requests: HashMap<String, usize> = HashMap::new();
@@ -657,10 +649,11 @@ fn analyze_detailed_server_stats_with_enhanced_data(cdn_records: &[CdnRecordWith
                 // Only include successful downloads (no error)
                 if record_meta.record.err.is_none() 
                     && time >= 10  // Minimum 50ms to avoid unrealistic high speeds (updated from 100ms)
-                    && size >= 10240  // Minimum 10KB for accurate measurement
+                    && size >= 10240
+                // Minimum 10KB for accurate measurement
                 {
                     let speed_mbps = (size as f64 / 1024.0 / 1024.0) / (time as f64 / 1000.0);
-                    
+
                     // Apply maximum speed filter (1000MB/s to avoid filtering high-speed downloads, updated from 500MB/s)
                     if speed_mbps <= 1000.0 {
                         server_speeds
@@ -681,31 +674,27 @@ fn analyze_detailed_server_stats_with_enhanced_data(cdn_records: &[CdnRecordWith
 
     for server_id in all_servers {
         let request_count = *server_requests.get(&server_id).unwrap_or(&0);
-        
+
         // Skip servers with very few requests to avoid statistical noise
         if request_count < 5 {
             continue;
         }
 
-        let ttfb_stats = server_ttfbs
-            .get(&server_id)
-            .and_then(|ttfbs| {
-                if ttfbs.len() >= 3 {
-                    Some(calculate_detailed_statistics(ttfbs))
-                } else {
-                    None
-                }
-            });
+        let ttfb_stats = server_ttfbs.get(&server_id).and_then(|ttfbs| {
+            if ttfbs.len() >= 3 {
+                Some(calculate_detailed_statistics(ttfbs))
+            } else {
+                None
+            }
+        });
 
-        let speed_stats = server_speeds
-            .get(&server_id)
-            .and_then(|speeds| {
-                if speeds.len() >= 3 {
-                    Some(calculate_detailed_statistics(speeds))
-                } else {
-                    None
-                }
-            });
+        let speed_stats = server_speeds.get(&server_id).and_then(|speeds| {
+            if speeds.len() >= 3 {
+                Some(calculate_detailed_statistics(speeds))
+            } else {
+                None
+            }
+        });
 
         // Calculate overall coverage
         let has_stats = ttfb_stats.is_some() || speed_stats.is_some();
@@ -721,7 +710,7 @@ fn analyze_detailed_server_stats_with_enhanced_data(cdn_records: &[CdnRecordWith
         if has_stats {
             let impact_stats = session_impacts.get(&server_id).cloned();
             let file_size_stats = file_size_performance.get(&server_id).cloned();
-            
+
             detailed_stats.push(ServerDetailedStats {
                 server_id,
                 ttfb_stats,
@@ -736,7 +725,7 @@ fn analyze_detailed_server_stats_with_enhanced_data(cdn_records: &[CdnRecordWith
 
     // Sort by request count (most active servers first)
     detailed_stats.sort_by(|a, b| b.request_count.cmp(&a.request_count));
-    
+
     detailed_stats
 }
 
@@ -756,10 +745,10 @@ fn calculate_detailed_statistics(data: &[f64]) -> DetailedStatistics {
 
     let mut sorted_data = data.to_vec();
     sorted_data.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    
+
     let len = sorted_data.len();
     let mean = sorted_data.iter().sum::<f64>() / len as f64;
-    
+
     // Median
     let median = if len % 2 == 0 {
         (sorted_data[len / 2 - 1] + sorted_data[len / 2]) / 2.0
@@ -778,7 +767,8 @@ fn calculate_detailed_statistics(data: &[f64]) -> DetailedStatistics {
             let diff = x - mean;
             diff * diff
         })
-        .sum::<f64>() / len as f64;
+        .sum::<f64>()
+        / len as f64;
     let std_dev = variance.sqrt();
 
     // Percentiles (排除异常慢的数据)
@@ -786,7 +776,7 @@ fn calculate_detailed_statistics(data: &[f64]) -> DetailedStatistics {
     // P99: 排除最慢的1%后，剩余99%数据的最小值
     let p95_index = ((len as f64 * 0.05).ceil() as usize).min(len - 1);
     let p99_index = ((len as f64 * 0.01).ceil() as usize).min(len - 1);
-    
+
     let p95 = sorted_data[p95_index];
     let p99 = sorted_data[p99_index];
 
@@ -803,16 +793,19 @@ fn calculate_detailed_statistics(data: &[f64]) -> DetailedStatistics {
 }
 
 /// Analyze performance by file size categories for each server
-fn analyze_file_size_performance(cdn_records: &[CdnRecordWithMeta], sessions: &[SessionLog]) -> HashMap<String, FileSizePerformance> {
+fn analyze_file_size_performance(
+    cdn_records: &[CdnRecordWithMeta],
+    sessions: &[SessionLog],
+) -> HashMap<String, FileSizePerformance> {
     // File size thresholds in MB
-    const TINY_THRESHOLD: f64 = 1.0;  // <1MB
-    const SMALL_THRESHOLD: f64 = 4.0;  // 1-4MB  
+    const TINY_THRESHOLD: f64 = 1.0; // <1MB
+    const SMALL_THRESHOLD: f64 = 4.0; // 1-4MB  
     const MEDIUM_THRESHOLD: f64 = 20.0; // 4-20MB
     // >20MB = large files
-    
+
     // Data structures to collect measurements by server and size category
     let mut server_data: HashMap<String, FileSizeCategoryData> = HashMap::new();
-    
+
     // Create session map for calculating file sizes from chunks
     let mut session_map: HashMap<String, &SessionLog> = HashMap::new();
     for session in sessions {
@@ -820,37 +813,39 @@ fn analyze_file_size_performance(cdn_records: &[CdnRecordWithMeta], sessions: &[
             session_map.insert(sid.clone(), session);
         }
     }
-    
+
     // Collect data by server and file size category
     for record_meta in cdn_records {
         if let Some(server_id) = &record_meta.server_id {
-            let entry = server_data.entry(server_id.clone()).or_insert_with(FileSizeCategoryData::new);
-            
+            let entry = server_data
+                .entry(server_id.clone())
+                .or_insert_with(FileSizeCategoryData::new);
+
             if let (Some(size), Some(time)) = (record_meta.record.size, record_meta.record.time) {
                 // Only include successful downloads
                 if record_meta.record.err.is_none() && time >= 10 && size >= 10240 {
                     let file_size_mb = size as f64 / (1024.0 * 1024.0);
                     let duration_seconds = time as f64 / 1000.0;
                     let speed_mbps = file_size_mb / duration_seconds;
-                    
+
                     // Skip unrealistic speeds
                     if speed_mbps <= 1000.0 {
                         let category_data = match file_size_mb {
                             x if x < TINY_THRESHOLD => &mut entry.tiny_files,
-                            x if x < SMALL_THRESHOLD => &mut entry.small_files, 
+                            x if x < SMALL_THRESHOLD => &mut entry.small_files,
                             x if x < MEDIUM_THRESHOLD => &mut entry.medium_files,
                             _ => &mut entry.large_files,
                         };
-                        
+
                         category_data.durations.push(duration_seconds);
-                        
+
                         // Collect TTFB for tiny and small files (where it's most relevant)
                         if file_size_mb < SMALL_THRESHOLD {
                             if let Some(ttfb) = record_meta.record.ttfb {
                                 category_data.ttfbs.push(ttfb as f64);
                             }
                         }
-                        
+
                         // Collect speed for small, medium, and large files (where it's most accurate)
                         if file_size_mb >= TINY_THRESHOLD {
                             category_data.speeds.push(speed_mbps);
@@ -860,20 +855,23 @@ fn analyze_file_size_performance(cdn_records: &[CdnRecordWithMeta], sessions: &[
             }
         }
     }
-    
+
     // Convert collected data to FileSizePerformance structures
     let mut result = HashMap::new();
     for (server_id, category_data) in server_data {
         if category_data.has_any_data() {
-            result.insert(server_id, FileSizePerformance {
-                tiny_files: create_file_size_stats(&category_data.tiny_files, true, false), // TTFB only
-                small_files: create_file_size_stats(&category_data.small_files, true, true), // Both TTFB and speed
-                medium_files: create_file_size_stats(&category_data.medium_files, false, true), // Speed only
-                large_files: create_file_size_stats(&category_data.large_files, false, true), // Speed only
-            });
+            result.insert(
+                server_id,
+                FileSizePerformance {
+                    tiny_files: create_file_size_stats(&category_data.tiny_files, true, false), // TTFB only
+                    small_files: create_file_size_stats(&category_data.small_files, true, true), // Both TTFB and speed
+                    medium_files: create_file_size_stats(&category_data.medium_files, false, true), // Speed only
+                    large_files: create_file_size_stats(&category_data.large_files, false, true), // Speed only
+                },
+            );
         }
     }
-    
+
     result
 }
 
@@ -889,7 +887,7 @@ impl FileSizeCategoryData {
     fn new() -> Self {
         Default::default()
     }
-    
+
     fn has_any_data(&self) -> bool {
         !self.tiny_files.durations.is_empty()
             || !self.small_files.durations.is_empty()
@@ -905,30 +903,40 @@ struct CategoryMeasurements {
     durations: Vec<f64>,
 }
 
-fn create_file_size_stats(measurements: &CategoryMeasurements, include_ttfb: bool, include_speed: bool) -> FileSizeStats {
+fn create_file_size_stats(
+    measurements: &CategoryMeasurements,
+    include_ttfb: bool,
+    include_speed: bool,
+) -> FileSizeStats {
     let count = measurements.durations.len();
-    
+
     let ttfb_stats = if include_ttfb && !measurements.ttfbs.is_empty() {
         Some(calculate_detailed_statistics(&measurements.ttfbs))
     } else {
         None
     };
-    
+
     let speed_stats = if include_speed && !measurements.speeds.is_empty() {
         Some(calculate_detailed_statistics(&measurements.speeds))
     } else {
         None
     };
-    
+
     let duration_stats = if !measurements.durations.is_empty() {
         calculate_detailed_statistics(&measurements.durations)
     } else {
         DetailedStatistics {
-            mean: 0.0, median: 0.0, min: 0.0, max: 0.0,
-            std_dev: 0.0, p95: 0.0, p99: 0.0, sample_count: 0,
+            mean: 0.0,
+            median: 0.0,
+            min: 0.0,
+            max: 0.0,
+            std_dev: 0.0,
+            p95: 0.0,
+            p99: 0.0,
+            sample_count: 0,
         }
     };
-    
+
     FileSizeStats {
         count,
         ttfb_stats,
@@ -938,21 +946,21 @@ fn create_file_size_stats(measurements: &CategoryMeasurements, include_ttfb: boo
 }
 
 // CPI v5 calculation constants - concurrency-aware rebalanced weights (方案1优化)
-const TAIL_PERFORMANCE_WEIGHT: f64 = 0.40;      // 增加尾部性能权重 - 直接影响完成时间
-const LOW_CONCURRENCY_SPEED_WEIGHT: f64 = 0.30;  // 增加真实速度权重 - 更突出性能差异
-const CRITICAL_RELIABILITY_WEIGHT: f64 = 0.15;   // 降低过严的可靠性权重
-const ADAPTABILITY_WEIGHT: f64 = 0.10;          // 稳定性评估权重保持不变
-const CONTRIBUTION_WEIGHT_V5: f64 = 0.05;       // 降低贡献权重，更专注性能
+const TAIL_PERFORMANCE_WEIGHT: f64 = 0.40; // 增加尾部性能权重 - 直接影响完成时间
+const LOW_CONCURRENCY_SPEED_WEIGHT: f64 = 0.30; // 增加真实速度权重 - 更突出性能差异
+const CRITICAL_RELIABILITY_WEIGHT: f64 = 0.15; // 降低过严的可靠性权重
+const ADAPTABILITY_WEIGHT: f64 = 0.10; // 稳定性评估权重保持不变
+const CONTRIBUTION_WEIGHT_V5: f64 = 0.05; // 降低贡献权重，更专注性能
 
 // Base score to ensure minimum reasonable scores
 const BASE_SCORE: f64 = 20.0;
 
 // Legacy CPI v4 weights (kept for compatibility)
-const EFFICIENCY_WEIGHT: f64 = 0.30;           // Relative efficiency (with execution delay correction)
-const TRUE_BOTTLENECK_WEIGHT: f64 = 0.25;      // True bottleneck avoidance (scheduling-aware)  
-const CONTRIBUTION_WEIGHT: f64 = 0.25;         // Session contribution and reliability
-const STABILITY_WEIGHT: f64 = 0.15;            // Performance and scheduling consistency
-const SPECIALIZATION_WEIGHT: f64 = 0.05;       // Specialized performance bonus
+const EFFICIENCY_WEIGHT: f64 = 0.30; // Relative efficiency (with execution delay correction)
+const TRUE_BOTTLENECK_WEIGHT: f64 = 0.25; // True bottleneck avoidance (scheduling-aware)  
+const CONTRIBUTION_WEIGHT: f64 = 0.25; // Session contribution and reliability
+const STABILITY_WEIGHT: f64 = 0.15; // Performance and scheduling consistency
+const SPECIALIZATION_WEIGHT: f64 = 0.05; // Specialized performance bonus
 
 /// Calculate Comprehensive Performance Index v5 - concurrency context-aware analysis
 fn calculate_cpi_v5(
@@ -969,21 +977,22 @@ fn calculate_cpi_v5(
     let mut total_reliability_score = 0.0;
     let mut total_adaptability_score = 0.0;
     let mut valid_sessions = 0;
-    
+
     for session in sessions {
         // Skip sessions where this server didn't participate
         let server_participated = session.chunks.iter().any(|chunk| {
-            chunk.cdns.iter().any(|cdn| {
-                cdn.srv.as_ref().map(|s| s == server).unwrap_or(false)
-            })
+            chunk
+                .cdns
+                .iter()
+                .any(|cdn| cdn.srv.as_ref().map(|s| s == server).unwrap_or(false))
         });
-        
+
         if !server_participated {
             continue;
         }
-        
+
         valid_sessions += 1;
-        
+
         // 1. Context-aware speed evaluation
         let context_speed = if let Some(ref session_id) = session.sid {
             if let Some(timeline) = timeline_cache.get(session_id) {
@@ -994,21 +1003,19 @@ fn calculate_cpi_v5(
         } else {
             ContextAwareSpeed::default()
         };
-        
+
         // 2. Tail performance analysis (most critical)
         let tail_score = match analyze_tail_performance(server, session) {
             TailPerformance::Excellent => 1.0,
             TailPerformance::Normal => 0.75,
             TailPerformance::NotPresent => 0.6, // Neutral - not in critical path
-            TailPerformance::Bottleneck { severity } => {
-                match severity.as_str() {
-                    "critical" => 0.0,
-                    "moderate" => 0.3,
-                    _ => 0.1,
-                }
-            }
+            TailPerformance::Bottleneck { severity } => match severity.as_str() {
+                "critical" => 0.0,
+                "moderate" => 0.3,
+                _ => 0.1,
+            },
         };
-        
+
         // 3. Low concurrency speed (most reliable speed measurement) - 方案C优化
         let low_concurrency_score = if context_speed.low_concurrency_speed > 0.0 {
             let expected_speed = estimate_expected_speed_by_file_size(8 * 1024 * 1024); // 8MB baseline
@@ -1030,7 +1037,7 @@ fn calculate_cpi_v5(
         } else {
             0.3 // 降低默认值，区分有数据和无数据的服务器
         };
-        
+
         // 4. Critical path reliability (performance when it matters most)
         let critical_reliability = if server_in_critical_path_session(server, session) {
             // If this server is in critical path, how did it perform?
@@ -1039,27 +1046,27 @@ fn calculate_cpi_v5(
         } else {
             0.8 // Good score if not in critical path (doesn't cause problems)
         };
-        
+
         // 5. Adaptability across concurrency levels
         let adaptability = calculate_performance_adaptability(&context_speed);
-        
+
         // Accumulate scores
         total_tail_score += tail_score;
         total_speed_score += low_concurrency_score;
         total_reliability_score += critical_reliability;
         total_adaptability_score += adaptability;
     }
-    
+
     if valid_sessions == 0 {
         return BASE_SCORE; // Return base score if no valid sessions
     }
-    
+
     // Calculate average scores
     let avg_tail_score = total_tail_score / valid_sessions as f64;
     let avg_speed_score = total_speed_score / valid_sessions as f64;
     let avg_reliability_score = total_reliability_score / valid_sessions as f64;
     let avg_adaptability_score = total_adaptability_score / valid_sessions as f64;
-    
+
     // 6. System contribution score
     let success_rate = 1.0; // Assume 100% for now, can be calculated from error rates
     let contribution_score = calculate_contribution_score(
@@ -1067,16 +1074,15 @@ fn calculate_cpi_v5(
         global_stats.total_data_processed,
         success_rate,
     );
-    
+
     // Combine weighted scores
-    let performance_score = (
-        avg_tail_score * TAIL_PERFORMANCE_WEIGHT +
-        avg_speed_score * LOW_CONCURRENCY_SPEED_WEIGHT +
-        avg_reliability_score * CRITICAL_RELIABILITY_WEIGHT +
-        avg_adaptability_score * ADAPTABILITY_WEIGHT +
-        contribution_score * CONTRIBUTION_WEIGHT_V5
-    ) * (100.0 - BASE_SCORE);
-    
+    let performance_score = (avg_tail_score * TAIL_PERFORMANCE_WEIGHT
+        + avg_speed_score * LOW_CONCURRENCY_SPEED_WEIGHT
+        + avg_reliability_score * CRITICAL_RELIABILITY_WEIGHT
+        + avg_adaptability_score * ADAPTABILITY_WEIGHT
+        + contribution_score * CONTRIBUTION_WEIGHT_V5)
+        * (100.0 - BASE_SCORE);
+
     // Final score with base score guarantee
     (BASE_SCORE + performance_score).max(0.0).min(100.0)
 }
@@ -1085,7 +1091,7 @@ fn calculate_cpi_v5(
 fn server_in_critical_path_session(server: &str, session: &SessionLog) -> bool {
     let session_duration = (session.end - session.start) as f64;
     let critical_threshold = session.start + (session_duration * CRITICAL_PATH_WINDOW) as u64;
-    
+
     // Check if server has any downloads that complete near the end
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
@@ -1101,7 +1107,7 @@ fn server_in_critical_path_session(server: &str, session: &SessionLog) -> bool {
             }
         }
     }
-    
+
     false
 }
 
@@ -1109,9 +1115,9 @@ fn server_in_critical_path_session(server: &str, session: &SessionLog) -> bool {
 fn calculate_critical_path_performance(server: &str, session: &SessionLog) -> f64 {
     let session_duration = (session.end - session.start) as f64;
     let critical_threshold = session.start + (session_duration * CRITICAL_PATH_WINDOW) as u64;
-    
+
     let mut critical_speeds = Vec::new();
-    
+
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             if let Some(server_id) = &cdn_record.srv {
@@ -1119,7 +1125,8 @@ fn calculate_critical_path_performance(server: &str, session: &SessionLog) -> f6
                     if let (Some(size), Some(duration)) = (cdn_record.size, cdn_record.time) {
                         let completion_time = cdn_record.ts + duration as u64;
                         if completion_time >= critical_threshold && duration > 10 {
-                            let speed = (size as f64 / 1024.0 / 1024.0) / (duration as f64 / 1000.0);
+                            let speed =
+                                (size as f64 / 1024.0 / 1024.0) / (duration as f64 / 1000.0);
                             critical_speeds.push(speed);
                         }
                     }
@@ -1127,13 +1134,13 @@ fn calculate_critical_path_performance(server: &str, session: &SessionLog) -> f6
             }
         }
     }
-    
+
     if critical_speeds.is_empty() {
         return 0.8; // Neutral if no critical path data
     }
-    
+
     let avg_critical_speed = critical_speeds.iter().sum::<f64>() / critical_speeds.len() as f64;
-    
+
     // Use the new evaluate_reliability_score function for more nuanced assessment
     evaluate_reliability_score(avg_critical_speed)
 }
@@ -1146,31 +1153,27 @@ const GRADE_C_THRESHOLD: f64 = 40.0;
 const GRADE_D_THRESHOLD: f64 = 25.0;
 
 // File size thresholds
-const SMALL_FILE_THRESHOLD: u64 = 100 * 1024;      // 100KB
+const SMALL_FILE_THRESHOLD: u64 = 100 * 1024; // 100KB
 const LARGE_FILE_THRESHOLD: u64 = 10 * 1024 * 1024; // 10MB
 
 // Minimum time threshold to avoid division by zero
 const MIN_TIME_MS: f64 = 10.0;
 
 /// Calculate layered efficiency score based on file size distribution
-fn calculate_layered_efficiency(
-    file_size_stats: &FileSizeDistribution,
-    total_files: usize,
-) -> f64 {
+fn calculate_layered_efficiency(file_size_stats: &FileSizeDistribution, total_files: usize) -> f64 {
     if total_files == 0 {
         return 0.5; // Default neutral score
     }
-    
+
     let small_weight = file_size_stats.small_files as f64 / total_files as f64;
     let medium_weight = file_size_stats.medium_files as f64 / total_files as f64;
     let large_weight = file_size_stats.large_files as f64 / total_files as f64;
-    
+
     // Weighted efficiency based on file size distribution
-    let weighted_efficiency = 
-        small_weight * file_size_stats.small_file_efficiency +
+    let weighted_efficiency = small_weight * file_size_stats.small_file_efficiency +
         medium_weight * normalize_speed(file_size_stats.medium_file_speed, 5.0) +  // Assume 5MB/s is good for medium
-        large_weight * normalize_speed(file_size_stats.large_file_speed, 10.0);   // Assume 10MB/s is good for large
-    
+        large_weight * normalize_speed(file_size_stats.large_file_speed, 10.0); // Assume 10MB/s is good for large
+
     weighted_efficiency.min(1.0).max(0.0)
 }
 
@@ -1179,7 +1182,7 @@ fn normalize_speed(actual_speed: f64, expected_speed: f64) -> f64 {
     if expected_speed <= 0.0 {
         return 0.5;
     }
-    (actual_speed / expected_speed).min(2.0) / 2.0  // Cap at 2x expected = 1.0
+    (actual_speed / expected_speed).min(2.0) / 2.0 // Cap at 2x expected = 1.0
 }
 
 /// Calculate relative bottleneck impact score - enhanced for CPI v4 with execution delay awareness
@@ -1192,21 +1195,21 @@ fn calculate_relative_impact(
     if usage_rate <= 0.0 {
         return 0.0;
     }
-    
+
     // Relative tail appearance (normalized by usage)
     let relative_tail = tail_rate / usage_rate;
     let avg_relative_tail = global_avg_tail_rate;
-    
+
     // Adjust for file size (large files naturally appear in tail)
     let size_adjustment = if avg_file_size > LARGE_FILE_THRESHOLD as f64 {
-        0.7  // Reduce penalty for large file servers (improved from 0.5 to 0.7)
+        0.7 // Reduce penalty for large file servers (improved from 0.5 to 0.7)
     } else {
         1.0
     };
-    
+
     // Calculate impact score (inverse of bottleneck tendency)
     let bottleneck_factor = (relative_tail / avg_relative_tail.max(0.01)) * size_adjustment;
-    1.0 / (1.0 + bottleneck_factor)  // Convert to 0-1 scale where higher is better
+    1.0 / (1.0 + bottleneck_factor) // Convert to 0-1 scale where higher is better
 }
 
 /// Calculate true bottleneck impact distinguishing real performance issues from scheduling delays
@@ -1222,19 +1225,17 @@ fn calculate_true_bottleneck_impact(
     if total_sessions == 0 || usage_rate <= 0.0 {
         return 1.0; // No impact data, return neutral
     }
-    
+
     let tail_rate = (tail_appearances as f64 / total_sessions as f64) * 100.0;
-    
+
     // Get base impact score
-    let base_impact = calculate_relative_impact(tail_rate, usage_rate, avg_file_size, global_avg_tail_rate);
-    
+    let base_impact =
+        calculate_relative_impact(tail_rate, usage_rate, avg_file_size, global_avg_tail_rate);
+
     // Apply true bottleneck weighting
-    let bottleneck_weight = calculate_true_bottleneck_weight(
-        avg_execution_delay,
-        avg_scheduling_delay,
-        total_sessions
-    );
-    
+    let bottleneck_weight =
+        calculate_true_bottleneck_weight(avg_execution_delay, avg_scheduling_delay, total_sessions);
+
     // Adjust impact based on whether this is a true bottleneck or scheduling issue
     if bottleneck_weight > 1.0 {
         // True bottleneck: amplify the negative impact
@@ -1251,20 +1252,22 @@ fn calculate_true_bottleneck_impact(
 /// Calculate performance variance coefficient (CV)
 fn calculate_performance_cv(performance_values: &[f64]) -> f64 {
     if performance_values.len() < 2 {
-        return 0.0;  // Not enough data
+        return 0.0; // Not enough data
     }
-    
+
     let mean = performance_values.iter().sum::<f64>() / performance_values.len() as f64;
     if mean <= 0.0 {
-        return 1.0;  // Maximum instability
+        return 1.0; // Maximum instability
     }
-    
-    let variance = performance_values.iter()
+
+    let variance = performance_values
+        .iter()
         .map(|v| (v - mean).powi(2))
-        .sum::<f64>() / performance_values.len() as f64;
-    
+        .sum::<f64>()
+        / performance_values.len() as f64;
+
     let std_dev = variance.sqrt();
-    std_dev / mean  // Coefficient of variation
+    std_dev / mean // Coefficient of variation
 }
 
 /// Calculate median from a vector of values
@@ -1290,24 +1293,20 @@ fn calculate_execution_delay(
     if session_median_speed <= 0.0 || file_size == 0 {
         return 0.0;
     }
-    
+
     let file_size_mb = file_size as f64 / (1024.0 * 1024.0);
     let expected_duration = file_size_mb / session_median_speed;
-    
+
     // Return positive value if slower than expected, negative if faster
     actual_duration - expected_duration
 }
 
 /// Calculate scheduling delay as relative position within session
-fn calculate_scheduling_delay(
-    start_time: u64,
-    session_start: u64,
-    session_duration: f64,
-) -> f64 {
+fn calculate_scheduling_delay(start_time: u64, session_start: u64, session_duration: f64) -> f64 {
     if session_duration <= 0.0 {
         return 0.0;
     }
-    
+
     let relative_start = (start_time - session_start) as f64 / session_duration;
     relative_start.max(0.0).min(1.0) // Clamp to 0-1 range
 }
@@ -1321,7 +1320,7 @@ fn calculate_true_bottleneck_weight(
     if session_count == 0 {
         return 1.0;
     }
-    
+
     // Early start + slow completion = true bottleneck
     if avg_scheduling_delay < 0.5 && avg_execution_delay > 0.5 {
         2.0
@@ -1360,7 +1359,7 @@ struct ContextAwareSpeed {
     high_concurrency_speed: f64,   // >12 threads
     medium_concurrency_speed: f64, // 4-12 threads
     low_concurrency_speed: f64,    // <4 threads
-    tail_speed: f64,              // Last 10% of session
+    tail_speed: f64,               // Last 10% of session
 }
 
 /// Tail performance analysis result
@@ -1375,19 +1374,19 @@ enum TailPerformance {
 /// Analyze concurrency windows throughout a session
 fn analyze_concurrency_windows(session: &SessionLog) -> Vec<ConcurrencyWindow> {
     let mut windows = Vec::new();
-    
+
     // Create time slots every 100ms
     let session_duration = (session.end - session.start) as f64;
     let slot_size = 100.0; // 100ms
     let num_slots = (session_duration / slot_size) as usize;
-    
+
     for i in 0..num_slots {
         let slot_start = session.start + (i as f64 * slot_size) as u64;
         let slot_end = session.start + ((i + 1) as f64 * slot_size) as u64;
-        
+
         // Count active downloads in this time slot
         let active_downloads = count_active_downloads_in_slot(slot_start, slot_end, session);
-        
+
         windows.push(ConcurrencyWindow {
             start_time: slot_start,
             end_time: slot_end,
@@ -1395,20 +1394,20 @@ fn analyze_concurrency_windows(session: &SessionLog) -> Vec<ConcurrencyWindow> {
             bandwidth_competition: active_downloads as f64 / 16.0, // Normalize to max 16 threads
         });
     }
-    
+
     windows
 }
 
 /// Count active downloads in a specific time slot
 fn count_active_downloads_in_slot(start: u64, end: u64, session: &SessionLog) -> usize {
     let mut active_count = 0;
-    
+
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             if let Some(duration) = cdn_record.time {
                 let download_start = cdn_record.ts;
                 let download_end = download_start + duration as u64;
-                
+
                 // Check if this download overlaps with the time slot
                 if download_start < end && download_end > start {
                     active_count += 1;
@@ -1416,20 +1415,20 @@ fn count_active_downloads_in_slot(start: u64, end: u64, session: &SessionLog) ->
             }
         }
     }
-    
+
     active_count
 }
 
 /// Get concurrency level at a specific time - 简单版本（用于备用场景）
 fn get_concurrency_at_time(timestamp: u64, session: &SessionLog) -> usize {
     let mut active_count = 0;
-    
+
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             if let Some(duration) = cdn_record.time {
                 let download_start = cdn_record.ts;
                 let download_end = download_start + duration as u64;
-                
+
                 // Check if download is active at this timestamp
                 if download_start <= timestamp && timestamp <= download_end {
                     active_count += 1;
@@ -1437,18 +1436,17 @@ fn get_concurrency_at_time(timestamp: u64, session: &SessionLog) -> usize {
             }
         }
     }
-    
+
     active_count
 }
 
 /// Get concurrency level at a specific time - 使用预计算时间线
 fn get_concurrency_at_time_optimized(
-    timestamp: u64, 
-    timeline: &SessionConcurrencyTimeline
+    timestamp: u64,
+    timeline: &SessionConcurrencyTimeline,
 ) -> usize {
     timeline.get_concurrency_at_time(timestamp)
 }
-
 
 /// Calculate context-aware speed evaluation for a server in a session
 fn calculate_context_aware_speed_score(
@@ -1459,7 +1457,7 @@ fn calculate_context_aware_speed_score(
     let mut speed_samples = Vec::new();
     let session_duration = (session.end - session.start) as f64;
     let tail_threshold = session.start + (session_duration * 0.9) as u64;
-    
+
     // Collect speed samples with concurrency context - 使用优化的并发度查询
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
@@ -1467,38 +1465,47 @@ fn calculate_context_aware_speed_score(
                 if server_id != server {
                     continue;
                 }
-                
+
                 if let (Some(size), Some(duration)) = (cdn_record.size, cdn_record.time) {
                     if cdn_record.err.is_some() || duration < 10 || size < 1024 {
                         continue; // Skip failed or too small downloads
                     }
-                    
+
                     // 使用优化的并发度查询 - 主要性能提升点
                     let concurrency = get_concurrency_at_time_optimized(cdn_record.ts, timeline);
                     let speed = (size as f64 / 1024.0 / 1024.0) / (duration as f64 / 1000.0); // MB/s
-                    
+
                     let sample = SpeedSample {
                         raw_speed: speed,
                         concurrency_level: concurrency,
                         reliability_weight: calculate_reliability_weight(concurrency),
                         file_size: size as u64, // Convert u32 to u64
                     };
-                    
+
                     speed_samples.push(sample);
                 }
             }
         }
     }
-    
+
     if speed_samples.is_empty() {
         return ContextAwareSpeed::default();
     }
-    
+
     // Categorize by concurrency levels - 放宽低并发定义以获得更多有用数据
-    let high_concurrency: Vec<_> = speed_samples.iter().filter(|s| s.concurrency_level > 8).collect();
-    let medium_concurrency: Vec<_> = speed_samples.iter().filter(|s| s.concurrency_level >= 4 && s.concurrency_level <= 8).collect();
-    let low_concurrency: Vec<_> = speed_samples.iter().filter(|s| s.concurrency_level < 4).collect();
-    
+    let high_concurrency: Vec<_> = speed_samples
+        .iter()
+        .filter(|s| s.concurrency_level > 8)
+        .collect();
+    let medium_concurrency: Vec<_> = speed_samples
+        .iter()
+        .filter(|s| s.concurrency_level >= 4 && s.concurrency_level <= 8)
+        .collect();
+    let low_concurrency: Vec<_> = speed_samples
+        .iter()
+        .filter(|s| s.concurrency_level < 4)
+        .collect();
+
     // 计算各级别速度，不做推算，直接显示原始数据
     let low_concurrency_speed = if !low_concurrency.is_empty() {
         calculate_weighted_average_speed(&low_concurrency).min(50.0) // 限制异常值
@@ -1511,25 +1518,28 @@ fn calculate_context_aware_speed_score(
     } else {
         0.0
     };
-    
+
     let medium_concurrency_speed = calculate_weighted_average_speed(&medium_concurrency).min(30.0);
     let high_concurrency_speed = calculate_weighted_average_speed(&high_concurrency).min(20.0);
-    
+
     // Calculate tail performance (last 10% of session)
-    let tail_samples: Vec<_> = speed_samples.iter().filter(|s| {
-        // Check if any download from this server happened in tail period
-        for chunk in &session.chunks {
-            for cdn_record in &chunk.cdns {
-                if let Some(srv) = &cdn_record.srv {
-                    if srv == server && cdn_record.ts >= tail_threshold {
-                        return true;
+    let tail_samples: Vec<_> = speed_samples
+        .iter()
+        .filter(|s| {
+            // Check if any download from this server happened in tail period
+            for chunk in &session.chunks {
+                for cdn_record in &chunk.cdns {
+                    if let Some(srv) = &cdn_record.srv {
+                        if srv == server && cdn_record.ts >= tail_threshold {
+                            return true;
+                        }
                     }
                 }
             }
-        }
-        false
-    }).collect();
-    
+            false
+        })
+        .collect();
+
     ContextAwareSpeed {
         high_concurrency_speed,
         medium_concurrency_speed,
@@ -1538,15 +1548,14 @@ fn calculate_context_aware_speed_score(
     }
 }
 
-
 /// Calculate reliability weight based on concurrency level
 fn calculate_reliability_weight(concurrency: usize) -> f64 {
     // Lower concurrency = higher reliability weight
     match concurrency {
-        0..=2 => 1.0,    // Very reliable
-        3..=6 => 0.8,    // Good reliability
-        7..=12 => 0.5,   // Medium reliability
-        _ => 0.2,        // Low reliability due to high competition
+        0..=2 => 1.0,  // Very reliable
+        3..=6 => 0.8,  // Good reliability
+        7..=12 => 0.5, // Medium reliability
+        _ => 0.2,      // Low reliability due to high competition
     }
 }
 
@@ -1555,15 +1564,15 @@ fn calculate_weighted_average_speed(samples: &[&SpeedSample]) -> f64 {
     if samples.is_empty() {
         return 0.0;
     }
-    
+
     let mut weighted_sum = 0.0;
     let mut total_weight = 0.0;
-    
+
     for sample in samples {
         weighted_sum += sample.raw_speed * sample.reliability_weight;
         total_weight += sample.reliability_weight;
     }
-    
+
     if total_weight > 0.0 {
         weighted_sum / total_weight
     } else {
@@ -1572,13 +1581,10 @@ fn calculate_weighted_average_speed(samples: &[&SpeedSample]) -> f64 {
 }
 
 /// Analyze tail performance - crucial for overall completion time
-fn analyze_tail_performance(
-    server: &str,
-    session: &SessionLog,
-) -> TailPerformance {
+fn analyze_tail_performance(server: &str, session: &SessionLog) -> TailPerformance {
     let session_duration = (session.end - session.start) as f64;
     let tail_start = session.start + (session_duration * 0.9) as u64;
-    
+
     // Collect downloads that happened in the tail phase
     let mut tail_downloads = Vec::new();
     for chunk in &session.chunks {
@@ -1592,14 +1598,15 @@ fn analyze_tail_performance(
             }
         }
     }
-    
+
     if tail_downloads.is_empty() {
         return TailPerformance::NotPresent;
     }
-    
+
     // Calculate average concurrency during tail phase
-    let avg_tail_concurrency = calculate_avg_concurrency_in_period(tail_start, session.end, session);
-    
+    let avg_tail_concurrency =
+        calculate_avg_concurrency_in_period(tail_start, session.end, session);
+
     // Calculate tail performance metrics
     let mut tail_speeds = Vec::new();
     for (size, duration, _) in &tail_downloads {
@@ -1608,19 +1615,23 @@ fn analyze_tail_performance(
             tail_speeds.push(speed);
         }
     }
-    
+
     if tail_speeds.is_empty() {
         return TailPerformance::NotPresent;
     }
-    
+
     let avg_tail_speed = tail_speeds.iter().sum::<f64>() / tail_speeds.len() as f64;
-    
+
     // Expected speed based on file size (rough estimates)
-    let avg_file_size: u64 = tail_downloads.iter().map(|(size, _, _)| *size as u64).sum::<u64>() / tail_downloads.len() as u64;
+    let avg_file_size: u64 = tail_downloads
+        .iter()
+        .map(|(size, _, _)| *size as u64)
+        .sum::<u64>()
+        / tail_downloads.len() as u64;
     let expected_speed = estimate_expected_speed_by_file_size(avg_file_size);
-    
+
     let speed_ratio = avg_tail_speed / expected_speed;
-    
+
     // Analyze performance based on concurrency context
     if avg_tail_concurrency <= 4.0 {
         // Low concurrency: speed is reliable indicator
@@ -1659,13 +1670,13 @@ fn calculate_avg_concurrency_in_period(start: u64, end: u64, session: &SessionLo
     if period_duration <= 0.0 {
         return 0.0;
     }
-    
+
     let sample_interval = 1000.0; // 1 second intervals
     let num_samples = (period_duration / sample_interval) as usize;
-    
+
     let mut concurrency_sum = 0.0;
     let mut sample_count = 0;
-    
+
     for i in 0..=num_samples {
         let sample_time = start + (i as f64 * sample_interval) as u64;
         if sample_time <= end {
@@ -1673,7 +1684,7 @@ fn calculate_avg_concurrency_in_period(start: u64, end: u64, session: &SessionLo
             sample_count += 1;
         }
     }
-    
+
     if sample_count > 0 {
         concurrency_sum / sample_count as f64
     } else {
@@ -1684,13 +1695,13 @@ fn calculate_avg_concurrency_in_period(start: u64, end: u64, session: &SessionLo
 /// Estimate expected speed based on file size - adjusted for 100Mbps server reality
 fn estimate_expected_speed_by_file_size(file_size: u64) -> f64 {
     let size_mb = file_size as f64 / (1024.0 * 1024.0);
-    
+
     // Based on 5MB/s as standard performance for 100Mbps servers with multi-user sharing
     if size_mb < 1.0 {
         // Small files: expect 5MB/s
         5.0
     } else if size_mb < 8.0 {
-        // Medium files: expect 5MB/s  
+        // Medium files: expect 5MB/s
         5.0
     } else {
         // Large files: expect 5MB/s, can be slightly higher for CDN
@@ -1706,38 +1717,44 @@ fn calculate_performance_adaptability(context_speed: &ContextAwareSpeed) -> f64 
         context_speed.medium_concurrency_speed,
         context_speed.low_concurrency_speed,
     ];
-    
+
     let valid_speeds: Vec<f64> = speeds.into_iter().filter(|&s| s > 0.0).collect();
-    
+
     if valid_speeds.len() < 2 {
         return 0.5; // Neutral if not enough data
     }
-    
+
     let mean = valid_speeds.iter().sum::<f64>() / valid_speeds.len() as f64;
-    let variance = valid_speeds.iter()
+    let variance = valid_speeds
+        .iter()
         .map(|&s| (s - mean).powi(2))
-        .sum::<f64>() / valid_speeds.len() as f64;
-    
-    let cv = if mean > 0.0 { variance.sqrt() / mean } else { 1.0 };
-    
+        .sum::<f64>()
+        / valid_speeds.len() as f64;
+
+    let cv = if mean > 0.0 {
+        variance.sqrt() / mean
+    } else {
+        1.0
+    };
+
     // Lower coefficient of variation = higher adaptability
     1.0 / (1.0 + cv)
 }
 
 // Adjusted critical path evaluation constants (方案2优化 - 更符合100Mbps服务器实际)
-const CRITICAL_PATH_BASE_SPEED: f64 = 3.0;     // 降低基线到3MB/s，更现实的期望
-const RELIABILITY_THRESHOLD: f64 = 0.3;        // 降低门槛到30%，对应0.9MB/s
-const CRITICAL_PATH_WINDOW: f64 = 0.8;         // 分析最后20%时间，更聚焦关键阶段
+const CRITICAL_PATH_BASE_SPEED: f64 = 3.0; // 降低基线到3MB/s，更现实的期望
+const RELIABILITY_THRESHOLD: f64 = 0.3; // 降低门槛到30%，对应0.9MB/s
+const CRITICAL_PATH_WINDOW: f64 = 0.8; // 分析最后20%时间，更聚焦关键阶段
 
 /// Evaluate reliability score based on speed performance
 fn evaluate_reliability_score(speed: f64) -> f64 {
     match speed {
-        s if s >= 8.0  => 1.0,  // 8MB/s+ = Excellent (CDN level)
-        s if s >= 5.0  => 0.8,  // 5-8MB/s = Good (standard performance)  
-        s if s >= 3.0  => 0.6,  // 3-5MB/s = Moderate
-        s if s >= 2.0  => 0.4,  // 2-3MB/s = Basic usable
-        s if s >= 1.0  => 0.2,  // 1-2MB/s = Poor
-        _              => 0.1,  // <1MB/s = Very poor
+        s if s >= 8.0 => 1.0, // 8MB/s+ = Excellent (CDN level)
+        s if s >= 5.0 => 0.8, // 5-8MB/s = Good (standard performance)
+        s if s >= 3.0 => 0.6, // 3-5MB/s = Moderate
+        s if s >= 2.0 => 0.4, // 2-3MB/s = Basic usable
+        s if s >= 1.0 => 0.2, // 1-2MB/s = Poor
+        _ => 0.1,             // <1MB/s = Very poor
     }
 }
 
@@ -1752,59 +1769,60 @@ fn collect_global_performance_stats(
     let mut total_data_processed = 0u64;
     let mut total_tail_appearances = 0;
     let mut total_sessions_count = 0;
-    
+
     for (_, data) in server_impacts {
         if data.total_sessions > 0 {
             // Collect small file efficiencies
             if !data.small_file_times.is_empty() {
-                let avg_time = data.small_file_times.iter().sum::<f64>() / data.small_file_times.len() as f64;
+                let avg_time =
+                    data.small_file_times.iter().sum::<f64>() / data.small_file_times.len() as f64;
                 if avg_time > 0.0 {
                     all_small_file_efficiencies.push(1.0 / avg_time);
                 }
             }
-            
+
             // Collect medium file speeds
             all_medium_file_speeds.extend(&data.medium_file_speeds);
-            
+
             // Collect large file speeds
             all_large_file_speeds.extend(&data.large_file_speeds);
-            
+
             // Calculate total data processed
             for &size in &data.file_sizes {
                 total_data_processed += size;
             }
-            
+
             // Collect tail statistics
             total_tail_appearances += data.tail_appearances;
             total_sessions_count += data.total_sessions;
         }
     }
-    
+
     // Calculate medians
     let small_file_median_efficiency = if !all_small_file_efficiencies.is_empty() {
         calculate_median(&mut all_small_file_efficiencies)
     } else {
         1.0
     };
-    
+
     let medium_file_median_speed = if !all_medium_file_speeds.is_empty() {
         calculate_median(&mut all_medium_file_speeds)
     } else {
         2.0
     };
-    
+
     let large_file_median_speed = if !all_large_file_speeds.is_empty() {
         calculate_median(&mut all_large_file_speeds)
     } else {
         5.0
     };
-    
+
     let global_avg_tail_rate = if total_sessions_count > 0 {
         (total_tail_appearances as f64 / total_sessions_count as f64) * 100.0
     } else {
         50.0
     };
-    
+
     GlobalPerformanceStats {
         small_file_median_efficiency,
         medium_file_median_speed,
@@ -1819,11 +1837,12 @@ fn performance_score_map(ratio: f64) -> f64 {
     // Linear mapping with boost for above-median performance
     if ratio >= 1.0 {
         // Above median: score from 0.6 to 1.0
-        0.6 + (ratio - 1.0) * 0.4 / 1.0  // Ratio 1.0->2.0 maps to 0.6->1.0
+        0.6 + (ratio - 1.0) * 0.4 / 1.0 // Ratio 1.0->2.0 maps to 0.6->1.0
     } else {
-        // Below median: score from 0.2 to 0.6  
-        0.2 + ratio * 0.4  // Ratio 0.0->1.0 maps to 0.2->0.6
-    }.min(1.0)
+        // Below median: score from 0.2 to 0.6
+        0.2 + ratio * 0.4 // Ratio 0.0->1.0 maps to 0.2->0.6
+    }
+    .min(1.0)
 }
 
 /// Calculate relative efficiency based on dynamic baselines
@@ -1835,51 +1854,57 @@ fn calculate_relative_efficiency(
     if total_files == 0 {
         return 0.5;
     }
-    
+
     let small_weight = file_size_stats.small_files as f64 / total_files as f64;
     let medium_weight = file_size_stats.medium_files as f64 / total_files as f64;
     let large_weight = file_size_stats.large_files as f64 / total_files as f64;
-    
+
     // Calculate relative scores using improved mapping function
-    let small_score = if file_size_stats.small_file_efficiency > 0.0 && global_stats.small_file_median_efficiency > 0.0 {
-        let ratio = file_size_stats.small_file_efficiency / global_stats.small_file_median_efficiency;
+    let small_score = if file_size_stats.small_file_efficiency > 0.0
+        && global_stats.small_file_median_efficiency > 0.0
+    {
+        let ratio =
+            file_size_stats.small_file_efficiency / global_stats.small_file_median_efficiency;
         performance_score_map(ratio)
     } else {
         0.5
     };
-    
-    let medium_score = if file_size_stats.medium_file_speed > 0.0 && global_stats.medium_file_median_speed > 0.0 {
-        let ratio = file_size_stats.medium_file_speed / global_stats.medium_file_median_speed;
-        performance_score_map(ratio)
-    } else {
-        0.5
-    };
-    
-    let large_score = if file_size_stats.large_file_speed > 0.0 && global_stats.large_file_median_speed > 0.0 {
-        let ratio = file_size_stats.large_file_speed / global_stats.large_file_median_speed;
-        performance_score_map(ratio)
-    } else {
-        0.5
-    };
-    
+
+    let medium_score =
+        if file_size_stats.medium_file_speed > 0.0 && global_stats.medium_file_median_speed > 0.0 {
+            let ratio = file_size_stats.medium_file_speed / global_stats.medium_file_median_speed;
+            performance_score_map(ratio)
+        } else {
+            0.5
+        };
+
+    let large_score =
+        if file_size_stats.large_file_speed > 0.0 && global_stats.large_file_median_speed > 0.0 {
+            let ratio = file_size_stats.large_file_speed / global_stats.large_file_median_speed;
+            performance_score_map(ratio)
+        } else {
+            0.5
+        };
+
     // Weighted average
     small_weight * small_score + medium_weight * medium_score + large_weight * large_score
 }
 
 /// Calculate specialization bonus for focused servers
 fn calculate_specialization_bonus(file_size_stats: &FileSizeDistribution) -> f64 {
-    let total = file_size_stats.small_files + file_size_stats.medium_files + file_size_stats.large_files;
+    let total =
+        file_size_stats.small_files + file_size_stats.medium_files + file_size_stats.large_files;
     if total == 0 {
         return 0.0;
     }
-    
+
     let small_ratio = file_size_stats.small_files as f64 / total as f64;
     let medium_ratio = file_size_stats.medium_files as f64 / total as f64;
     let large_ratio = file_size_stats.large_files as f64 / total as f64;
-    
+
     // Calculate concentration (Herfindahl index)
     let concentration = small_ratio.powi(2) + medium_ratio.powi(2) + large_ratio.powi(2);
-    
+
     // If highly specialized (>0.8 concentration) and performing well in specialty
     if concentration > 0.8 {
         if small_ratio > 0.8 && file_size_stats.small_file_efficiency > 0.0 {
@@ -1892,22 +1917,18 @@ fn calculate_specialization_bonus(file_size_stats: &FileSizeDistribution) -> f64
             return 1.0; // Full bonus for large file specialists
         }
     }
-    
+
     0.0
 }
 
 /// Calculate contribution score based on data processed and success rate
-fn calculate_contribution_score(
-    data_processed: u64,
-    total_data: u64,
-    success_rate: f64,
-) -> f64 {
+fn calculate_contribution_score(data_processed: u64, total_data: u64, success_rate: f64) -> f64 {
     let data_contribution = if total_data > 0 {
         (data_processed as f64 / total_data as f64).min(1.0)
     } else {
         0.0
     };
-    
+
     // Combine data contribution with success rate
     data_contribution * success_rate
 }
@@ -1915,17 +1936,19 @@ fn calculate_contribution_score(
 /// Calculate soft penalty for anomalies
 fn calculate_soft_penalty(ttfb_p95: f64, error_rate: f64) -> f64 {
     let mut penalty = 0.0;
-    
+
     // TTFB penalty - more lenient, up to 3 points for 10+ seconds
-    if ttfb_p95 > 5000.0 {  // Only penalize if > 5 seconds
+    if ttfb_p95 > 5000.0 {
+        // Only penalize if > 5 seconds
         penalty += ((ttfb_p95 - 5000.0) / 5000.0).min(3.0);
     }
-    
+
     // Error rate penalty - more lenient, up to 3 points for 10%+ errors
-    if error_rate > 0.05 {  // Only penalize if > 5% errors
+    if error_rate > 0.05 {
+        // Only penalize if > 5% errors
         penalty += ((error_rate - 0.05) * 60.0).min(3.0);
     }
-    
+
     penalty
 }
 
@@ -1944,20 +1967,22 @@ fn calculate_cpi_v4(
     avg_scheduling_delay: f64,
     global_stats: &GlobalPerformanceStats,
 ) -> f64 {
-    let total_files = file_size_stats.small_files + file_size_stats.medium_files + file_size_stats.large_files;
-    
+    let total_files =
+        file_size_stats.small_files + file_size_stats.medium_files + file_size_stats.large_files;
+
     // 1. Enhanced Efficiency Score (30%) - relative to dynamic baselines with execution delay correction
     let base_efficiency = calculate_relative_efficiency(file_size_stats, total_files, global_stats);
-    
+
     // Apply execution delay correction - penalize servers that are consistently slower than expected
     let execution_efficiency_correction = if avg_execution_delay > 0.0 {
         1.0 / (1.0 + avg_execution_delay)
     } else {
         1.0 + (-avg_execution_delay * 0.1).min(0.2) // Small bonus for being faster than expected
     };
-    
-    let enhanced_efficiency = (base_efficiency * execution_efficiency_correction) * EFFICIENCY_WEIGHT;
-    
+
+    let enhanced_efficiency =
+        (base_efficiency * execution_efficiency_correction) * EFFICIENCY_WEIGHT;
+
     // 2. True Bottleneck Impact Score (25%) - distinguish real bottlenecks from scheduling delays
     let true_bottleneck_impact = calculate_true_bottleneck_impact(
         tail_appearances,
@@ -1968,7 +1993,7 @@ fn calculate_cpi_v4(
         avg_file_size,
         global_stats.global_avg_tail_rate,
     ) * TRUE_BOTTLENECK_WEIGHT;
-    
+
     // 3. Contribution Score (25%) - data processed and success rate
     let success_rate = 1.0 - error_rate;
     let contribution = calculate_contribution_score(
@@ -1976,10 +2001,10 @@ fn calculate_cpi_v4(
         global_stats.total_data_processed,
         success_rate,
     ) * CONTRIBUTION_WEIGHT;
-    
+
     // 4. Enhanced Stability Score (15%) - performance CV + scheduling consistency
     let performance_stability = 1.0 - performance_cv.min(1.0);
-    
+
     // Add scheduling consistency - reward servers with consistent scheduling patterns
     let scheduling_consistency = if total_sessions > 1 {
         // Lower scheduling delay variance indicates more consistent assignment patterns
@@ -1987,29 +2012,38 @@ fn calculate_cpi_v4(
     } else {
         1.0
     };
-    
-    let enhanced_stability = (performance_stability * 0.7 + scheduling_consistency * 0.3) * STABILITY_WEIGHT;
-    
+
+    let enhanced_stability =
+        (performance_stability * 0.7 + scheduling_consistency * 0.3) * STABILITY_WEIGHT;
+
     // 5. Specialization Bonus (5%) - reward for focused performance
     let specialization = calculate_specialization_bonus(file_size_stats) * SPECIALIZATION_WEIGHT;
-    
+
     // Combine scores
-    let performance_score = (enhanced_efficiency + true_bottleneck_impact + contribution + enhanced_stability + specialization) * (100.0 - BASE_SCORE);
-    
+    let performance_score = (enhanced_efficiency
+        + true_bottleneck_impact
+        + contribution
+        + enhanced_stability
+        + specialization)
+        * (100.0 - BASE_SCORE);
+
     // Apply soft penalty with execution delay awareness
     let base_penalty = calculate_soft_penalty(ttfb_p95, error_rate);
-    
+
     // Additional penalty for persistent execution delays
-    let execution_delay_penalty = if avg_execution_delay > 1.0 { // >1 second delay
+    let execution_delay_penalty = if avg_execution_delay > 1.0 {
+        // >1 second delay
         (avg_execution_delay - 1.0).min(3.0)
     } else {
         0.0
     };
-    
+
     let total_penalty = base_penalty + execution_delay_penalty;
-    
+
     // Final score with base score guarantee
-    (BASE_SCORE + performance_score - total_penalty).max(0.0).min(100.0)
+    (BASE_SCORE + performance_score - total_penalty)
+        .max(0.0)
+        .min(100.0)
 }
 
 /// Calculate Comprehensive Performance Index v3 for a server (legacy)
@@ -2027,19 +2061,21 @@ fn calculate_cpi_v3(
     data_processed: u64,
     global_stats: &GlobalPerformanceStats,
 ) -> f64 {
-    let total_files = file_size_stats.small_files + file_size_stats.medium_files + file_size_stats.large_files;
-    
+    let total_files =
+        file_size_stats.small_files + file_size_stats.medium_files + file_size_stats.large_files;
+
     // 1. Efficiency Score (30%) - relative to dynamic baselines
-    let efficiency = calculate_relative_efficiency(file_size_stats, total_files, global_stats) * EFFICIENCY_WEIGHT;
-    
-    // 2. Impact Score (25%) - relative bottleneck impact with improved calculation  
+    let efficiency = calculate_relative_efficiency(file_size_stats, total_files, global_stats)
+        * EFFICIENCY_WEIGHT;
+
+    // 2. Impact Score (25%) - relative bottleneck impact with improved calculation
     let impact = calculate_relative_impact(
         tail_rate,
         usage_rate,
         avg_file_size,
         global_stats.global_avg_tail_rate,
     ) * TRUE_BOTTLENECK_WEIGHT;
-    
+
     // 3. Contribution Score (25%) - data processed and success rate
     let success_rate = 1.0 - error_rate;
     let contribution = calculate_contribution_score(
@@ -2047,21 +2083,24 @@ fn calculate_cpi_v3(
         global_stats.total_data_processed,
         success_rate,
     ) * CONTRIBUTION_WEIGHT;
-    
+
     // 4. Stability Score (15%) - based on performance CV
     let stability = (1.0 - performance_cv.min(1.0)) * STABILITY_WEIGHT;
-    
+
     // 5. Specialization Bonus (5%) - reward for focused performance
     let specialization = calculate_specialization_bonus(file_size_stats) * SPECIALIZATION_WEIGHT;
-    
+
     // Combine scores
-    let performance_score = (efficiency + impact + contribution + stability + specialization) * (100.0 - BASE_SCORE);
-    
+    let performance_score =
+        (efficiency + impact + contribution + stability + specialization) * (100.0 - BASE_SCORE);
+
     // Apply soft penalty
     let penalty = calculate_soft_penalty(ttfb_p95, error_rate);
-    
+
     // Final score with base score guarantee
-    (BASE_SCORE + performance_score - penalty).max(0.0).min(100.0)
+    (BASE_SCORE + performance_score - penalty)
+        .max(0.0)
+        .min(100.0)
 }
 
 /// Calculate Comprehensive Performance Index v2 for a server
@@ -2078,19 +2117,17 @@ fn calculate_cpi_v2(
     avg_file_size: f64,
     global_avg_tail_rate: f64,
 ) -> f64 {
-    let total_files = file_size_stats.small_files + file_size_stats.medium_files + file_size_stats.large_files;
-    
+    let total_files =
+        file_size_stats.small_files + file_size_stats.medium_files + file_size_stats.large_files;
+
     // 1. Efficiency Score (35%) - layered calculation based on file sizes
     let efficiency = calculate_layered_efficiency(file_size_stats, total_files) * EFFICIENCY_WEIGHT;
-    
+
     // 2. Impact Score (35%) - relative bottleneck impact
-    let impact = calculate_relative_impact(
-        tail_rate,
-        usage_rate,
-        avg_file_size,
-        global_avg_tail_rate,
-    ) * TRUE_BOTTLENECK_WEIGHT;
-    
+    let impact =
+        calculate_relative_impact(tail_rate, usage_rate, avg_file_size, global_avg_tail_rate)
+            * TRUE_BOTTLENECK_WEIGHT;
+
     // 3. Participation Score (20%) - effective participation
     let success_rate = 1.0 - error_rate;
     let effective_participation = if total_sessions > 0 {
@@ -2100,31 +2137,33 @@ fn calculate_cpi_v2(
         } else {
             0.0
         };
-        participation_rate * success_rate * (1.0 - bottleneck_rate * 0.5)  // Reduce bottleneck penalty
+        participation_rate * success_rate * (1.0 - bottleneck_rate * 0.5) // Reduce bottleneck penalty
     } else {
         0.0
     };
     let participation = effective_participation * CONTRIBUTION_WEIGHT;
-    
+
     // 4. Stability Score (10%) - based on CV (lower is better)
     let stability = (1.0 - performance_cv.min(1.0)) * STABILITY_WEIGHT;
-    
+
     // Base CPI score
     let base_cpi = (efficiency + impact + participation + stability) * 100.0;
-    
+
     // Apply penalty for anomalies (max 10 points)
     let mut penalty = 0.0;
-    
+
     // TTFB penalty (max 5 points)
-    if ttfb_p95 > 5000.0 {  // > 5 seconds
+    if ttfb_p95 > 5000.0 {
+        // > 5 seconds
         penalty += 5.0;
     }
-    
+
     // Error rate penalty (max 5 points)
-    if error_rate > 0.05 {  // > 5% errors
+    if error_rate > 0.05 {
+        // > 5% errors
         penalty += 5.0;
     }
-    
+
     // Final CPI score
     (base_cpi - penalty).max(0.0)
 }
@@ -2149,7 +2188,7 @@ fn assign_grade(cpi_score: f64) -> String {
 /// Calculate actual session duration using the last download completion time
 fn calculate_actual_session_duration(session: &SessionLog) -> f64 {
     let mut latest_completion_time = session.start;
-    
+
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             if let Some(time) = cdn_record.time {
@@ -2158,7 +2197,7 @@ fn calculate_actual_session_duration(session: &SessionLog) -> f64 {
             }
         }
     }
-    
+
     if latest_completion_time > session.start {
         (latest_completion_time - session.start) as f64
     } else {
@@ -2170,16 +2209,15 @@ fn calculate_actual_session_duration(session: &SessionLog) -> f64 {
 /// Get the first download start time in a session
 fn get_first_download_start(session: &SessionLog) -> f64 {
     let mut earliest_start = session.start;
-    
+
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             earliest_start = earliest_start.min(cdn_record.ts);
         }
     }
-    
+
     earliest_start as f64
 }
-
 
 /// Calculate session extension based on speed difference from other servers' average
 fn calculate_speed_based_extension(
@@ -2192,72 +2230,74 @@ fn calculate_speed_based_extension(
         Some(analysis) => analysis,
         None => return 0.0,
     };
-    
+
     // Calculate target server metrics
     let mut target_bytes = 0u64;
     let mut target_duration = 0.0f64;
-    
+
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             if let Some(server_id) = &cdn_record.srv {
                 if server_id == target_server {
                     if let Some(duration) = cdn_record.time {
-                        target_bytes += (allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0) as u64;
+                        target_bytes +=
+                            (allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0) as u64;
                         target_duration += duration as f64 / 1000.0; // Convert to seconds
                     }
                 }
             }
         }
     }
-    
+
     if target_duration <= 0.0 || target_bytes == 0 {
         return 0.0;
     }
-    
+
     // Calculate average speed of other servers
     let mut other_speeds: Vec<f64> = Vec::new();
-    
+
     for (server_id, _) in server_analysis {
         if server_id == target_server {
             continue; // Skip target server
         }
-        
+
         let mut server_bytes = 0u64;
         let mut server_duration = 0.0f64;
-        
+
         for chunk in &session.chunks {
             for cdn_record in &chunk.cdns {
                 if let Some(srv_id) = &cdn_record.srv {
                     if srv_id == server_id {
                         if let Some(duration) = cdn_record.time {
-                            server_bytes += (allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0) as u64;
+                            server_bytes +=
+                                (allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0) as u64;
                             server_duration += duration as f64 / 1000.0;
                         }
                     }
                 }
             }
         }
-        
+
         if server_duration > 0.0 && server_bytes > 0 {
             let speed = server_bytes as f64 / server_duration; // bytes per second
             other_speeds.push(speed);
         }
     }
-    
+
     if other_speeds.is_empty() {
         return 0.0; // Cannot compare if no other servers
     }
-    
+
     // Calculate average speed of other servers
     let avg_speed = other_speeds.iter().sum::<f64>() / other_speeds.len() as f64;
-    
+
     if avg_speed <= 0.0 {
         return 0.0;
     }
-    
+
     // Calculate expected duration based on average speed
     let expected_duration = target_bytes as f64 / avg_speed;
-    
+
     // Extension = actual - expected (can be positive or negative)
     target_duration - expected_duration
 }
@@ -2265,23 +2305,24 @@ fn calculate_speed_based_extension(
 /// Calculate session-level speed context for execution delay analysis
 fn calculate_session_speed_context(session: &SessionLog) -> Vec<f64> {
     let mut session_speeds = Vec::new();
-    
+
     for chunk in &session.chunks {
         let _chunk_size = allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0; // Convert to MB
-        
+
         for cdn_record in &chunk.cdns {
             if let (Some(size), Some(time)) = (cdn_record.size, cdn_record.time) {
                 // Only include successful downloads
                 if cdn_record.err.is_none() && time >= 10 && size >= 10240 {
                     let speed_mbps = (size as f64 / 1024.0 / 1024.0) / (time as f64 / 1000.0);
-                    if speed_mbps <= 1000.0 { // Filter out unrealistic speeds
+                    if speed_mbps <= 1000.0 {
+                        // Filter out unrealistic speeds
                         session_speeds.push(speed_mbps);
                     }
                 }
             }
         }
     }
-    
+
     session_speeds
 }
 
@@ -2291,15 +2332,13 @@ fn analyze_session_impact(sessions: &[SessionLog]) -> HashMap<String, ServerImpa
     // 步骤1：并行预计算所有会话的并发度时间线 (最大性能提升点)
     println!("预计算并发度时间线...");
     let timeline_cache = precompute_all_session_timelines(sessions);
-    
+
     // 步骤2：并行处理会话数据收集
     println!("并行处理会话数据收集...");
     let server_impacts = sessions
         .par_iter() // 使用 Rayon 并行处理会话
         .filter(|session| (session.end - session.start) as f64 > 0.0) // 过滤无效会话
-        .map(|session| {
-            analyze_single_session(session, &timeline_cache)
-        })
+        .map(|session| analyze_single_session(session, &timeline_cache))
         .reduce(
             || HashMap::<String, ServerImpactData>::new(),
             |mut acc, session_data| {
@@ -2309,7 +2348,7 @@ fn analyze_session_impact(sessions: &[SessionLog]) -> HashMap<String, ServerImpa
                     merge_server_impact_data(entry, data);
                 }
                 acc
-            }
+            },
         );
 
     // 步骤3：全局统计信息收集
@@ -2337,12 +2376,12 @@ fn analyze_session_impact(sessions: &[SessionLog]) -> HashMap<String, ServerImpa
 
 /// 分析单个会话的服务器影响数据（优化版本）
 fn analyze_single_session(
-    session: &SessionLog, 
-    timeline_cache: &HashMap<String, SessionConcurrencyTimeline>
+    session: &SessionLog,
+    timeline_cache: &HashMap<String, SessionConcurrencyTimeline>,
 ) -> HashMap<String, ServerImpactData> {
     let mut session_server_impacts = HashMap::new();
     let session_duration = (session.end - session.start) as f64;
-    
+
     // 获取此会话的时间线缓存
     let timeline = match session.sid.as_ref().and_then(|sid| timeline_cache.get(sid)) {
         Some(timeline) => timeline,
@@ -2374,31 +2413,31 @@ fn analyze_single_session(
     // 收集会话数据
     for chunk in &session.chunks {
         let chunk_size = allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0;
-        
+
         for cdn_record in &chunk.cdns {
             if let Some(server_id) = &cdn_record.srv {
                 let entry = session_server_impacts
                     .entry(server_id.clone())
                     .or_insert_with(ServerImpactData::new);
-                    
+
                 // 基础统计
                 entry.total_downloads += 1;
-                
+
                 if let Some(ttfb) = cdn_record.ttfb {
                     entry.ttfb_values.push(ttfb as f64);
                 }
-                
+
                 if cdn_record.err.is_some() {
                     entry.error_count += 1;
                 }
-                
+
                 entry.file_sizes.push(chunk_size as u64);
-                
+
                 // 性能分析
                 if let Some(duration) = cdn_record.time {
                     let duration_sec = duration as f64 / 1000.0;
                     let completion_time = cdn_record.ts + duration as u64;
-                    
+
                     // CPI v4: Calculate execution delay based on session context
                     if cdn_record.err.is_none() && duration >= 10 && chunk_size >= 10240.0 {
                         let execution_delay = calculate_execution_delay(
@@ -2408,18 +2447,15 @@ fn analyze_single_session(
                         );
                         entry.execution_delays.push(execution_delay);
                     }
-                    
+
                     // CPI v4: Calculate scheduling delay
-                    let scheduling_delay = calculate_scheduling_delay(
-                        cdn_record.ts,
-                        session.start,
-                        session_duration,
-                    );
+                    let scheduling_delay =
+                        calculate_scheduling_delay(cdn_record.ts, session.start, session_duration);
                     entry.scheduling_delays.push(scheduling_delay);
-                    
+
                     // Store session speed context for this download
                     entry.session_speed_contexts.push(session_median_speed);
-                    
+
                     // 文件大小分类处理
                     if chunk_size < SMALL_FILE_THRESHOLD as f64 {
                         let total_time = if let Some(ttfb) = cdn_record.ttfb {
@@ -2439,13 +2475,13 @@ fn analyze_single_session(
                             entry.large_file_speeds.push(speed_mbps);
                         }
                     }
-                    
+
                     // Track general performance for CV calculation
                     if duration_sec > 0.0 {
                         let speed_mbps = (chunk_size / 1024.0 / 1024.0) / duration_sec;
                         entry.performance_values.push(speed_mbps);
                     }
-                    
+
                     // Check if this download completes in the tail period
                     if completion_time as f64 >= tail_threshold {
                         tail_servers.insert(server_id.clone());
@@ -2459,19 +2495,26 @@ fn analyze_single_session(
     for (server_id, bottleneck_analysis) in &session_bottleneck_analysis {
         if let Some(entry) = session_server_impacts.get_mut(server_id) {
             entry.total_sessions += 1;
-            entry.efficiency_scores.push(bottleneck_analysis.efficiency_score);
-            entry.bottleneck_scores.push(bottleneck_analysis.bottleneck_score);
-            entry.bottleneck_types.push(bottleneck_analysis.bottleneck_type.clone());
-            
+            entry
+                .efficiency_scores
+                .push(bottleneck_analysis.efficiency_score);
+            entry
+                .bottleneck_scores
+                .push(bottleneck_analysis.bottleneck_score);
+            entry
+                .bottleneck_types
+                .push(bottleneck_analysis.bottleneck_type.clone());
+
             // Check if this server appears in the tail
             if tail_servers.contains(server_id) {
                 entry.tail_appearances += 1;
             }
-            
+
             // Calculate session extension
-            let extension = calculate_speed_based_extension(session, server_id, &session_bottleneck_analysis);
+            let extension =
+                calculate_speed_based_extension(session, server_id, &session_bottleneck_analysis);
             entry.session_extensions.push(extension);
-            
+
             if bottleneck_analysis.is_bottleneck {
                 entry.bottleneck_count += 1;
             }
@@ -2500,7 +2543,9 @@ fn merge_server_impact_data(target: &mut ServerImpactData, source: ServerImpactD
     target.large_file_speeds.extend(source.large_file_speeds);
     target.execution_delays.extend(source.execution_delays);
     target.scheduling_delays.extend(source.scheduling_delays);
-    target.session_speed_contexts.extend(source.session_speed_contexts);
+    target
+        .session_speed_contexts
+        .extend(source.session_speed_contexts);
 }
 
 /// 计算最终服务器统计信息（优化版本）
@@ -2531,7 +2576,8 @@ fn calculate_final_server_statistics(
 
     // Calculate efficiency/speed for each file size category
     let small_file_efficiency = if !data.small_file_times.is_empty() {
-        let avg_time = data.small_file_times.iter().sum::<f64>() / data.small_file_times.len() as f64;
+        let avg_time =
+            data.small_file_times.iter().sum::<f64>() / data.small_file_times.len() as f64;
         1.0 / avg_time.max(0.01)
     } else {
         0.5
@@ -2601,9 +2647,10 @@ fn calculate_final_server_statistics(
         .filter_map(|session| {
             // 检查此服务器是否参与了此会话
             let server_participated = session.chunks.iter().any(|chunk| {
-                chunk.cdns.iter().any(|cdn| {
-                    cdn.srv.as_ref().map(|s| s == server_id).unwrap_or(false)
-                })
+                chunk
+                    .cdns
+                    .iter()
+                    .any(|cdn| cdn.srv.as_ref().map(|s| s == server_id).unwrap_or(false))
             });
 
             if !server_participated {
@@ -2613,11 +2660,8 @@ fn calculate_final_server_statistics(
             // 获取时间线缓存
             if let Some(ref session_id) = session.sid {
                 if let Some(timeline) = timeline_cache.get(session_id) {
-                    let context_speed = calculate_context_aware_speed_score(
-                        server_id, 
-                        session, 
-                        timeline
-                    );
+                    let context_speed =
+                        calculate_context_aware_speed_score(server_id, session, timeline);
                     if context_speed.low_concurrency_speed > 0.0 || context_speed.tail_speed > 0.0 {
                         return Some(context_speed);
                     }
@@ -2654,33 +2698,43 @@ fn calculate_final_server_statistics(
 
     // CPI v5 统计指标优化 - 使用已经包含备选逻辑的ContextAwareSpeed数据
     let low_concurrency_speed = if !all_context_speeds.is_empty() {
-        all_context_speeds.iter()
+        all_context_speeds
+            .iter()
             .map(|cs| cs.low_concurrency_speed)
             .filter(|&s| s > 0.0)
-            .sum::<f64>() / all_context_speeds.iter()
-            .map(|cs| cs.low_concurrency_speed)
-            .filter(|&s| s > 0.0)
-            .count().max(1) as f64
+            .sum::<f64>()
+            / all_context_speeds
+                .iter()
+                .map(|cs| cs.low_concurrency_speed)
+                .filter(|&s| s > 0.0)
+                .count()
+                .max(1) as f64
     } else {
         0.0
     };
 
     let tail_performance_score = if !all_context_speeds.is_empty() {
-        all_context_speeds.iter()
+        all_context_speeds
+            .iter()
             .map(|cs| cs.tail_speed)
             .filter(|&s| s > 0.0)
-            .sum::<f64>() / all_context_speeds.iter()
-            .map(|cs| cs.tail_speed)
-            .filter(|&s| s > 0.0)
-            .count().max(1) as f64
+            .sum::<f64>()
+            / all_context_speeds
+                .iter()
+                .map(|cs| cs.tail_speed)
+                .filter(|&s| s > 0.0)
+                .count()
+                .max(1) as f64
     } else {
         0.0
     };
 
     let adaptability_score = if !all_context_speeds.is_empty() {
-        all_context_speeds.iter()
+        all_context_speeds
+            .iter()
             .map(|cs| calculate_performance_adaptability(cs))
-            .sum::<f64>() / all_context_speeds.len() as f64
+            .sum::<f64>()
+            / all_context_speeds.len() as f64
     } else {
         0.5
     };
@@ -2738,25 +2792,24 @@ fn calculate_final_server_statistics(
     }
 }
 
-
 #[derive(Default)]
 struct ServerImpactData {
     total_sessions: usize,
-    tail_appearances: usize, // Appearances in last 10% of session time
-    bottleneck_count: usize, // Times this server was a true bottleneck
+    tail_appearances: usize,      // Appearances in last 10% of session time
+    bottleneck_count: usize,      // Times this server was a true bottleneck
     session_extensions: Vec<f64>, // Time extensions caused when bottleneck
-    efficiency_scores: Vec<f64>, // Efficiency scores across sessions
-    bottleneck_scores: Vec<f64>, // Bottleneck scores across sessions
+    efficiency_scores: Vec<f64>,  // Efficiency scores across sessions
+    bottleneck_scores: Vec<f64>,  // Bottleneck scores across sessions
     bottleneck_types: Vec<BottleneckType>, // Bottleneck types across sessions
     // New fields for enhanced CPI
     performance_values: Vec<f64>, // Performance values for CV calculation
-    ttfb_values: Vec<f64>, // TTFB values for P95 calculation
-    error_count: usize, // Number of errors
-    total_downloads: usize, // Total download attempts
-    file_sizes: Vec<u64>, // File sizes processed
-    small_file_times: Vec<f64>, // Completion times for small files
+    ttfb_values: Vec<f64>,        // TTFB values for P95 calculation
+    error_count: usize,           // Number of errors
+    total_downloads: usize,       // Total download attempts
+    file_sizes: Vec<u64>,         // File sizes processed
+    small_file_times: Vec<f64>,   // Completion times for small files
     medium_file_speeds: Vec<f64>, // Speeds for medium files
-    large_file_speeds: Vec<f64>, // Speeds for large files
+    large_file_speeds: Vec<f64>,  // Speeds for large files
     // CPI v4 enhancements for concurrent-aware analysis
     execution_delays: Vec<f64>, // Execution delay history (actual - expected duration)
     scheduling_delays: Vec<f64>, // Scheduling delay history (relative start position)
@@ -2773,22 +2826,24 @@ impl ServerImpactData {
 fn analyze_session_bottlenecks(session: &SessionLog) -> HashMap<String, BottleneckAnalysis> {
     let session_duration = (session.end - session.start) as f64;
     let server_performances = calculate_server_session_performances(session);
-    
+
     // Calculate total session data volume for normalization
-    let total_session_bytes: u64 = server_performances.values()
+    let total_session_bytes: u64 = server_performances
+        .values()
         .map(|perf| perf.total_bytes)
         .sum();
-    
+
     if total_session_bytes == 0 {
         return HashMap::new();
     }
-    
+
     // Calculate relative performance metrics
-    let session_speeds: Vec<f64> = server_performances.values()
+    let session_speeds: Vec<f64> = server_performances
+        .values()
         .map(|perf| perf.actual_speed)
         .filter(|&speed| speed > 0.0)
         .collect();
-    
+
     let median_speed = if !session_speeds.is_empty() {
         let mut sorted_speeds = session_speeds;
         sorted_speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -2801,35 +2856,38 @@ fn analyze_session_bottlenecks(session: &SessionLog) -> HashMap<String, Bottlene
     } else {
         1.0 // Fallback
     };
-    
+
     // Skip bottleneck analysis for single-server sessions
     if server_performances.len() <= 1 {
         let mut results = HashMap::new();
         for (server_id, mut perf) in server_performances {
             // Single server sessions get neutral classification
-            perf.efficiency_score = 1.0;  // Perfect relative efficiency
-            perf.bottleneck_score = 0.0;  // No bottleneck tendency
+            perf.efficiency_score = 1.0; // Perfect relative efficiency
+            perf.bottleneck_score = 0.0; // No bottleneck tendency
             perf.session_time_usage = perf.total_duration / session_duration;
-            perf.data_contribution = 1.0;  // 100% data contribution
-            perf.workload_rank = 1.0;      // 100% workload
-            
-            results.insert(server_id, BottleneckAnalysis {
-                efficiency_score: 1.0,
-                time_burden_score: perf.total_duration / session_duration,
-                data_contribution: 1.0,
-                bottleneck_score: 0.0,
-                bottleneck_type: BottleneckType::Normal,  // Always normal for single-server
-                is_bottleneck: false,
-            });
+            perf.data_contribution = 1.0; // 100% data contribution
+            perf.workload_rank = 1.0; // 100% workload
+
+            results.insert(
+                server_id,
+                BottleneckAnalysis {
+                    efficiency_score: 1.0,
+                    time_burden_score: perf.total_duration / session_duration,
+                    data_contribution: 1.0,
+                    bottleneck_score: 0.0,
+                    bottleneck_type: BottleneckType::Normal, // Always normal for single-server
+                    is_bottleneck: false,
+                },
+            );
         }
         return results;
     }
-    
+
     // Calculate workload rankings based on total bytes processed
     let workload_ranks = calculate_workload_rankings(&server_performances);
-    
+
     let mut results = HashMap::new();
-    
+
     for (server_id, mut perf) in server_performances {
         // 1. Calculate efficiency score (relative to session median)
         let efficiency_score = if median_speed > 0.0 {
@@ -2837,23 +2895,20 @@ fn analyze_session_bottlenecks(session: &SessionLog) -> HashMap<String, Bottlene
         } else {
             0.5 // Neutral if no reference
         };
-        
+
         // 2. Calculate time burden score
         let time_burden_score = perf.total_duration / session_duration;
-        
+
         // 3. Calculate data contribution
         let data_contribution = perf.total_bytes as f64 / total_session_bytes as f64;
-        
+
         // 4. Get workload rank
         let workload_rank = workload_ranks.get(&server_id).copied().unwrap_or(0.0);
-        
+
         // 5. Calculate bottleneck score
-        let bottleneck_score = calculate_bottleneck_score(
-            efficiency_score,
-            time_burden_score,
-            data_contribution
-        );
-        
+        let bottleneck_score =
+            calculate_bottleneck_score(efficiency_score, time_burden_score, data_contribution);
+
         // 6. Classify bottleneck type (now using workload-based logic)
         let bottleneck_type = classify_bottleneck_type(
             efficiency_score,
@@ -2861,36 +2916,41 @@ fn analyze_session_bottlenecks(session: &SessionLog) -> HashMap<String, Bottlene
             data_contribution,
             bottleneck_score,
             perf.total_bytes,
-            workload_rank
+            workload_rank,
         );
-        
+
         let is_bottleneck = matches!(
-            bottleneck_type, 
+            bottleneck_type,
             BottleneckType::TrueBottleneck | BottleneckType::EfficiencyBottleneck
         );
-        
+
         // Update performance struct
         perf.efficiency_score = efficiency_score;
         perf.bottleneck_score = bottleneck_score;
         perf.session_time_usage = time_burden_score;
         perf.data_contribution = data_contribution;
         perf.workload_rank = workload_rank;
-        
-        results.insert(server_id, BottleneckAnalysis {
-            efficiency_score,
-            time_burden_score,
-            data_contribution,
-            bottleneck_score,
-            bottleneck_type,
-            is_bottleneck,
-        });
+
+        results.insert(
+            server_id,
+            BottleneckAnalysis {
+                efficiency_score,
+                time_burden_score,
+                data_contribution,
+                bottleneck_score,
+                bottleneck_type,
+                is_bottleneck,
+            },
+        );
     }
-    
+
     results
 }
 
 /// Calculate performance metrics for each server in a session
-fn calculate_server_session_performances(session: &SessionLog) -> HashMap<String, ServerSessionPerformance> {
+fn calculate_server_session_performances(
+    session: &SessionLog,
+) -> HashMap<String, ServerSessionPerformance> {
     #[derive(Default)]
     struct ServerSessionData {
         start_times: Vec<u64>,
@@ -2898,29 +2958,31 @@ fn calculate_server_session_performances(session: &SessionLog) -> HashMap<String
         total_bytes: u64,
         download_records: Vec<(u64, f64)>, // (size, duration)
     }
-    
+
     let mut server_data: HashMap<String, ServerSessionData> = HashMap::new();
-    
+
     // Collect all download data for each server
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             if let Some(server_id) = &cdn_record.srv {
                 let entry = server_data.entry(server_id.clone()).or_default();
-                
+
                 entry.start_times.push(cdn_record.ts);
-                
+
                 if let (Some(size), Some(time)) = (cdn_record.size, cdn_record.time) {
                     // Only include successful downloads
                     if cdn_record.err.is_none() && time >= 10 && size >= 1024 {
                         entry.total_bytes += size as u64;
-                        entry.download_records.push((size as u64, time as f64 / 1000.0));
+                        entry
+                            .download_records
+                            .push((size as u64, time as f64 / 1000.0));
                         entry.completion_times.push(cdn_record.ts + time as u64);
                     }
                 }
             }
         }
     }
-    
+
     // Convert to performance structures
     let mut performances = HashMap::new();
     for (server_id, data) in server_data {
@@ -2928,46 +2990,51 @@ fn calculate_server_session_performances(session: &SessionLog) -> HashMap<String
             let first_start = *data.start_times.iter().min().unwrap();
             let last_completion = *data.completion_times.iter().max().unwrap();
             let total_duration = (last_completion - first_start) as f64 / 1000.0;
-            
+
             // Calculate actual speed
             let actual_speed = if total_duration > 0.0 {
                 (data.total_bytes as f64 / 1024.0 / 1024.0) / total_duration
             } else {
                 0.0
             };
-            
-            performances.insert(server_id.clone(), ServerSessionPerformance {
-                server_id,
-                total_bytes: data.total_bytes,
-                total_duration,
-                actual_speed,
-                session_time_usage: 0.0, // Will be calculated later
-                data_contribution: 0.0,  // Will be calculated later
-                efficiency_score: 0.0,   // Will be calculated later
-                bottleneck_score: 0.0,   // Will be calculated later
-                workload_rank: 0.0,      // Will be calculated later
-            });
+
+            performances.insert(
+                server_id.clone(),
+                ServerSessionPerformance {
+                    server_id,
+                    total_bytes: data.total_bytes,
+                    total_duration,
+                    actual_speed,
+                    session_time_usage: 0.0, // Will be calculated later
+                    data_contribution: 0.0,  // Will be calculated later
+                    efficiency_score: 0.0,   // Will be calculated later
+                    bottleneck_score: 0.0,   // Will be calculated later
+                    workload_rank: 0.0,      // Will be calculated later
+                },
+            );
         }
     }
-    
+
     performances
 }
 
 /// Calculate workload rankings for servers based on total bytes processed
-fn calculate_workload_rankings(performances: &HashMap<String, ServerSessionPerformance>) -> HashMap<String, f64> {
+fn calculate_workload_rankings(
+    performances: &HashMap<String, ServerSessionPerformance>,
+) -> HashMap<String, f64> {
     // Sort servers by total bytes (descending order)
     let mut servers_by_workload: Vec<_> = performances
         .iter()
         .map(|(server_id, perf)| (server_id.clone(), perf.total_bytes))
         .collect();
-    
+
     servers_by_workload.sort_by(|a, b| b.1.cmp(&a.1)); // Descending: highest workload first
-    
+
     let total_servers = servers_by_workload.len() as f64;
     if total_servers == 0.0 {
         return HashMap::new();
     }
-    
+
     servers_by_workload
         .into_iter()
         .enumerate()
@@ -2986,18 +3053,18 @@ fn calculate_bottleneck_score(
     data_contribution: f64,
 ) -> f64 {
     // Core formula: bottleneck tendency = inefficiency × time_burden × data_contribution_adjustment
-    
+
     let inefficiency_factor = 1.0 - efficiency_score; // 0-1, higher means less efficient
     let time_burden_factor = time_burden_score.min(1.0); // 0-1, higher means more time consumed
-    
+
     // Data contribution adjustment: less data = higher bottleneck tendency
     // Formula: 1 / (contribution + 0.05), capped at 4.0
     let data_adjustment = (1.0 / (data_contribution + 0.05)).min(4.0);
-    
+
     // Combined bottleneck score with dampening to keep in 0-1 range
     let raw_score = inefficiency_factor * time_burden_factor * data_adjustment;
     let bottleneck_score = (raw_score / 4.0).min(1.0); // Normalize to 0-1
-    
+
     bottleneck_score
 }
 
@@ -3011,29 +3078,41 @@ fn classify_bottleneck_type(
     workload_rank: f64,
 ) -> BottleneckType {
     // Define workload thresholds
-    const HIGH_WORKLOAD_BYTES: u64 = 20_000_000;    // 20MB (lowered from 50MB)
-    const LOW_WORKLOAD_BYTES: u64 = 5_000_000;      // 5MB (lowered from 10MB)
-    const HIGH_WORKLOAD_RANK: f64 = 0.5;            // Top 50% (lowered from 70%)
-    const LOW_WORKLOAD_RANK: f64 = 0.2;             // Bottom 80% (lowered from 30%)
-    
-    match (efficiency_score, total_bytes, workload_rank, bottleneck_score) {
+    const HIGH_WORKLOAD_BYTES: u64 = 20_000_000; // 20MB (lowered from 50MB)
+    const LOW_WORKLOAD_BYTES: u64 = 5_000_000; // 5MB (lowered from 10MB)
+    const HIGH_WORKLOAD_RANK: f64 = 0.5; // Top 50% (lowered from 70%)
+    const LOW_WORKLOAD_RANK: f64 = 0.2; // Bottom 80% (lowered from 30%)
+
+    match (
+        efficiency_score,
+        total_bytes,
+        workload_rank,
+        bottleneck_score,
+    ) {
         // True bottleneck: very low efficiency AND meaningful bottleneck score OR very high bottleneck score
         (eff, _, _, score) if eff < 0.35 && score > 0.05 => BottleneckType::TrueBottleneck,
         (_, _, _, score) if score > 0.25 => BottleneckType::TrueBottleneck,
-        
+
         // Efficiency bottleneck: medium-low efficiency with notable bottleneck score
         (eff, _, _, score) if eff < 0.65 && score > 0.15 => BottleneckType::EfficiencyBottleneck,
-        
+
         // Workhorse: good efficiency + high workload (by bytes OR rank)
-        (eff, bytes, rank, _) if eff > 0.7 && (bytes > HIGH_WORKLOAD_BYTES || rank > HIGH_WORKLOAD_RANK) => {
+        (eff, bytes, rank, _)
+            if eff > 0.7 && (bytes > HIGH_WORKLOAD_BYTES || rank > HIGH_WORKLOAD_RANK) =>
+        {
             BottleneckType::Workhorse
-        },
-        
+        }
+
         // Underused: high efficiency + low workload (by bytes AND rank) + very low bottleneck score
-        (eff, bytes, rank, score) if eff > 0.8 && bytes < LOW_WORKLOAD_BYTES && rank < LOW_WORKLOAD_RANK && score < 0.05 => {
+        (eff, bytes, rank, score)
+            if eff > 0.8
+                && bytes < LOW_WORKLOAD_BYTES
+                && rank < LOW_WORKLOAD_RANK
+                && score < 0.05 =>
+        {
             BottleneckType::Underutilized
-        },
-        
+        }
+
         // Normal: everything else
         _ => BottleneckType::Normal,
     }
@@ -3044,12 +3123,12 @@ fn determine_primary_bottleneck_type(types: &[BottleneckType]) -> String {
     if types.is_empty() {
         return "normal".to_string();
     }
-    
+
     let mut type_counts: HashMap<&str, usize> = HashMap::new();
     for bottleneck_type in types {
         *type_counts.entry(bottleneck_type.as_str()).or_insert(0) += 1;
     }
-    
+
     type_counts
         .into_iter()
         .max_by_key(|(_, count)| *count)

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 /// Calculate actual session duration using the last download completion time
 fn calculate_actual_session_duration(session: &SessionLog) -> f64 {
     let mut latest_completion_time = session.start;
-    
+
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
             if let Some(time) = cdn_record.time {
@@ -16,7 +16,7 @@ fn calculate_actual_session_duration(session: &SessionLog) -> f64 {
             }
         }
     }
-    
+
     if latest_completion_time > session.start {
         (latest_completion_time - session.start) as f64
     } else {
@@ -212,13 +212,16 @@ fn analyze_retry_by_server(sessions: &[SessionLog]) -> HashMap<String, ServerRet
                     // Convert attempts to retries: retries = attempts - 1
                     if chunk.att > 1 {
                         data.total_retries += chunk.att - 1;
-                        
+
                         // Track retry reasons from error field when there are actual retries
                         if let Some(error) = &cdn_record.err {
                             *data.retry_reasons.entry(error.clone()).or_insert(0) += 1;
                         } else {
                             // If no error is recorded, use a generic retry reason
-                            *data.retry_reasons.entry("retry_without_error".to_string()).or_insert(0) += 1;
+                            *data
+                                .retry_reasons
+                                .entry("retry_without_error".to_string())
+                                .or_insert(0) += 1;
                         }
                     }
 

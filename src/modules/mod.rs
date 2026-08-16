@@ -6,4 +6,5 @@ pub mod network;
 pub mod qjs;
 pub mod server;
 pub mod storage;
+pub mod version_file;
 pub mod version_provider;

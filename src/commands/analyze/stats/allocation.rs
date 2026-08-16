@@ -1,6 +1,5 @@
 use crate::commands::analyze::models::{
-    ChunkAllocationAnalysis, ChunkAllocationImpact, MisallocatedChunk, ServerChunkStats,
-    SessionLog,
+    ChunkAllocationAnalysis, ChunkAllocationImpact, MisallocatedChunk, ServerChunkStats, SessionLog,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -26,16 +25,16 @@ pub fn analyze_chunk_allocation(sessions: &[SessionLog]) -> ChunkAllocationAnaly
 
     // Collect all chunk data with server performance
     let chunk_data = collect_chunk_data(sessions);
-    
+
     // Calculate server performance metrics
     let server_speeds = calculate_server_speeds(&chunk_data);
-    
+
     // Build server chunk distribution
     let server_chunk_distribution = build_server_chunk_distribution(&chunk_data);
-    
+
     // Detect misallocated chunks
     let misallocated_chunks = detect_misallocated_chunks(&chunk_data, &server_speeds);
-    
+
     // Calculate total impact
     let total_impact = calculate_total_impact(&misallocated_chunks, sessions);
 
@@ -61,20 +60,22 @@ fn collect_chunk_data(sessions: &[SessionLog]) -> Vec<ChunkData> {
     for session in sessions {
         for chunk in &session.chunks {
             let chunk_size_mb = parse_chunk_size(&chunk.rng);
-            
+
             for cdn_record in &chunk.cdns {
-                if let (Some(server_id), Some(size), Some(time)) = 
-                    (&cdn_record.srv, cdn_record.size, cdn_record.time) {
-                    
+                if let (Some(server_id), Some(size), Some(time)) =
+                    (&cdn_record.srv, cdn_record.size, cdn_record.time)
+                {
                     // Apply multiple filters for accurate speed measurement
                     // Only include successful downloads (no error)
                     if cdn_record.err.is_none() 
                         && time >= 10  // Minimum 50ms to avoid unrealistic high speeds (reduced from 100ms)
-                        && size >= 10240  // Minimum 10KB for accurate measurement
+                        && size >= 10240
+                    // Minimum 10KB for accurate measurement
                     {
-                        let download_speed_mbps = (size as f64 / 1024.0 / 1024.0) / (time as f64 / 1000.0);
+                        let download_speed_mbps =
+                            (size as f64 / 1024.0 / 1024.0) / (time as f64 / 1000.0);
                         let download_time_seconds = time as f64 / 1000.0;
-                        
+
                         // Apply maximum speed filter (1000MB/s to avoid filtering high-speed downloads, increased from 500MB/s)
                         if download_speed_mbps <= 1000.0 {
                             chunk_data.push(ChunkData {
@@ -141,9 +142,11 @@ fn build_server_chunk_distribution(chunk_data: &[ChunkData]) -> HashMap<String, 
                 .iter()
                 .filter(|chunk| chunk.chunk_size_mb >= LARGE_CHUNK_THRESHOLD_MB)
                 .count();
-            
-            let avg_chunk_size_mb = chunks.iter().map(|c| c.chunk_size_mb).sum::<f64>() / chunks.len() as f64;
-            let avg_speed_mbps = chunks.iter().map(|c| c.download_speed_mbps).sum::<f64>() / chunks.len() as f64;
+
+            let avg_chunk_size_mb =
+                chunks.iter().map(|c| c.chunk_size_mb).sum::<f64>() / chunks.len() as f64;
+            let avg_speed_mbps =
+                chunks.iter().map(|c| c.download_speed_mbps).sum::<f64>() / chunks.len() as f64;
 
             let stats = ServerChunkStats {
                 server_id: server_id.clone(),
@@ -163,36 +166,42 @@ fn detect_misallocated_chunks(
     server_speeds: &HashMap<String, f64>,
 ) -> Vec<MisallocatedChunk> {
     let mut misallocated = Vec::new();
-    
+
     // Find the fastest server for calculating optimal time
-    let max_speed = server_speeds.values().fold(0.0f64, |max, &speed| max.max(speed));
-    
+    let max_speed = server_speeds
+        .values()
+        .fold(0.0f64, |max, &speed| max.max(speed));
+
     for chunk in chunk_data {
         let mut should_flag = false;
         let optimal_time_seconds = chunk.chunk_size_mb / max_speed;
         let time_penalty = chunk.download_time_seconds - optimal_time_seconds;
-        
+
         // Check multiple misallocation conditions:
-        
+
         // 1. Large chunks assigned to slow servers (existing logic with updated thresholds)
         if chunk.chunk_size_mb >= LARGE_CHUNK_THRESHOLD_MB {
             if let Some(&server_speed) = server_speeds.get(&chunk.server_id) {
-                if server_speed < SLOW_SERVER_THRESHOLD_MBPS && time_penalty >= MIN_TIME_PENALTY_SECONDS {
+                if server_speed < SLOW_SERVER_THRESHOLD_MBPS
+                    && time_penalty >= MIN_TIME_PENALTY_SECONDS
+                {
                     should_flag = true;
                 }
             }
         }
-        
+
         // 2. Any download taking longer than 30 seconds (regardless of file size)
         if chunk.download_time_seconds >= LONG_DOWNLOAD_THRESHOLD_SECONDS {
             should_flag = true;
         }
-        
+
         // 3. Small files (<4MB) taking longer than 10 seconds
-        if chunk.chunk_size_mb < LARGE_CHUNK_THRESHOLD_MB && chunk.download_time_seconds >= SMALL_FILE_SLOW_THRESHOLD_SECONDS {
+        if chunk.chunk_size_mb < LARGE_CHUNK_THRESHOLD_MB
+            && chunk.download_time_seconds >= SMALL_FILE_SLOW_THRESHOLD_SECONDS
+        {
             should_flag = true;
         }
-        
+
         if should_flag {
             misallocated.push(MisallocatedChunk {
                 server_id: chunk.server_id.clone(),
@@ -214,27 +223,27 @@ fn detect_misallocated_chunks(
             None => std::cmp::Ordering::Equal,
         }
     });
-    
+
     misallocated
 }
 
 fn calculate_total_impact(
-    misallocated_chunks: &[MisallocatedChunk], 
-    _sessions: &[SessionLog]
+    misallocated_chunks: &[MisallocatedChunk],
+    _sessions: &[SessionLog],
 ) -> ChunkAllocationImpact {
     let total_misallocated_chunks = misallocated_chunks.len();
     let total_time_penalty_seconds = misallocated_chunks
         .iter()
         .map(|chunk| chunk.time_penalty_seconds)
         .sum();
-    
+
     // Count affected sessions
     let affected_sessions: HashSet<_> = misallocated_chunks
         .iter()
         .filter_map(|chunk| chunk.session_id.as_ref())
         .collect();
     let affected_sessions_count = affected_sessions.len();
-    
+
     let worst_misallocation = misallocated_chunks.first().cloned();
 
     ChunkAllocationImpact {
@@ -273,7 +282,7 @@ mod tests {
     fn test_chunk_allocation_analysis() {
         let sessions = vec![create_test_session()];
         let analysis = analyze_chunk_allocation(&sessions);
-        
+
         // Should have some server chunk distribution
         assert!(!analysis.server_chunk_distribution.is_empty());
     }
@@ -288,25 +297,23 @@ mod tests {
             ver: "1.0.0".to_string(),
             ua: Some("TestAgent/1.0".to_string()),
             ip: ("192.168.1.100".to_string(), None),
-            chunks: vec![
-                ChunkLog {
-                    rng: "0-20971519".to_string(), // 20MB chunk
-                    att: 1,
-                    cdns: vec![CdnRecordLog {
-                        url: "https://slow-server.example.com/test".to_string(),
-                        srv: Some("slow-server".to_string()),
-                        wgt: Some(10),
-                        ts: 1010,
-                        pen: Some(false),
-                        rsn: Some("flow_selected".to_string()),
-                        ttfb: Some(1000),
-                        time: Some(20000), // 20 seconds = 1MB/s
-                        size: Some(20971520),
-                        err: None,
-                        mode: Some("http".to_string()),
-                    }],
-                }
-            ],
+            chunks: vec![ChunkLog {
+                rng: "0-20971519".to_string(), // 20MB chunk
+                att: 1,
+                cdns: vec![CdnRecordLog {
+                    url: "https://slow-server.example.com/test".to_string(),
+                    srv: Some("slow-server".to_string()),
+                    wgt: Some(10),
+                    ts: 1010,
+                    pen: Some(false),
+                    rsn: Some("flow_selected".to_string()),
+                    ttfb: Some(1000),
+                    time: Some(20000), // 20 seconds = 1MB/s
+                    size: Some(20971520),
+                    err: None,
+                    mode: Some("http".to_string()),
+                }],
+            }],
         }
     }
 }

@@ -51,7 +51,10 @@ pub fn generate_prometheus_config(
 
     for (server_id, server_config) in &config.servers {
         // 判断跳过
-        if server_config.generation_skip.contains(&"prometheus".to_string()) {
+        if server_config
+            .generation_skip
+            .contains(&"prometheus".to_string())
+        {
             continue;
         }
         // 如果指定了profile过滤器，则只处理匹配的服务器

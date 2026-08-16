@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::container::REQWEST_CLIENT;
+use crate::container::FETCH_CLIENT;
 use crate::modules::storage::data_store::{CacheMetadata, DataStoreBackend};
 use std::sync::Arc;
 use tracing::warn;
@@ -21,7 +21,7 @@ pub async fn download_and_cache(
     max_age: u32,
 ) -> Result<(CacheMetadata, Vec<u8>), String> {
     // 下载内容
-    let response = REQWEST_CLIENT
+    let response = FETCH_CLIENT
         .get(cdn_url)
         .send()
         .await
@@ -80,7 +80,10 @@ pub async fn should_cache_content(
     server_id: &str,
     full_path: &str,
 ) -> Option<(u64, u32)> {
-    println!("Checking cache for resource_id: {}, sub_path: {:?}, server_id: {}, full_path: {}", resource_id, sub_path, server_id, full_path);
+    println!(
+        "Checking cache for resource_id: {}, sub_path: {:?}, server_id: {}, full_path: {}",
+        resource_id, sub_path, server_id, full_path
+    );
     // 检查资源是否启用缓存
     let resource = config.get_resource(resource_id)?;
     if !resource.cache_enabled {
@@ -96,7 +99,10 @@ pub async fn should_cache_content(
             .iter()
             .any(|pattern| glob_match(pattern, sub))
         {
-            println!("Subpath {} does not match any cache patterns for resource_id: {}", sub, resource_id);
+            println!(
+                "Subpath {} does not match any cache patterns for resource_id: {}",
+                sub, resource_id
+            );
             return None;
         }
     }
@@ -104,13 +110,19 @@ pub async fn should_cache_content(
     // 从健康检查缓存获取文件大小
     if let Ok(Some(health_info)) = redis.get_health_info(server_id, full_path).await {
         if health_info.is_alive {
-            println!("Health info found for server_id: {}, full_path: {}", server_id, full_path);
+            println!(
+                "Health info found for server_id: {}, full_path: {}",
+                server_id, full_path
+            );
             return health_info
                 .file_size
                 .map(|size| (size, resource.cache_max_age));
         }
     }
-    println!("No health info available for server_id: {}, full_path: {}", server_id, full_path);
+    println!(
+        "No health info available for server_id: {}, full_path: {}",
+        server_id, full_path
+    );
     None
 }
 

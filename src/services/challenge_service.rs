@@ -417,6 +417,8 @@ impl ChallengeService {
             cdn_records: HashMap::new(),
             extras: serde_json::json!({}), // 历史客户端使用空extras
             created_at: chrono::Utc::now().timestamp() as u64,
+            kind: crate::models::SessionKind::Direct,
+            expires_at: Some(chrono::Utc::now().timestamp() as u64 + Session::DIRECT_TTL_SECONDS),
         };
 
         // 使用SessionService创建session

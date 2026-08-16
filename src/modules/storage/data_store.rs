@@ -817,22 +817,27 @@ impl DataStoreBackend for FileDataStore {
                 _ => continue,
             };
 
-            // 检查文件修改时间
-            if let Ok(metadata) = fs::metadata(&path).await {
-                if let Ok(modified) = metadata.modified() {
-                    if let Ok(modified_secs) = modified.duration_since(UNIX_EPOCH) {
-                        let file_age = now - modified_secs.as_secs();
+            let is_expired = if let Ok(Some(session)) = self.get_session(file_name).await {
+                if let Some(expires_at) = session.expires_at {
+                    now >= expires_at
+                } else if let Ok(metadata) = fs::metadata(&path).await {
+                    metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                        .is_some_and(|modified_secs| {
+                            now - modified_secs.as_secs() >= timeout_seconds.saturating_sub(60)
+                        })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
 
-                        // 如果文件年龄接近超时时间（在最后60秒内）
-                        if file_age >= timeout_seconds.saturating_sub(60) {
-                            // 尝试读取会话信息
-                            if let Ok(Some(session_info)) =
-                                self.get_file_session_info(file_name).await
-                            {
-                                expired_sessions.push(session_info);
-                            }
-                        }
-                    }
+            if is_expired {
+                if let Ok(Some(session_info)) = self.get_file_session_info(file_name).await {
+                    expired_sessions.push(session_info);
                 }
             }
         }

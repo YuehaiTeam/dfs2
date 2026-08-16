@@ -6,7 +6,7 @@ use tracing::info;
 
 use crate::error::DfsError;
 use crate::modules::network::RealConnectInfo;
-use crate::modules::network::h3_capability::compute_h3_capable;
+use crate::modules::network::capabilities::compute_capabilities;
 use crate::record_request_metrics;
 use crate::responses::ErrorResponse;
 use crate::{container::AppContext, modules::external::geolocation};
@@ -78,10 +78,17 @@ pub async fn post_batch_cdn(
         .get_resource(&resid)
         .ok_or_else(|| DfsError::resource_not_found(&resid))?;
 
-    // 2. Pipeline批量读取所有chunk信息
+    // 2. Pipeline批量读取所有chunk信息（计数按当前认证文件隔离）
+    let scoped_chunks: Vec<String> = payload
+        .chunks
+        .iter()
+        .map(|chunk| {
+            crate::services::SessionService::scoped_download_key(session.sub_path.as_deref(), chunk)
+        })
+        .collect();
     let batch_data = ctx
         .data_store
-        .batch_check_and_increment_downloads(&sessionid, &payload.chunks)
+        .batch_check_and_increment_downloads(&sessionid, &scoped_chunks)
         .await
         .map_err(|e| DfsError::internal_error(format!("Batch Redis read failed: {}", e)))?;
 
@@ -97,7 +104,7 @@ pub async fn post_batch_cdn(
     }
 
     // 4. 限制并发Flow执行（关键：限制为4个）
-    let h3_capable = compute_h3_capable(
+    let capabilities = compute_capabilities(
         headers.get("X-DFS-Override").and_then(|v| v.to_str().ok()),
         headers.get("user-agent").and_then(|v| v.to_str().ok()),
     );
@@ -113,18 +120,21 @@ pub async fn post_batch_cdn(
             let resource = resource.clone();
             let batch_data_ref = batch_data.clone();
             let semaphore = semaphore.clone();
+            let sessionid = sessionid.clone();
 
+            let capabilities = capabilities.clone();
             let task = tokio::spawn(async move {
                 let _permit = semaphore.acquire().await.unwrap();
 
                 process_chunk_with_preloaded_data(
                     &ctx,
                     &session,
+                    &sessionid,
                     &chunk_range,
                     &resource,
                     &*batch_data_ref,
                     client_ip,
-                    h3_capable,
+                    capabilities.clone(),
                 )
                 .await
             });
@@ -276,37 +286,30 @@ pub async fn post_batch_cdn(
 async fn process_chunk_with_preloaded_data(
     ctx: &AppContext,
     session: &crate::models::Session,
+    session_id: &str,
     chunk_range: &str,
     resource: &crate::config::ResourceConfig,
     batch_data: &crate::models::BatchChunkData,
     client_ip: Option<std::net::IpAddr>,
-    h3_capable: bool,
+    capabilities: crate::modules::network::capabilities::ClientCapabilities,
 ) -> crate::error::DfsResult<crate::models::ChunkProcessResult> {
+    let scoped_chunk = crate::services::SessionService::scoped_download_key(
+        session.sub_path.as_deref(),
+        chunk_range,
+    );
     // 检查chunk是否有效
-    if batch_data.invalid_chunks.contains(&chunk_range.to_string()) {
+    if batch_data.invalid_chunks.contains(&scoped_chunk) {
         return Err(DfsError::invalid_input("chunk", "Invalid chunk range"));
     }
 
     // 解析ranges
     let ranges = parse_and_validate_ranges(chunk_range)?;
 
-    // 获取预加载的penalty服务器
-    let penalty_servers: Vec<String> = batch_data
-        .cdn_records
-        .get(chunk_range)
-        .map(|records| {
-            records
-                .iter()
-                .filter_map(|record| {
-                    if !record.skip_penalty {
-                        record.server_id.clone()
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // 退避按 sid 汇总，不按当前 range 切片
+    let penalty_servers = ctx
+        .session_service
+        .get_sticky_penalty_servers(session_id)
+        .await?;
 
     // 执行flow（无Redis操作，纯计算）
     let file_size = Some(calculate_file_size_from_ranges(&ranges));
@@ -320,9 +323,9 @@ async fn process_chunk_with_preloaded_data(
 
     let context = crate::models::FlowContext {
         client_ip,
-        session_id: Some(session.resource_id.clone()),
+        session_id: Some(session_id.to_string()),
         extras: session.extras.clone(),
-        h3_capable,
+        capabilities,
     };
 
     let options = crate::models::FlowOptions {
