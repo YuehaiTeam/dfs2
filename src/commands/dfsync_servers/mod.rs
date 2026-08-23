@@ -56,21 +56,17 @@ pub fn generate_dfsync_servers(config: &AppConfig, profile_filter: Option<&str>)
                 );
             }
             "dfs_node" => {
-                let selected_url = select_dfs_node_sync_url(server);
-                let Some(selected_url) = selected_url else {
-                    continue;
-                };
-
-                let normalized = normalize_dfsnode_sync_url(server_id, selected_url)?;
-                out.insert(
-                    server_id.clone(),
-                    DfsyncServerEntry {
-                        server_type: "webdav_tus".to_string(),
-                        url: normalized,
-                        profile: server.profile.clone(),
-                        health_check_path: server.health_check_path.clone(),
-                    },
-                );
+                if let Some(entry) =
+                    webdav_tus_entry(server_id, server, select_dfs_node_sync_url(server))?
+                {
+                    out.insert(server_id.clone(), entry);
+                }
+            }
+            "dfs_webtransport" | "dfs_sftp" => {
+                if let Some(entry) = webdav_tus_entry(server_id, server, required_sync_url(server))?
+                {
+                    out.insert(server_id.clone(), entry);
+                }
             }
             _ => {}
         }
@@ -79,12 +75,16 @@ pub fn generate_dfsync_servers(config: &AppConfig, profile_filter: Option<&str>)
     serde_yaml::to_string(&out).context("Failed to serialize dfsync servers YAML")
 }
 
-fn select_dfs_node_sync_url(server: &ServerConfig) -> Option<&str> {
-    let sync_url = server
+fn required_sync_url(server: &ServerConfig) -> Option<&str> {
+    server
         .sync_url
         .as_deref()
         .map(str::trim)
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+}
+
+fn select_dfs_node_sync_url(server: &ServerConfig) -> Option<&str> {
+    let sync_url = required_sync_url(server);
 
     if server.ssh_only || server.h3_only {
         return sync_url;
@@ -94,6 +94,23 @@ fn select_dfs_node_sync_url(server: &ServerConfig) -> Option<&str> {
         let raw = server.url.trim();
         if raw.is_empty() { None } else { Some(raw) }
     })
+}
+
+fn webdav_tus_entry(
+    server_id: &str,
+    server: &ServerConfig,
+    selected_url: Option<&str>,
+) -> Result<Option<DfsyncServerEntry>> {
+    let Some(selected_url) = selected_url else {
+        return Ok(None);
+    };
+
+    Ok(Some(DfsyncServerEntry {
+        server_type: "webdav_tus".to_string(),
+        url: normalize_dfsnode_sync_url(server_id, selected_url)?,
+        profile: server.profile.clone(),
+        health_check_path: server.health_check_path.clone(),
+    }))
 }
 
 fn validate_http_url(server_id: &str, raw_url: &str) -> Result<()> {
@@ -246,6 +263,90 @@ plugins: {}
         let generated = generate_dfsync_servers(&config, None).unwrap();
         let map = parse_generated(&generated);
         assert_eq!(map["node1"].url, "http://su:sp@127.0.0.1:8080/dav");
+    }
+
+    #[test]
+    fn test_generate_dfs_webtransport_requires_sync_url() {
+        let config = parse_app_config(
+            r#"
+servers:
+  wt1:
+    id: wt1
+    type: dfs_webtransport
+    url: "https://u:p@127.0.0.1:443/"
+    sync_url: "http://su:sp@127.0.0.1:8080/dav?expire_seconds=3600"
+    cert_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+resources: {}
+plugins: {}
+"#,
+        );
+
+        let generated = generate_dfsync_servers(&config, None).unwrap();
+        let map = parse_generated(&generated);
+        assert_eq!(map["wt1"].server_type, "webdav_tus");
+        assert_eq!(map["wt1"].url, "http://su:sp@127.0.0.1:8080/dav");
+    }
+
+    #[test]
+    fn test_skip_dfs_webtransport_without_sync_url() {
+        let config = parse_app_config(
+            r#"
+servers:
+  wt1:
+    id: wt1
+    type: dfs_webtransport
+    url: "https://u:p@127.0.0.1:443/"
+    cert_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+resources: {}
+plugins: {}
+"#,
+        );
+
+        let generated = generate_dfsync_servers(&config, None).unwrap();
+        let map = parse_generated(&generated);
+        assert!(!map.contains_key("wt1"));
+    }
+
+    #[test]
+    fn test_generate_dfs_sftp_requires_sync_url() {
+        let config = parse_app_config(
+            r#"
+servers:
+  sftp1:
+    id: sftp1
+    type: dfs_sftp
+    url: "sftp://u:p@127.0.0.1:22/"
+    sync_url: "https://su:sp@127.0.0.1:8443/dav"
+    ssh_fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+resources: {}
+plugins: {}
+"#,
+        );
+
+        let generated = generate_dfsync_servers(&config, None).unwrap();
+        let map = parse_generated(&generated);
+        assert_eq!(map["sftp1"].server_type, "webdav_tus");
+        assert_eq!(map["sftp1"].url, "https://su:sp@127.0.0.1:8443/dav");
+    }
+
+    #[test]
+    fn test_skip_dfs_sftp_without_sync_url() {
+        let config = parse_app_config(
+            r#"
+servers:
+  sftp1:
+    id: sftp1
+    type: dfs_sftp
+    url: "sftp://u:p@127.0.0.1:22/"
+    ssh_fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+resources: {}
+plugins: {}
+"#,
+        );
+
+        let generated = generate_dfsync_servers(&config, None).unwrap();
+        let map = parse_generated(&generated);
+        assert!(!map.contains_key("sftp1"));
     }
 
     #[test]
