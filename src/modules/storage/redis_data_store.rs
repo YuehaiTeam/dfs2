@@ -212,29 +212,20 @@ impl DataStoreBackend for RedisDataStore {
         sid: &str,
         chunk: &str,
     ) -> Result<Option<u32>, String> {
+        let session = match self.get_session(sid).await? {
+            Some(session) => session,
+            None => return Ok(None),
+        };
+
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
             .await
             .map_err(|e| e.to_string())?;
         let counts_key = self.redis_key("counts", sid);
+        let ttl = Self::session_ttl_seconds(&session);
 
-        // 首先检查chunk是否存在于hash中
-        let exists: bool = conn
-            .hexists(&counts_key, chunk)
-            .await
-            .map_err(|e| e.to_string())?;
-        if !exists {
-            return Ok(None); // 无效的chunk
-        }
-
-        let ttl = self
-            .get_session(sid)
-            .await?
-            .map(|session| Self::session_ttl_seconds(&session))
-            .unwrap_or(3600);
-
-        // 增加下载计数并保持会话的生命周期
+        // counts 只是计数器：会话存在就 HINCRBY，字段不存在则创建。
         let count: [u32; 2] = redis::pipe()
             .atomic()
             .hincr(&counts_key, chunk, 1)
@@ -807,6 +798,25 @@ impl DataStoreBackend for RedisDataStore {
         sid: &str,
         chunks: &[String],
     ) -> Result<crate::models::BatchChunkData, String> {
+        if chunks.is_empty() {
+            return Ok(crate::models::BatchChunkData {
+                valid_chunks: HashMap::new(),
+                invalid_chunks: Vec::new(),
+                cdn_records: HashMap::new(),
+            });
+        }
+
+        let session = match self.get_session(sid).await? {
+            Some(session) => session,
+            None => {
+                return Ok(crate::models::BatchChunkData {
+                    valid_chunks: HashMap::new(),
+                    invalid_chunks: chunks.to_vec(),
+                    cdn_records: HashMap::new(),
+                });
+            }
+        };
+
         let mut conn = self
             .client
             .get_multiplexed_async_connection()
@@ -815,62 +825,37 @@ impl DataStoreBackend for RedisDataStore {
 
         let counts_key = self.redis_key("counts", sid);
         let session_key = self.redis_key("session", sid);
+        let ttl = Self::session_ttl_seconds(&session);
 
-        // 构建Pipeline: 检查存在性 + 增加计数 + 获取CDN记录
         let mut pipe = redis::pipe();
         pipe.atomic();
 
-        // 1. 批量检查chunk存在性
-        for chunk in chunks {
-            pipe.hexists(&counts_key, chunk);
-        }
-
-        // 2. 批量增加下载计数
         for chunk in chunks {
             pipe.hincr(&counts_key, chunk, 1);
         }
-
-        // 3. 获取CDN记录
         pipe.hget(&session_key, "cdn_records");
+        pipe.expire(&counts_key, ttl);
+        pipe.expire(&session_key, ttl);
 
-        // 4. 刷新过期时间
-        pipe.expire(&counts_key, 3600);
-        pipe.expire(&session_key, 3600);
-
-        // 执行Pipeline
         let results: Vec<redis::Value> = pipe
             .query_async(&mut conn)
             .await
             .map_err(|e| e.to_string())?;
 
-        // 解析结果
-        let chunk_count = chunks.len();
-        let mut valid_chunks = std::collections::HashMap::new();
-        let mut invalid_chunks = Vec::new();
-
-        // 处理存在性检查和下载计数结果
+        let mut valid_chunks = HashMap::new();
         for (i, chunk) in chunks.iter().enumerate() {
-            let exists: bool = redis::from_redis_value(&results[i]).map_err(|e| e.to_string())?;
-
-            if exists {
-                let new_count: u32 = redis::from_redis_value(&results[chunk_count + i])
-                    .map_err(|e| e.to_string())?;
-                valid_chunks.insert(chunk.clone(), new_count);
-            } else {
-                invalid_chunks.push(chunk.clone());
-            }
+            let new_count: u32 = redis::from_redis_value(&results[i]).map_err(|e| e.to_string())?;
+            valid_chunks.insert(chunk.clone(), new_count);
         }
 
-        // 解析CDN记录
         let cdn_records_json: Option<String> =
-            redis::from_redis_value(&results[chunk_count * 2]).map_err(|e| e.to_string())?;
+            redis::from_redis_value(&results[chunks.len()]).map_err(|e| e.to_string())?;
 
-        let all_cdn_records: std::collections::HashMap<String, Vec<crate::models::CdnRecord>> =
-            cdn_records_json
-                .and_then(|json| serde_json::from_str(&json).ok())
-                .unwrap_or_default();
+        let all_cdn_records: HashMap<String, Vec<crate::models::CdnRecord>> = cdn_records_json
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
 
-        let mut cdn_records = std::collections::HashMap::new();
+        let mut cdn_records = HashMap::new();
         for chunk in chunks {
             if let Some(records) = all_cdn_records.get(chunk) {
                 cdn_records.insert(chunk.clone(), records.clone());
@@ -879,7 +864,7 @@ impl DataStoreBackend for RedisDataStore {
 
         Ok(crate::models::BatchChunkData {
             valid_chunks,
-            invalid_chunks,
+            invalid_chunks: Vec::new(),
             cdn_records,
         })
     }

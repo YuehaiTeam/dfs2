@@ -267,6 +267,9 @@ impl DataStoreBackend for MockDataStore {
         sid: &str,
         chunk: &str,
     ) -> Result<Option<u32>, String> {
+        if self.get_session(sid).await?.is_none() {
+            return Ok(None);
+        }
         let key = format!("{}:{}", sid, chunk);
         let mut counts = self.download_counts.write().await;
         let current = counts.get(&key).copied().unwrap_or(0);

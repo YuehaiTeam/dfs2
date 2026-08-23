@@ -78,19 +78,33 @@ pub async fn post_batch_cdn(
         .get_resource(&resid)
         .ok_or_else(|| DfsError::resource_not_found(&resid))?;
 
-    // 2. Pipeline批量读取所有chunk信息（计数按当前认证文件隔离）
-    let scoped_chunks: Vec<String> = payload
-        .chunks
-        .iter()
-        .map(|chunk| {
-            crate::services::SessionService::scoped_download_key(session.sub_path.as_deref(), chunk)
-        })
-        .collect();
-    let batch_data = ctx
-        .data_store
-        .batch_check_and_increment_downloads(&sessionid, &scoped_chunks)
-        .await
-        .map_err(|e| DfsError::internal_error(format!("Batch Redis read failed: {}", e)))?;
+    // 2. 白名单看 session.chunks（原始 range）；计数键按当前认证文件隔离
+    let mut scoped_allowed = Vec::new();
+    let mut scoped_invalid = Vec::new();
+    for chunk in &payload.chunks {
+        let scoped = crate::services::SessionService::scoped_download_key(
+            session.sub_path.as_deref(),
+            chunk,
+        );
+        if session.chunks.iter().any(|allowed| allowed == chunk) {
+            scoped_allowed.push(scoped);
+        } else {
+            scoped_invalid.push(scoped);
+        }
+    }
+    let mut batch_data = if scoped_allowed.is_empty() {
+        crate::models::BatchChunkData {
+            valid_chunks: std::collections::HashMap::new(),
+            invalid_chunks: Vec::new(),
+            cdn_records: std::collections::HashMap::new(),
+        }
+    } else {
+        ctx.data_store
+            .batch_check_and_increment_downloads(&sessionid, &scoped_allowed)
+            .await
+            .map_err(|e| DfsError::internal_error(format!("Batch Redis read failed: {}", e)))?
+    };
+    batch_data.invalid_chunks.extend(scoped_invalid);
 
     // 3. 验证下载限制
     for (chunk, count) in &batch_data.valid_chunks {
@@ -785,13 +799,15 @@ mod tests {
             "应该包含失败的chunk invalid-format"
         );
 
-        // 注意：9999-10000在MockDataStore中被处理为有效（这是预期的，因为mock没有完全模拟所有验证）
-        // 重点是验证它返回了正确的chunk_id而不是"error_chunk"
         let chunk_9999_result = urls.get("9999-10000").unwrap();
-        // 这个chunk在mock环境中成功了，所以有URL
         assert!(
-            chunk_9999_result.get("url").is_some(),
-            "chunk 9999-10000在mock环境中应该有url字段"
+            chunk_9999_result.get("error").is_some(),
+            "不在 session.chunks 中的 range 应该有 error 字段"
+        );
+        assert!(
+            chunk_9999_result.get("url").is_none()
+                || chunk_9999_result.get("url").unwrap().is_null(),
+            "不在 session.chunks 中的 range 不应该有 url 字段"
         );
 
         // invalid-format是真正格式错误的chunk，应该有error
@@ -820,8 +836,8 @@ mod tests {
 
         println!("✅ POST batch CDN error chunk_id preservation test completed!");
         println!("   - 所有chunk都正确返回原始chunk_id，包括：");
-        println!("     * 成功的chunk: 0-1023, 1024-2047, 9999-10000 (有url字段)");
-        println!("     * 失败的chunk: invalid-format (有error字段)");
+        println!("     * 成功的chunk: 0-1023, 1024-2047 (有url字段)");
+        println!("     * 失败的chunk: 9999-10000, invalid-format (有error字段)");
         println!("   - 修复验证：不再使用虚假的'error_chunk'或'unknown_chunk'作为key");
     }
 }

@@ -415,6 +415,9 @@ impl DataStoreBackend for FileDataStore {
         sid: &str,
         chunk: &str,
     ) -> Result<Option<u32>, String> {
+        if self.get_session(sid).await?.is_none() {
+            return Ok(None);
+        }
         let key = format!("download_count:{sid}:{chunk}");
         let current_count: u32 = self.read_json_file(&key).await?.unwrap_or(0);
         let new_count = current_count + 1;

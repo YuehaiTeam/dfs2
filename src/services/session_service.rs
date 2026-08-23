@@ -57,7 +57,7 @@ impl SessionService {
             .map_err(|e| DfsError::internal_error(format!("Failed to store session: {e}")))
     }
 
-    /// 统一的下载次数检查逻辑
+    /// 记录一次下载尝试。`None` 只表示会话不存在，不表示计数键未预注册。
     pub async fn record_download_attempt(&self, session_id: &str, range: &str) -> DfsResult<u32> {
         match self
             .data_store
@@ -151,9 +151,9 @@ impl SessionService {
         chunk_key: &str,
     ) -> DfsResult<Vec<String>> {
         match self.data_store.get_cdn_records(session_id, chunk_key).await {
-            Ok(previous_records) => Ok(penalty_servers_from_records(
-                std::iter::once(previous_records.as_slice()),
-            )),
+            Ok(previous_records) => Ok(penalty_servers_from_records(std::iter::once(
+                previous_records.as_slice(),
+            ))),
             Err(_) => Ok(Vec::new()), // 没有历史记录，不进行惩罚
         }
     }
@@ -316,9 +316,8 @@ impl SessionService {
             .await?;
 
         if !flow_result.url.is_empty() {
-            let chunk_key = self.generate_chunk_key_from_ranges(
-                target.ranges.as_deref().unwrap_or(&[]),
-            );
+            let chunk_key =
+                self.generate_chunk_key_from_ranges(target.ranges.as_deref().unwrap_or(&[]));
             let cdn_record = CdnRecord {
                 url: flow_result.url.clone(),
                 server_id: flow_result.selected_server_id.clone(),
@@ -493,6 +492,42 @@ mod tests {
         let ranges = vec![];
         let chunk_key = service.generate_chunk_key_from_ranges(&ranges);
         assert_eq!(chunk_key, "0-");
+    }
+
+    #[tokio::test]
+    async fn test_record_download_attempt_missing_session() {
+        let data_store =
+            Arc::new(MockDataStore::new()) as crate::modules::storage::data_store::DataStore;
+        let service = SessionService::new(data_store);
+
+        let err = service
+            .record_download_attempt("missing-sid", "0-")
+            .await
+            .expect_err("missing session must not look like a count-key miss");
+        match err {
+            DfsError::SessionNotFound { session_id } => {
+                assert_eq!(session_id, "missing-sid");
+            }
+            other => panic!("Expected SessionNotFound, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_record_download_attempt_accepts_unregistered_scoped_key() {
+        let data_store =
+            Arc::new(MockDataStore::new()) as crate::modules::storage::data_store::DataStore;
+        let service = SessionService::new(data_store);
+
+        let session_id = "sticky-free-sid";
+        let mut session = create_test_session();
+        session.chunks = vec!["0-".to_string()];
+        service.store_session(session_id, &session).await.unwrap();
+
+        let count = service
+            .record_download_attempt(session_id, "a/one.bin:0-")
+            .await
+            .expect("session exists, so a new scoped count key must be created");
+        assert_eq!(count, 1);
     }
 
     #[test]
