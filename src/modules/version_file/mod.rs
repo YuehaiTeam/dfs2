@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use xxhash_rust::xxh3::xxh3_64;
 
 pub const VERSION_FILE_MAX_BYTES: u64 = 256 * 1024;
+pub const PROBE_CONCURRENCY: usize = 4;
 
 /// Per-server observation collected during a version-file census.
 #[derive(Debug, Clone)]
@@ -72,7 +73,7 @@ pub fn apply_observations(
             server_hashes: HashMap::new(),
             responder_count: 0,
             split_since: previous.and_then(|p| p.split_since),
-            failed: previous.map(|p| p.failed).unwrap_or(false),
+            failed: strict_split_fail || previous.map(|p| p.failed).unwrap_or(false),
             updated_at: now,
         };
     }
@@ -110,6 +111,89 @@ pub fn apply_observations(
         failed,
         updated_at: now,
     }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CensusReport {
+    pub errors: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl CensusReport {
+    pub fn extend(&mut self, other: Self) {
+        self.errors.extend(other.errors);
+        self.warnings.extend(other.warnings);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CensusVerdict {
+    Consistent,
+    MinorityMismatch { mismatched: Vec<String> },
+    NoMajority,
+    NoResponders,
+}
+
+pub fn mismatched_servers(view: &VersionFileView) -> Vec<String> {
+    let Some(majority) = &view.majority_hash else {
+        return Vec::new();
+    };
+    let mut mismatched: Vec<String> = view
+        .server_hashes
+        .iter()
+        .filter(|(_, hash)| *hash != majority)
+        .map(|(id, _)| id.clone())
+        .collect();
+    mismatched.sort();
+    mismatched
+}
+
+pub fn classify_view(view: &VersionFileView) -> CensusVerdict {
+    if view.responder_count == 0 {
+        return CensusVerdict::NoResponders;
+    }
+    if view.failed {
+        return CensusVerdict::NoMajority;
+    }
+    let mismatched = mismatched_servers(view);
+    if mismatched.is_empty() {
+        CensusVerdict::Consistent
+    } else {
+        CensusVerdict::MinorityMismatch { mismatched }
+    }
+}
+
+pub fn report_view(
+    resource_id: &str,
+    version_file: &str,
+    view: &VersionFileView,
+    strict_split_fail: bool,
+) -> CensusReport {
+    let mut report = CensusReport::default();
+    match classify_view(view) {
+        CensusVerdict::Consistent => {}
+        CensusVerdict::MinorityMismatch { mismatched } => {
+            for server_id in mismatched {
+                report.warnings.push(format!(
+                    "服务器 '{server_id}' 版本文件不一致 (资源: {resource_id}, 路径: {version_file})"
+                ));
+            }
+        }
+        CensusVerdict::NoMajority => {
+            report.errors.push(format!(
+                "resource '{resource_id}' version file '{version_file}' has no strict majority (responders={}, groups={:?})",
+                view.responder_count, view.groups
+            ));
+        }
+        CensusVerdict::NoResponders => {
+            if strict_split_fail {
+                report.errors.push(format!(
+                    "resource '{resource_id}' version file '{version_file}' has no live responders"
+                ));
+            }
+        }
+    }
+    report
 }
 
 pub fn evaluate_server(view: &VersionFileView, server_id: &str) -> VersionFileDecision {
@@ -206,7 +290,10 @@ mod tests {
         assert!(view.failed);
         assert_eq!(view.majority_hash, None);
         assert_eq!(view.split_since, Some(10));
-        assert_eq!(evaluate_server(&view, "a"), VersionFileDecision::SplitFailed);
+        assert_eq!(
+            evaluate_server(&view, "a"),
+            VersionFileDecision::SplitFailed
+        );
     }
 
     #[test]
@@ -264,7 +351,10 @@ mod tests {
         );
         assert!(view.failed);
         assert_eq!(view.majority_hash.as_deref(), Some("old"));
-        assert_eq!(evaluate_server(&view, "a"), VersionFileDecision::SplitFailed);
+        assert_eq!(
+            evaluate_server(&view, "a"),
+            VersionFileDecision::SplitFailed
+        );
     }
 
     #[test]
@@ -325,11 +415,7 @@ mod tests {
     fn three_way_split_has_no_majority() {
         let view = apply_observations(
             None,
-            &observations(&[
-                ("a", Some("a")),
-                ("b", Some("b")),
-                ("c", Some("c")),
-            ]),
+            &observations(&[("a", Some("a")), ("b", Some("b")), ("c", Some("c"))]),
             1,
             300,
             false,
@@ -380,5 +466,112 @@ mod tests {
         assert_eq!(view.majority_hash.as_deref(), Some("old"));
         assert!(!view.failed);
         assert_eq!(view.responder_count, 0);
+        assert_eq!(classify_view(&view), CensusVerdict::NoResponders);
+        assert!(
+            report_view("app", "version.json", &view, false)
+                .errors
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn check_zero_responders_fails() {
+        let view = apply_observations(
+            None,
+            &observations(&[("a", None), ("b", None)]),
+            9,
+            300,
+            true,
+        );
+        assert!(view.failed);
+        assert_eq!(view.responder_count, 0);
+        assert_eq!(classify_view(&view), CensusVerdict::NoResponders);
+        let report = report_view("app", "version.json", &view, true);
+        assert_eq!(
+            report.errors,
+            vec!["resource 'app' version file 'version.json' has no live responders".to_string()]
+        );
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn four_to_one_is_majority_with_mismatch() {
+        let view = apply_observations(
+            None,
+            &observations(&[
+                ("a", Some("x")),
+                ("b", Some("x")),
+                ("c", Some("x")),
+                ("d", Some("x")),
+                ("e", Some("y")),
+            ]),
+            1,
+            300,
+            true,
+        );
+        assert!(!view.failed);
+        assert_eq!(view.majority_hash.as_deref(), Some("x"));
+        assert_eq!(evaluate_server(&view, "e"), VersionFileDecision::Mismatch);
+        assert_eq!(
+            classify_view(&view),
+            CensusVerdict::MinorityMismatch {
+                mismatched: vec!["e".to_string()]
+            }
+        );
+        let report = report_view("app", "version.json", &view, true);
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            report.warnings,
+            vec!["服务器 'e' 版本文件不一致 (资源: app, 路径: version.json)".to_string()]
+        );
+    }
+
+    #[test]
+    fn five_dead_five_consistent_is_clean() {
+        let view = apply_observations(
+            None,
+            &observations(&[
+                ("a", Some("x")),
+                ("b", Some("x")),
+                ("c", Some("x")),
+                ("d", Some("x")),
+                ("e", Some("x")),
+                ("f", None),
+                ("g", None),
+                ("h", None),
+                ("i", None),
+                ("j", None),
+            ]),
+            1,
+            300,
+            true,
+        );
+        assert!(!view.failed);
+        assert_eq!(classify_view(&view), CensusVerdict::Consistent);
+        let report = report_view("app", "version.json", &view, true);
+        assert!(report.errors.is_empty());
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn even_split_check_reports_error() {
+        let view = apply_observations(
+            None,
+            &observations(&[
+                ("a", Some("old")),
+                ("b", Some("old")),
+                ("c", Some("new")),
+                ("d", Some("new")),
+            ]),
+            1,
+            300,
+            true,
+        );
+        assert!(view.failed);
+        assert_eq!(classify_view(&view), CensusVerdict::NoMajority);
+        let report = report_view("app", "version.json", &view, true);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("no strict majority"));
+        assert!(report.warnings.is_empty());
     }
 }

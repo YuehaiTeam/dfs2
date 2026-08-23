@@ -101,16 +101,14 @@ fn init_tracing() -> DfsResult<()> {
 }
 
 // 中间件函数来处理真实IP提取 (兼容 TCP 和 Unix Socket)
-async fn real_ip_middleware(
-    mut req: Request<Body>,
-    next: Next,
-) -> Response {
+async fn real_ip_middleware(mut req: Request<Body>, next: Next) -> Response {
     // 尝试从扩展中获取 ConnectInfo，对于 UDS 连接可能不存在
-    let fallback_addr = req.extensions()
+    let fallback_addr = req
+        .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| *addr)
         .unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
-    
+
     let real_connect_info = RealConnectInfo::from_headers_and_addr(req.headers(), fallback_addr);
 
     // 将真实连接信息添加到请求扩展中
@@ -243,7 +241,9 @@ async fn handle_validate() -> DfsResult<()> {
 async fn main() -> DfsResult<()> {
     dotenv().ok();
 
-    let _ = rustls::crypto::CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    );
 
     // 解析命令行参数
     let args = Args::parse();
@@ -357,10 +357,16 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
         app_container.data_store.clone(),
         app_context.resource_service.clone(),
     ));
-    match version_file_service.census_all(false).await {
-        Ok(errors) => {
-            for error in &errors {
+    match version_file_service
+        .census_all(false, &std::collections::HashSet::new())
+        .await
+    {
+        Ok(report) => {
+            for error in &report.errors {
                 warn!("Version-file census: {}", error);
+            }
+            for warning in &report.warnings {
+                warn!("Version-file census: {}", warning);
             }
         }
         Err(e) => warn!("Initial version-file census failed: {}", e),
@@ -395,12 +401,7 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
         {
             let listener = tokio::net::UnixListener::bind(&bind_addr[5..])
                 .map_err(|e| DfsError::io_error("bind_socket", e.to_string()))?;
-            match axum::serve(
-                listener,
-                app.into_make_service(),
-            )
-            .await
-            {
+            match axum::serve(listener, app.into_make_service()).await {
                 Ok(_) => {
                     info!("Server shutdown gracefully");
                     Ok(())

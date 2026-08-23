@@ -412,7 +412,10 @@ impl ServerImpl {
         let check_url = match self.url(path, None, None, redis).await {
             Ok(url) => url,
             Err(e) => {
-                warn!("Version-file URL generation failed for path {}: {:?}", path, e);
+                warn!(
+                    "Version-file URL generation failed for path {}: {:?}",
+                    path, e
+                );
                 return FileProbe {
                     is_alive: false,
                     file_size: None,
@@ -437,8 +440,8 @@ async fn read_limited_body(
     response: reqwest::Response,
     max_bytes: u64,
 ) -> (Option<u64>, Option<Vec<u8>>) {
-    let file_size = extract_file_size_from_response(response.headers())
-        .or_else(|| response.content_length());
+    let file_size =
+        extract_file_size_from_response(response.headers()).or_else(|| response.content_length());
     if file_size.is_some_and(|size| size > max_bytes) {
         return (file_size, None);
     }
@@ -503,7 +506,10 @@ async fn execute_full_probe(
                 (true, file_size, observed_cert_hash, body)
             }
             Err(e) => {
-                warn!("HTTP/3 version-file probe failed for URL {}: {:?}", check_url, e);
+                warn!(
+                    "HTTP/3 version-file probe failed for URL {}: {:?}",
+                    check_url, e
+                );
                 (false, None, None, None)
             }
         }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -7,8 +8,9 @@ use crate::modules::server::HealthInfo;
 use crate::modules::storage::cache::generate_etag;
 use crate::modules::storage::data_store::{CacheMetadata, DataStore};
 use crate::modules::version_file::{
-    VERSION_FILE_MAX_BYTES, VersionFileDecision, VersionFileObservation, VersionFileView,
-    apply_observations, evaluate_server, hash_content, view_storage_key,
+    CensusReport, PROBE_CONCURRENCY, VERSION_FILE_MAX_BYTES, VersionFileDecision,
+    VersionFileObservation, VersionFileView, apply_observations, evaluate_server, hash_content,
+    report_view, view_storage_key,
 };
 use crate::services::resource_service::{
     ResourceService, collect_resource_server_ids, version_file_path_for_resource,
@@ -44,8 +46,16 @@ impl VersionFileService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                if let Err(e) = self.census_all(false).await {
-                    warn!("Version-file census cycle failed: {}", e);
+                match self.census_all(false, &HashSet::new()).await {
+                    Ok(report) => {
+                        for error in &report.errors {
+                            warn!("Version-file census: {}", error);
+                        }
+                        for warning in &report.warnings {
+                            warn!("Version-file census: {}", warning);
+                        }
+                    }
+                    Err(e) => warn!("Version-file census cycle failed: {}", e),
                 }
             }
         });
@@ -105,39 +115,43 @@ impl VersionFileService {
             .any(|candidate| candidate == path)
     }
 
-    pub async fn census_all(&self, strict_split_fail: bool) -> Result<Vec<String>, String> {
+    pub async fn census_all(
+        &self,
+        strict_split_fail: bool,
+        skip_server_ids: &HashSet<String>,
+    ) -> Result<CensusReport, String> {
         let config = self.shared_config.load();
-        let mut errors = Vec::new();
+        let mut report = CensusReport::default();
 
         for (resource_id, resource) in &config.resources {
             if resource.version_files.is_empty() {
                 continue;
             }
-            match self.census_resource(resource_id, strict_split_fail).await {
-                Ok(resource_errors) => errors.extend(resource_errors),
-                Err(e) => errors.push(e),
+            match self
+                .census_resource(resource_id, strict_split_fail, skip_server_ids)
+                .await
+            {
+                Ok(resource_report) => report.extend(resource_report),
+                Err(e) => report.errors.push(e),
             }
         }
 
-        if errors.is_empty() {
-            Ok(Vec::new())
-        } else {
-            Ok(errors)
-        }
+        Ok(report)
     }
 
     pub async fn census_resource(
         &self,
         resource_id: &str,
         strict_split_fail: bool,
-    ) -> Result<Vec<String>, String> {
+        skip_server_ids: &HashSet<String>,
+    ) -> Result<CensusReport, String> {
         let config = self.shared_config.load();
         let resource = config
             .get_resource(resource_id)
             .ok_or_else(|| format!("resource '{resource_id}' not found"))?;
 
         if resource.version_files.is_empty() {
-            return Ok(Vec::new());
+            return Ok(CensusReport::default());
         }
 
         let version = self
@@ -147,66 +161,20 @@ impl VersionFileService {
             .unwrap_or_else(|_| resource.latest.clone());
         let server_ids = collect_resource_server_ids(resource);
         let now = chrono::Utc::now().timestamp() as u64;
-        let mut errors = Vec::new();
+        let mut report = CensusReport::default();
 
         for version_file in &resource.version_files {
             let Some(path) = version_file_path_for_resource(resource, &version, None, version_file)
             else {
-                errors.push(format!(
+                report.errors.push(format!(
                     "resource '{resource_id}' version file '{version_file}' could not be resolved"
                 ));
                 continue;
             };
 
-            let mut observations = Vec::new();
-
-            for server_id in &server_ids {
-                let Some(server_impl) = config.get_server(server_id) else {
-                    observations.push(VersionFileObservation {
-                        server_id: server_id.clone(),
-                        hash: None,
-                        content: None,
-                        file_size: None,
-                        observed_cert_hash: None,
-                    });
-                    continue;
-                };
-                let Some(server_config) = config.servers.get(server_id) else {
-                    observations.push(VersionFileObservation {
-                        server_id: server_id.clone(),
-                        hash: None,
-                        content: None,
-                        file_size: None,
-                        observed_cert_hash: None,
-                    });
-                    continue;
-                };
-
-                let probe = server_impl
-                    .fetch_small_file(
-                        server_config,
-                        &path,
-                        Some(&self.data_store),
-                        VERSION_FILE_MAX_BYTES,
-                    )
-                    .await;
-
-                let (hash, content) = match probe.body {
-                    Some(body) => {
-                        let hash = hash_content(&body);
-                        (Some(hash), Some(body))
-                    }
-                    None => (None, None),
-                };
-
-                observations.push(VersionFileObservation {
-                    server_id: server_id.clone(),
-                    hash,
-                    content,
-                    file_size: probe.file_size,
-                    observed_cert_hash: probe.observed_cert_hash.clone(),
-                });
-            }
+            let observations = self
+                .collect_observations(&server_ids, &path, skip_server_ids)
+                .await;
 
             let previous = self.get_view(resource_id, &path).await;
             let view = apply_observations(
@@ -221,26 +189,30 @@ impl VersionFileService {
             self.update_server_health(&observations, &view, &path, now)
                 .await;
 
-            if view.failed {
-                errors.push(format!(
-                    "resource '{resource_id}' version file '{version_file}' has no strict majority (responders={}, groups={:?})",
-                    view.responder_count, view.groups
-                ));
-            } else if let Some(majority_hash) = &view.majority_hash {
-                if resource.cache_enabled {
-                    if let Some(content) = observations.iter().find_map(|obs| {
-                        (obs.hash.as_deref() == Some(majority_hash.as_str()))
-                            .then(|| obs.content.clone())
-                            .flatten()
-                    }) {
-                        self.write_majority_cache(
-                            resource_id,
-                            &version,
-                            &path,
-                            resource.cache_max_age,
-                            &content,
-                        )
-                        .await;
+            report.extend(report_view(
+                resource_id,
+                version_file,
+                &view,
+                strict_split_fail,
+            ));
+
+            if !view.failed {
+                if let Some(majority_hash) = &view.majority_hash {
+                    if resource.cache_enabled {
+                        if let Some(content) = observations.iter().find_map(|obs| {
+                            (obs.hash.as_deref() == Some(majority_hash.as_str()))
+                                .then(|| obs.content.clone())
+                                .flatten()
+                        }) {
+                            self.write_majority_cache(
+                                resource_id,
+                                &version,
+                                &path,
+                                resource.cache_max_age,
+                                &content,
+                            )
+                            .await;
+                        }
                     }
                 }
             }
@@ -251,7 +223,78 @@ impl VersionFileService {
             );
         }
 
-        Ok(errors)
+        Ok(report)
+    }
+
+    async fn collect_observations(
+        &self,
+        server_ids: &[String],
+        path: &str,
+        skip_server_ids: &HashSet<String>,
+    ) -> Vec<VersionFileObservation> {
+        let config = self.shared_config.load();
+        let mut observations = Vec::new();
+        let mut to_probe = Vec::new();
+
+        for server_id in server_ids {
+            if skip_server_ids.contains(server_id) {
+                observations.push(empty_observation(server_id));
+                continue;
+            }
+            match (config.get_server(server_id), config.servers.get(server_id)) {
+                (Some(server_impl), Some(server_config)) => {
+                    to_probe.push((
+                        server_id.clone(),
+                        server_impl.clone(),
+                        server_config.clone(),
+                    ));
+                }
+                _ => observations.push(empty_observation(server_id)),
+            }
+        }
+
+        if to_probe.is_empty() {
+            return observations;
+        }
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(PROBE_CONCURRENCY));
+        let path = path.to_string();
+        let data_store = self.data_store.clone();
+        let probed = futures::future::join_all(to_probe.into_iter().map(
+            |(server_id, server_impl, server_config)| {
+                let semaphore = semaphore.clone();
+                let path = path.clone();
+                let data_store = data_store.clone();
+                async move {
+                    let _permit = semaphore.acquire().await.ok();
+                    let probe = server_impl
+                        .fetch_small_file(
+                            &server_config,
+                            &path,
+                            Some(&data_store),
+                            VERSION_FILE_MAX_BYTES,
+                        )
+                        .await;
+                    let (hash, content) = match probe.body {
+                        Some(body) => {
+                            let hash = hash_content(&body);
+                            (Some(hash), Some(body))
+                        }
+                        None => (None, None),
+                    };
+                    VersionFileObservation {
+                        server_id,
+                        hash,
+                        content,
+                        file_size: probe.file_size,
+                        observed_cert_hash: probe.observed_cert_hash,
+                    }
+                }
+            },
+        ))
+        .await;
+        observations.extend(probed);
+        observations
     }
 
     async fn store_view(
@@ -324,5 +367,15 @@ impl VersionFileService {
                 resource_id, path, e
             );
         }
+    }
+}
+
+fn empty_observation(server_id: &str) -> VersionFileObservation {
+    VersionFileObservation {
+        server_id: server_id.to_string(),
+        hash: None,
+        content: None,
+        file_size: None,
+        observed_cert_hash: None,
     }
 }

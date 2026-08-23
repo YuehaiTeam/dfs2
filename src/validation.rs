@@ -1,8 +1,10 @@
 use crate::{
     config::{AppConfig, SharedConfig},
     error::DfsResult,
-    modules::{qjs::JsRunner, storage::data_store::DataStore},
+    modules::{qjs::JsRunner, storage::data_store::DataStore, version_file::PROBE_CONCURRENCY},
 };
+use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::info;
 
 /// 验证报告结构
@@ -152,7 +154,7 @@ impl ConfigValidator {
         Self::validate_plugins_syntax(config, data_store, &mut report).await;
 
         // 3. 验证服务器连接性
-        Self::validate_server_connectivity(config, data_store, &mut report).await;
+        let ping_failed = Self::validate_server_connectivity(config, data_store, &mut report).await;
 
         // 4. 验证Redis连接
         Self::validate_redis_connection(data_store, &mut report).await;
@@ -161,7 +163,7 @@ impl ConfigValidator {
         Self::validate_version_providers(config, data_store, &mut report).await;
 
         // 6. 验证版本文件跨节点一致性（配置了 version_files 时）
-        Self::validate_version_files(config, data_store, &mut report).await;
+        Self::validate_version_files(config, data_store, &mut report, &ping_failed).await;
 
         // 7. 验证环境变量配置
         Self::validate_environment_variables(&mut report).await;
@@ -234,9 +236,7 @@ impl ConfigValidator {
 
             for version_file in &resource.version_files {
                 if version_file.trim().is_empty() {
-                    report.add_error(format!(
-                        "资源 '{resource_id}' 的 version_files 包含空路径"
-                    ));
+                    report.add_error(format!("资源 '{resource_id}' 的 version_files 包含空路径"));
                     report.config_valid = false;
                 }
                 if version_file.contains("..") {
@@ -416,37 +416,33 @@ impl ConfigValidator {
         config: &AppConfig,
         _data_store: &DataStore,
         report: &mut ValidationReport,
-    ) {
+    ) -> HashSet<String> {
         info!("验证服务器连接性...");
 
-        let mut valid_servers = 0;
-        let mut tested_servers = 0;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(PROBE_CONCURRENCY));
+        let mut tasks = Vec::new();
+        let mut ping_failed = HashSet::new();
 
         for (server_id, server_config) in &config.servers {
             // 检查是否配置了健康检查路径
             if let Some(health_check_path) = &server_config.health_check_path {
-                info!(
-                    "测试服务器连接: {} (路径: {})",
-                    server_id, health_check_path
-                );
-                tested_servers += 1;
-
-                // 获取服务器实现
                 if let Some(server_impl) = config.get_server(server_id) {
-                    // 使用配置的健康检查路径来测试连接性，不缓存结果
-                    let is_alive = server_impl
-                        .is_alive(server_id, server_config, health_check_path, None)
-                        .await;
-
-                    if is_alive {
-                        valid_servers += 1;
-                        info!("服务器 '{}' 连接正常", server_id);
-                    } else {
-                        // 服务器连接失败只是警告，不影响配置验证结果
-                        report.add_warning(format!(
-                            "服务器 '{server_id}' 连接失败或不可用 (测试路径: {health_check_path})"
-                        ));
-                    }
+                    let server_id = server_id.clone();
+                    let server_config = server_config.clone();
+                    let server_impl = server_impl.clone();
+                    let health_check_path = health_check_path.clone();
+                    let semaphore = semaphore.clone();
+                    tasks.push(async move {
+                        let _permit = semaphore.acquire().await.ok();
+                        info!(
+                            "测试服务器连接: {} (路径: {})",
+                            server_id, health_check_path
+                        );
+                        let is_alive = server_impl
+                            .is_alive(&server_id, &server_config, &health_check_path, None)
+                            .await;
+                        (server_id, health_check_path, is_alive)
+                    });
                 } else {
                     // 服务器配置错误是致命问题
                     report.add_error(format!("服务器 '{server_id}' 配置错误，无法创建服务器实现"));
@@ -457,6 +453,23 @@ impl ConfigValidator {
                     "跳过服务器 '{}' 的连接性测试（未配置健康检查路径）",
                     server_id
                 );
+            }
+        }
+
+        let results = futures::future::join_all(tasks).await;
+        let tested_servers = results.len();
+        let mut valid_servers = 0;
+
+        for (server_id, health_check_path, is_alive) in results {
+            if is_alive {
+                valid_servers += 1;
+                info!("服务器 '{}' 连接正常", server_id);
+            } else {
+                ping_failed.insert(server_id.clone());
+                // 服务器连接失败只是警告，不影响配置验证结果
+                report.add_warning(format!(
+                    "服务器 '{server_id}' 连接失败或不可用 (测试路径: {health_check_path})"
+                ));
             }
         }
 
@@ -475,6 +488,8 @@ impl ConfigValidator {
             report
                 .add_warning("所有配置了健康检查的服务器当前都不可用，请检查网络连接".to_string());
         }
+
+        ping_failed
     }
 
     /// 验证Redis连接
@@ -641,6 +656,7 @@ impl ConfigValidator {
         config: &AppConfig,
         data_store: &DataStore,
         report: &mut ValidationReport,
+        ping_failed: &HashSet<String>,
     ) {
         let has_version_files = config
             .resources
@@ -663,13 +679,12 @@ impl ConfigValidator {
                 shared_config.clone(),
             ),
         );
-        let version_updater = std::sync::Arc::new(
-            crate::modules::version_provider::VersionUpdater::new(
+        let version_updater =
+            std::sync::Arc::new(crate::modules::version_provider::VersionUpdater::new(
                 shared_config.clone(),
                 version_cache.clone(),
                 plugin_provider,
-            ),
-        );
+            ));
         let resource_service = crate::services::ResourceService::new(
             shared_config.clone(),
             version_cache,
@@ -681,12 +696,15 @@ impl ConfigValidator {
             resource_service,
         );
 
-        match version_file_service.census_all(true).await {
-            Ok(errors) => {
-                if errors.is_empty() {
+        match version_file_service.census_all(true, ping_failed).await {
+            Ok(census) => {
+                for warning in census.warnings {
+                    report.add_warning(warning);
+                }
+                if census.errors.is_empty() {
                     info!("版本文件一致性检查通过");
                 } else {
-                    for error in errors {
+                    for error in census.errors {
                         report.add_error(error);
                     }
                     report.version_files_valid = false;
