@@ -162,9 +162,20 @@ impl FlowService {
             true
         };
 
+        // `break` / `continue` 命令的效果。None 表示本项没给出显式处置。
+        let mut explicit_control: Option<bool> = None;
+
         if should_exec {
             for operation in &item.r#use {
                 match operation {
+                    FlowUse::Break => {
+                        explicit_control = Some(true);
+                        break;
+                    }
+                    FlowUse::Continue => {
+                        explicit_control = Some(false);
+                        break;
+                    }
                     FlowUse::Clear => pool.clear(),
                     FlowUse::Server { id, weight } => {
                         if penalties.banned.iter().any(|server_id| server_id == id) {
@@ -307,7 +318,10 @@ impl FlowService {
             }
         }
 
-        Ok(item.r#break)
+        // 旧的 `break: true` 字段等价于在 `use` 末尾放一条 `break` 命令，因此同样只在规则命中时
+        // 生效。此前它写在规则判定之外，规则不命中时也会截断整条 flow——后续各层被静默跳过，
+        // 表现为节点池比配置写的少。
+        Ok(explicit_control.unwrap_or(should_exec && item.r#break))
     }
 
     /// 从pool中选择服务器并生成URL（不涉及CDN记录）
@@ -2417,6 +2431,207 @@ mod tests {
         assert_eq!(pool[0].0, "unknown_server");
 
         println!("✅ Unknown server not filtered by h3_only gate");
+    }
+
+    /// 一个规则不命中的项不该截断整条 flow。旧的 `break` 字段写在规则判定之外，
+    /// 结果是"这层不适用于你"变成了"到此为止"，后续各层被静默跳过。
+    #[tokio::test]
+    async fn break_field_only_applies_when_the_rules_match() {
+        let service = create_test_flow_service().await;
+        let (target, mut context, options) = create_test_context();
+        context.client_ip = Some("8.8.8.8".parse().unwrap());
+
+        // 无 IPDB 时 cnip true 恒为假，因此这一项的规则不命中
+        let unmatched_breaking_item = FlowItem {
+            rules: vec![FlowCond::CnIp(true)],
+            mode: FlowMode::AND,
+            r#use: vec![FlowUse::Server {
+                id: "cn_only".to_string(),
+                weight: 10,
+            }],
+            r#break: true,
+        };
+        let fallback_item = FlowItem {
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec![FlowUse::Server {
+                id: "test_server_1".to_string(),
+                weight: 5,
+            }],
+            r#break: false,
+        };
+
+        let mut pool = Vec::new();
+        let mut plugin_server_mapping = HashMap::new();
+        let mut selected_server_id = None;
+        let mut selected_server_weight = None;
+
+        let should_break = service
+            .execute_flow_item(
+                &mut pool,
+                &unmatched_breaking_item,
+                &target,
+                &context,
+                &options,
+                None,
+                &mut plugin_server_mapping,
+                &FlowPenalties::default(),
+                &mut selected_server_id,
+                &mut selected_server_weight,
+            )
+            .await
+            .expect("flow item executes");
+
+        assert!(
+            !should_break,
+            "an item whose rules did not match must not cut the flow short"
+        );
+        assert!(pool.is_empty(), "unmatched item contributes no servers");
+
+        // 规则命中时 break 字段照常生效
+        let matched_breaking_item = FlowItem {
+            rules: vec![FlowCond::CnIp(false)],
+            ..unmatched_breaking_item.clone()
+        };
+        let should_break = service
+            .execute_flow_item(
+                &mut pool,
+                &matched_breaking_item,
+                &target,
+                &context,
+                &options,
+                None,
+                &mut plugin_server_mapping,
+                &FlowPenalties::default(),
+                &mut selected_server_id,
+                &mut selected_server_weight,
+            )
+            .await
+            .expect("flow item executes");
+        assert!(
+            should_break,
+            "a matched item with break: true cuts the flow"
+        );
+
+        // 后续项在未被截断时仍然贡献节点
+        let mut pool = Vec::new();
+        let should_break = service
+            .execute_flow_item(
+                &mut pool,
+                &fallback_item,
+                &target,
+                &context,
+                &options,
+                None,
+                &mut plugin_server_mapping,
+                &FlowPenalties::default(),
+                &mut selected_server_id,
+                &mut selected_server_weight,
+            )
+            .await
+            .expect("flow item executes");
+        assert!(!should_break);
+        assert_eq!(pool, vec![("test_server_1".to_string(), 5)]);
+    }
+
+    /// `break` 与 `continue` 作为命令，位置决定它们截断到哪里。
+    #[tokio::test]
+    async fn break_and_continue_commands_stop_at_their_position() {
+        let service = create_test_flow_service().await;
+        let (target, context, options) = create_test_context();
+
+        let cases = [
+            (FlowUse::Break, true, "break"),
+            (FlowUse::Continue, false, "continue"),
+        ];
+
+        for (command, expected_break, name) in cases {
+            let item = FlowItem {
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![
+                    FlowUse::Server {
+                        id: "before".to_string(),
+                        weight: 3,
+                    },
+                    command,
+                    FlowUse::Server {
+                        id: "after".to_string(),
+                        weight: 4,
+                    },
+                ],
+                r#break: false,
+            };
+
+            let mut pool = Vec::new();
+            let mut plugin_server_mapping = HashMap::new();
+            let mut selected_server_id = None;
+            let mut selected_server_weight = None;
+
+            let should_break = service
+                .execute_flow_item(
+                    &mut pool,
+                    &item,
+                    &target,
+                    &context,
+                    &options,
+                    None,
+                    &mut plugin_server_mapping,
+                    &FlowPenalties::default(),
+                    &mut selected_server_id,
+                    &mut selected_server_weight,
+                )
+                .await
+                .expect("flow item executes");
+
+            assert_eq!(should_break, expected_break, "{name} controls the flow");
+            assert_eq!(
+                pool,
+                vec![("before".to_string(), 3)],
+                "commands after {name} in the same use list must not run"
+            );
+        }
+    }
+
+    /// 规则不命中时，`break` / `continue` 命令都不执行——它们在 `use` 里，与其它命令同权。
+    #[tokio::test]
+    async fn control_commands_do_not_run_when_rules_miss() {
+        let service = create_test_flow_service().await;
+        let (target, mut context, options) = create_test_context();
+        context.client_ip = Some("8.8.8.8".parse().unwrap());
+
+        let item = FlowItem {
+            rules: vec![FlowCond::CnIp(true)],
+            mode: FlowMode::AND,
+            r#use: vec![FlowUse::Break],
+            r#break: false,
+        };
+
+        let mut pool = Vec::new();
+        let mut plugin_server_mapping = HashMap::new();
+        let mut selected_server_id = None;
+        let mut selected_server_weight = None;
+
+        let should_break = service
+            .execute_flow_item(
+                &mut pool,
+                &item,
+                &target,
+                &context,
+                &options,
+                None,
+                &mut plugin_server_mapping,
+                &FlowPenalties::default(),
+                &mut selected_server_id,
+                &mut selected_server_weight,
+            )
+            .await
+            .expect("flow item executes");
+
+        assert!(
+            !should_break,
+            "a break command in an unmatched item is inert"
+        );
     }
 
     #[tokio::test]

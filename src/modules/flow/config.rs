@@ -20,11 +20,21 @@ pub enum FlowUse {
     // clear
     Clear,
     // server id server id weight
-    Server { id: String, weight: u32 },
+    Server {
+        id: String,
+        weight: u32,
+    },
     // plugin id plugin id indirect
-    Plugin { id: String, indirect: String },
+    Plugin {
+        id: String,
+        indirect: String,
+    },
     // poolize
     Poolize,
+    /// 停止执行后续 flow 项。本项 `use` 中它之后的命令也不再执行。
+    Break,
+    /// 结束本项的 `use`，继续执行后续 flow 项。
+    Continue,
 }
 impl<'de> Deserialize<'de> for FlowUse {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -37,6 +47,10 @@ impl<'de> Deserialize<'de> for FlowUse {
             Ok(FlowUse::Clear)
         } else if s == "poolize" {
             Ok(FlowUse::Poolize)
+        } else if s == "break" {
+            Ok(FlowUse::Break)
+        } else if s == "continue" {
+            Ok(FlowUse::Continue)
         } else if s.starts_with("server ") {
             // server id server id weight
             // eg. server example 2
@@ -79,6 +93,8 @@ impl Serialize for FlowUse {
         match self {
             FlowUse::Clear => serializer.serialize_str("clear"),
             FlowUse::Poolize => serializer.serialize_str("poolize"),
+            FlowUse::Break => serializer.serialize_str("break"),
+            FlowUse::Continue => serializer.serialize_str("continue"),
             FlowUse::Server { id, weight } => {
                 if *weight > 0 {
                     serializer.serialize_str(&format!("server {id}[{weight}]"))
@@ -399,6 +415,17 @@ mod tests {
         let use_server: FlowUse = serde_yaml::from_str("server test_server 10").unwrap();
         assert!(
             matches!(use_server, FlowUse::Server { ref id, weight } if id == "test_server" && weight == 10)
+        );
+
+        let use_break: FlowUse = serde_yaml::from_str("break").unwrap();
+        assert!(matches!(use_break, FlowUse::Break));
+        assert_eq!(serde_yaml::to_string(&use_break).unwrap().trim(), "break");
+
+        let use_continue: FlowUse = serde_yaml::from_str("continue").unwrap();
+        assert!(matches!(use_continue, FlowUse::Continue));
+        assert_eq!(
+            serde_yaml::to_string(&use_continue).unwrap().trim(),
+            "continue"
         );
 
         let use_plugin: FlowUse = serde_yaml::from_str("plugin test_plugin some_data").unwrap();
