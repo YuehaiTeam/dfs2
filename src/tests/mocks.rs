@@ -94,6 +94,7 @@ impl TestEnvironment {
             shared_config.clone(),
             data_store.clone(),
             resource_service.clone(),
+            Some(metrics.clone()),
         );
         let app_context = AppContext::new(
             session_service.clone(),

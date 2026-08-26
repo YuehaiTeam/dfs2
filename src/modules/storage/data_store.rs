@@ -15,6 +15,9 @@ pub struct CacheMetadata {
     pub content_length: u64,          // 内容长度
     pub content_type: Option<String>, // MIME类型
     pub etag: String,                 // xxhash ETag
+    /// 供出这份字节的节点。旧缓存条目没有此字段，故 default
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub src: Option<String>,
 }
 
 impl CacheMetadata {
@@ -445,8 +448,17 @@ impl DataStoreBackend for FileDataStore {
     ) -> Result<(), String> {
         let key = format!("cdn_records:{sid}:{chunk}");
         let mut records: Vec<CdnRecord> = self.read_json_file(&key).await?.unwrap_or_default();
-        records.push(record);
-        self.write_json_file(&key, &records).await
+        records.push(record.clone());
+        self.write_json_file(&key, &records).await?;
+        if let Some(mut session) = self.get_session(sid).await? {
+            session
+                .cdn_records
+                .entry(chunk.to_string())
+                .or_default()
+                .push(record);
+            self.store_session(sid, &session).await?;
+        }
+        Ok(())
     }
 
     async fn get_cdn_records(&self, sid: &str, chunk: &str) -> Result<Vec<CdnRecord>, String> {
@@ -458,9 +470,11 @@ impl DataStoreBackend for FileDataStore {
         if let Some(session) = self.get_session(sid).await? {
             let download_counts = self.get_download_counts(sid).await?;
 
-            // 收集所有CDN记录
-            let mut cdn_records = HashMap::new();
+            let mut cdn_records = session.cdn_records;
             for chunk in &session.chunks {
+                if cdn_records.contains_key(chunk) {
+                    continue;
+                }
                 let records = self.get_cdn_records(sid, chunk).await?;
                 if !records.is_empty() {
                     cdn_records.insert(chunk.clone(), records);

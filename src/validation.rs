@@ -694,6 +694,7 @@ impl ConfigValidator {
             shared_config,
             data_store.clone(),
             resource_service,
+            None,
         );
 
         match version_file_service.census_all(true, ping_failed).await {

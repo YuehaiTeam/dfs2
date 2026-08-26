@@ -189,7 +189,10 @@ pub async fn post_batch_cdn(
                 if let Some(cdn_record) = chunk_result.cdn_record {
                     cdn_records_to_store.push(
                         crate::modules::storage::data_store::BatchCdnRecord {
-                            chunk_id: chunk_result.chunk_id.clone(),
+                            chunk_id: crate::services::SessionService::scoped_download_key(
+                                session.sub_path.as_deref(),
+                                &chunk_result.chunk_id,
+                            ),
                             record: cdn_record,
                         },
                     );
@@ -319,10 +322,9 @@ async fn process_chunk_with_preloaded_data(
     // 解析ranges
     let ranges = parse_and_validate_ranges(chunk_range)?;
 
-    // 退避按 sid 汇总，不按当前 range 切片
-    let penalty_servers = ctx
+    let penalties = ctx
         .session_service
-        .get_sticky_penalty_servers(session_id)
+        .get_schedule_penalties(session_id, Some(&scoped_chunk))
         .await?;
 
     // 执行flow（无Redis操作，纯计算）
@@ -353,7 +355,7 @@ async fn process_chunk_with_preloaded_data(
             &context,
             &options,
             &resource.flow,
-            penalty_servers,
+            penalties,
             Some(session),
         )
         .await?;

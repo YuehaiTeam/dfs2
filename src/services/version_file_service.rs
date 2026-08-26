@@ -1,16 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::config::SharedConfig;
+use crate::metrics::Metrics;
 use crate::modules::server::HealthInfo;
 use crate::modules::storage::cache::generate_etag;
 use crate::modules::storage::data_store::{CacheMetadata, DataStore};
 use crate::modules::version_file::{
     CensusReport, PROBE_CONCURRENCY, VERSION_FILE_MAX_BYTES, VersionFileDecision,
     VersionFileObservation, VersionFileView, apply_observations, evaluate_server, hash_content,
-    report_view, view_storage_key,
+    mismatched_servers, report_view, view_storage_key,
 };
 use crate::services::resource_service::{
     ResourceService, collect_resource_server_ids, version_file_path_for_resource,
@@ -24,6 +25,8 @@ pub struct VersionFileService {
     shared_config: SharedConfig,
     data_store: DataStore,
     resource_service: ResourceService,
+    /// CLI 校验路径没有 metrics registry，此时不上报
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl VersionFileService {
@@ -31,11 +34,13 @@ impl VersionFileService {
         shared_config: SharedConfig,
         data_store: DataStore,
         resource_service: ResourceService,
+        metrics: Option<Arc<Metrics>>,
     ) -> Self {
         Self {
             shared_config,
             data_store,
             resource_service,
+            metrics,
         }
     }
 
@@ -123,6 +128,10 @@ impl VersionFileService {
         let config = self.shared_config.load();
         let mut report = CensusReport::default();
 
+        if let Some(metrics) = &self.metrics {
+            metrics.reset_version_file_consistency();
+        }
+
         for (resource_id, resource) in &config.resources {
             if resource.version_files.is_empty() {
                 continue;
@@ -162,6 +171,9 @@ impl VersionFileService {
         let server_ids = collect_resource_server_ids(resource);
         let now = chrono::Utc::now().timestamp() as u64;
         let mut report = CensusReport::default();
+        let mut mismatch_counts: HashMap<String, u64> =
+            server_ids.iter().map(|id| (id.clone(), 0)).collect();
+        let mut no_majority_paths: u64 = 0;
 
         for version_file in &resource.version_files {
             let Some(path) = version_file_path_for_resource(resource, &version, None, version_file)
@@ -189,6 +201,14 @@ impl VersionFileService {
             self.update_server_health(&observations, &view, &path, now)
                 .await;
 
+            // split_since 只在当前不存在严格多数派时有值，宽限期内的分裂也算
+            if view.split_since.is_some() {
+                no_majority_paths += 1;
+            }
+            for server_id in mismatched_servers(&view) {
+                *mismatch_counts.entry(server_id).or_insert(0) += 1;
+            }
+
             report.extend(report_view(
                 resource_id,
                 version_file,
@@ -199,17 +219,21 @@ impl VersionFileService {
             if !view.failed {
                 if let Some(majority_hash) = &view.majority_hash {
                     if resource.cache_enabled {
-                        if let Some(content) = observations.iter().find_map(|obs| {
-                            (obs.hash.as_deref() == Some(majority_hash.as_str()))
-                                .then(|| obs.content.clone())
-                                .flatten()
-                        }) {
+                        if let Some((source_server, content)) =
+                            observations.iter().find_map(|obs| {
+                                (obs.hash.as_deref() == Some(majority_hash.as_str()))
+                                    .then(|| obs.content.clone())
+                                    .flatten()
+                                    .map(|content| (obs.server_id.as_str(), content))
+                            })
+                        {
                             self.write_majority_cache(
                                 resource_id,
                                 &version,
                                 &path,
                                 resource.cache_max_age,
                                 &content,
+                                source_server,
                             )
                             .await;
                         }
@@ -221,6 +245,13 @@ impl VersionFileService {
                 "Version-file census {} {}: majority={:?} failed={} responders={}",
                 resource_id, path, view.majority_hash, view.failed, view.responder_count
             );
+        }
+
+        if let Some(metrics) = &self.metrics {
+            for (server_id, files) in &mismatch_counts {
+                metrics.set_version_file_mismatch_files(server_id, resource_id, *files);
+            }
+            metrics.set_version_file_no_majority(resource_id, no_majority_paths);
         }
 
         Ok(report)
@@ -341,6 +372,7 @@ impl VersionFileService {
         path: &str,
         max_age: u32,
         content: &[u8],
+        source_server: &str,
     ) {
         let keys = self
             .data_store
@@ -356,6 +388,7 @@ impl VersionFileService {
             content_length: content.len() as u64,
             content_type,
             etag: generate_etag(content),
+            src: Some(source_server.to_string()),
         };
         if let Err(e) = self
             .data_store

@@ -1,13 +1,14 @@
 use crate::{
     container::MAX_CHUNK_DOWNLOADS,
     error::{DfsError, DfsResult},
-    models::{CdnRecord, Session},
+    models::{CdnRecord, FlowPenalties, Session},
     models::{FlowContext, FlowOptions, FlowResult, FlowTarget},
     modules::flow::FlowItem,
     modules::network::ClientCapabilities,
     modules::storage::data_store::DataStore,
     services::FlowService,
 };
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 #[derive(Clone)]
@@ -144,35 +145,41 @@ impl SessionService {
         Ok(())
     }
 
-    /// 获取需要惩罚的服务器列表
+    /// 当前 chunk 再要 URL 时，这些节点应被硬剔除。
     pub async fn get_penalty_servers(
         &self,
         session_id: &str,
         chunk_key: &str,
     ) -> DfsResult<Vec<String>> {
         match self.data_store.get_cdn_records(session_id, chunk_key).await {
-            Ok(previous_records) => Ok(penalty_servers_from_records(std::iter::once(
-                previous_records.as_slice(),
-            ))),
-            Err(_) => Ok(Vec::new()), // 没有历史记录，不进行惩罚
+            Ok(previous_records) => {
+                let mut records = HashMap::new();
+                records.insert(chunk_key.to_string(), previous_records);
+                Ok(schedule_penalties_from_records(&records, Some(chunk_key)).banned)
+            }
+            Err(_) => Ok(Vec::new()),
         }
     }
 
-    /// Free / 粘滞 sid：汇总该 sid 下所有文件、所有 range 的已调度节点。
-    /// 目录下载时，文件 1 连不上的节点在文件 2 上也会被回避。
-    pub async fn get_sticky_penalty_servers(&self, session_id: &str) -> DfsResult<Vec<String>> {
+    /// 按 sid 汇总：重试换掉的节点硬 ban，仅签过的降权。
+    pub async fn get_schedule_penalties(
+        &self,
+        session_id: &str,
+        current_chunk_key: Option<&str>,
+    ) -> DfsResult<FlowPenalties> {
         match self.data_store.get_session_stats(session_id).await {
-            Ok(Some(stats)) => Ok(penalty_servers_from_records(
-                stats.cdn_records.values().map(|v| v.as_slice()),
+            Ok(Some(stats)) => Ok(schedule_penalties_from_records(
+                &stats.cdn_records,
+                current_chunk_key,
             )),
-            Ok(None) => Ok(Vec::new()),
+            Ok(None) => Ok(FlowPenalties::default()),
             Err(e) => {
                 tracing::warn!(
-                    "Failed to load sticky penalty servers for {}: {}",
+                    "Failed to load schedule penalties for {}: {}",
                     session_id,
                     e
                 );
-                Ok(Vec::new())
+                Ok(FlowPenalties::default())
             }
         }
     }
@@ -233,14 +240,19 @@ impl SessionService {
     ) -> DfsResult<FlowResult> {
         // 1. 直接使用传入的session（无需重复获取）
 
-        // 2. 从ranges生成chunk_key（用于CDN记录）
-        let chunk_key = self.generate_chunk_key_from_ranges(&requested_ranges);
+        // 2. 从ranges生成chunk_key（用于CDN记录；前缀资源按文件隔离）
+        let chunk_key = Self::scoped_download_key(
+            session.sub_path.as_deref(),
+            &self.generate_chunk_key_from_ranges(&requested_ranges),
+        );
 
         // 3. 验证ranges是否在session.chunks中
         self.validate_ranges_against_session(&requested_ranges, &session.chunks)?;
 
-        // 4. 退避按 sid 汇总，目录里上一个文件踩过的节点这次也会被回避
-        let penalty_servers = self.get_sticky_penalty_servers(session_id).await?;
+        // 4. 重试才 ban；仅签过的节点降权摊开
+        let penalties = self
+            .get_schedule_penalties(session_id, Some(&chunk_key))
+            .await?;
 
         // 5. 构建Flow参数
         let target = FlowTarget {
@@ -269,7 +281,7 @@ impl SessionService {
                 &context,
                 options,
                 flow_items,
-                penalty_servers,
+                penalties,
                 Some(session),
             )
             .await?;
@@ -303,21 +315,25 @@ impl SessionService {
         options: &FlowOptions,
         flow_items: &[FlowItem],
     ) -> DfsResult<FlowResult> {
-        let penalty_servers = self.get_sticky_penalty_servers(session_id).await?;
+        let chunk_key = Self::scoped_download_key(
+            target.sub_path.as_deref(),
+            &self.generate_chunk_key_from_ranges(target.ranges.as_deref().unwrap_or(&[])),
+        );
+        let penalties = self
+            .get_schedule_penalties(session_id, Some(&chunk_key))
+            .await?;
         let flow_result = flow_service
             .execute_flow(
                 target,
                 context,
                 options,
                 flow_items,
-                penalty_servers,
+                penalties,
                 Some(session),
             )
             .await?;
 
         if !flow_result.url.is_empty() {
-            let chunk_key =
-                self.generate_chunk_key_from_ranges(target.ranges.as_deref().unwrap_or(&[]));
             let cdn_record = CdnRecord {
                 url: flow_result.url.clone(),
                 server_id: flow_result.selected_server_id.clone(),
@@ -334,24 +350,58 @@ impl SessionService {
     }
 }
 
-fn penalty_servers_from_records<'a, I>(record_sets: I) -> Vec<String>
-where
-    I: IntoIterator<Item = &'a [CdnRecord]>,
-{
+fn push_unique(servers: &mut Vec<String>, server_id: String) {
+    if !servers.contains(&server_id) {
+        servers.push(server_id);
+    }
+}
+
+fn record_server_ids(records: &[CdnRecord]) -> Vec<String> {
     let mut servers = Vec::new();
-    for records in record_sets {
-        for record in records {
-            if record.skip_penalty {
-                continue;
-            }
-            if let Some(server_id) = &record.server_id {
-                if !servers.contains(server_id) {
-                    servers.push(server_id.clone());
-                }
-            }
+    for record in records {
+        if record.skip_penalty {
+            continue;
+        }
+        if let Some(server_id) = &record.server_id {
+            servers.push(server_id.clone());
         }
     }
     servers
+}
+
+/// 重试才进 banned；其它 chunk 上只签过一次的进 demoted。
+fn schedule_penalties_from_records(
+    records_by_chunk: &HashMap<String, Vec<CdnRecord>>,
+    current_chunk_key: Option<&str>,
+) -> FlowPenalties {
+    let mut banned = Vec::new();
+    let mut demoted = Vec::new();
+
+    for (chunk_key, records) in records_by_chunk {
+        let servers = record_server_ids(records);
+        if servers.is_empty() {
+            continue;
+        }
+
+        if current_chunk_key == Some(chunk_key.as_str()) {
+            for server_id in servers {
+                push_unique(&mut banned, server_id);
+            }
+            continue;
+        }
+
+        if servers.len() >= 2 {
+            for server_id in &servers[..servers.len() - 1] {
+                push_unique(&mut banned, server_id.clone());
+            }
+            push_unique(&mut demoted, servers[servers.len() - 1].clone());
+        } else {
+            push_unique(&mut demoted, servers[0].clone());
+        }
+    }
+
+    demoted.retain(|server_id| !banned.contains(server_id));
+    FlowPenalties { banned, demoted }
 }
 
 pub fn generate_session_id() -> String {
@@ -716,10 +766,97 @@ mod tests {
             "per-chunk lookup should not see file1's server"
         );
 
-        let sticky = service
-            .get_sticky_penalty_servers(session_id)
+        let other_file = service
+            .get_schedule_penalties(session_id, Some("file2:0-"))
             .await
             .unwrap();
-        assert_eq!(sticky, vec!["server_a".to_string()]);
+        assert!(
+            other_file.banned.is_empty(),
+            "first assignment on another file is not a retry"
+        );
+        assert_eq!(other_file.demoted, vec!["server_a".to_string()]);
+
+        let current_retry = service
+            .get_schedule_penalties(session_id, Some("file1:0-"))
+            .await
+            .unwrap();
+        assert_eq!(current_retry.banned, vec!["server_a".to_string()]);
+        assert!(current_retry.demoted.is_empty());
+    }
+
+    fn test_record(server_id: &str, skip_penalty: bool) -> CdnRecord {
+        CdnRecord {
+            url: format!("https://{server_id}.example.com/file"),
+            server_id: Some(server_id.to_string()),
+            skip_penalty,
+            timestamp: 1,
+            weight: 8,
+            size: Some(100),
+        }
+    }
+
+    #[test]
+    fn first_assignments_are_demoted_not_banned() {
+        let mut records = HashMap::new();
+        for i in 0..23 {
+            records.insert(
+                format!("{i}-{i}"),
+                vec![test_record(&format!("srv{i}"), false)],
+            );
+        }
+
+        let penalties = schedule_penalties_from_records(&records, Some("new-range"));
+        assert!(
+            penalties.banned.is_empty(),
+            "concurrent first hits must not empty the pool"
+        );
+        assert_eq!(penalties.demoted.len(), 23);
+    }
+
+    #[test]
+    fn retry_of_current_chunk_bans_previous_servers() {
+        let mut records = HashMap::new();
+        records.insert("0-100".to_string(), vec![test_record("telecom", false)]);
+
+        let penalties = schedule_penalties_from_records(&records, Some("0-100"));
+        assert_eq!(penalties.banned, vec!["telecom".to_string()]);
+        assert!(penalties.demoted.is_empty());
+    }
+
+    #[test]
+    fn other_chunk_retry_bans_superseded_and_demotes_current() {
+        let mut records = HashMap::new();
+        records.insert(
+            "0-100".to_string(),
+            vec![test_record("A", false), test_record("B", false)],
+        );
+
+        let penalties = schedule_penalties_from_records(&records, Some("200-300"));
+        assert_eq!(penalties.banned, vec!["A".to_string()]);
+        assert_eq!(penalties.demoted, vec!["B".to_string()]);
+    }
+
+    #[test]
+    fn skip_penalty_records_are_ignored() {
+        let mut records = HashMap::new();
+        records.insert("0-100".to_string(), vec![test_record("skip", true)]);
+
+        let penalties = schedule_penalties_from_records(&records, Some("0-100"));
+        assert!(penalties.banned.is_empty());
+        assert!(penalties.demoted.is_empty());
+    }
+
+    #[test]
+    fn banned_wins_over_demoted() {
+        let mut records = HashMap::new();
+        records.insert(
+            "0-100".to_string(),
+            vec![test_record("shared", false), test_record("other", false)],
+        );
+        records.insert("200-300".to_string(), vec![test_record("shared", false)]);
+
+        let penalties = schedule_penalties_from_records(&records, Some("400-500"));
+        assert_eq!(penalties.banned, vec!["shared".to_string()]);
+        assert_eq!(penalties.demoted, vec!["other".to_string()]);
     }
 }

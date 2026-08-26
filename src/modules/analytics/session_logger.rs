@@ -154,30 +154,46 @@ impl SessionLogger {
     }
 
     /// 记录缓存命中的下载
+    ///
+    /// 命中不经过 CDN，但仍合成一条 CDN 记录，把字节归到当初供出这份缓存的节点上，
+    /// 否则缓存流量在按 `srv` 聚合的分析里会整体消失。`mode` 固定为 `cache`，便于剔除。
     pub async fn log_cached_download(
         &self,
         resource_id: &str,
         version: &str,
         client_ip: IpAddr,
         user_agent: Option<String>,
-        _file_size: u64,
-        _cache_max_age: u32,
-        _etag: &str,
+        session_id: Option<String>,
+        file_size: u64,
+        source_server: Option<&str>,
     ) -> Result<(), String> {
         let now = Utc::now();
 
-        // 缓存命中不记录CDN记录，创建空的chunk信息
+        let cdn_record = CdnRecordLog {
+            url: format!("cache://{resource_id}/{version}"),
+            srv: source_server.map(|id| id.to_string()),
+            wgt: None,
+            ts: now.timestamp() as u64,
+            pen: Some(false),
+            rsn: Some("cache_hit".to_string()),
+            ttfb: None,
+            time: None,
+            size: u32::try_from(file_size).ok(),
+            err: None,
+            mode: Some("cache".to_string()),
+        };
+
         let chunk = ChunkLog {
             rng: "full_file".to_string(),
-            att: 0,       // 缓存命中无需下载尝试
-            cdns: vec![], // 缓存命中不记录CDN记录
+            att: 1,
+            cdns: vec![cdn_record],
         };
 
         let session_log = SessionLog {
             start: now.timestamp() as u64, // cached download没有真正的session创建时间
             end: now.timestamp() as u64,
             log_type: "cached_download".to_string(),
-            sid: None,
+            sid: session_id,
             rid: resource_id.to_string(),
             ver: version.to_string(),
             ua: user_agent,
@@ -429,11 +445,19 @@ impl SessionLogger {
 
     /// 检查客户端range是否与chunk_id完全匹配
     fn ranges_match(client_ranges: &[(u32, u32)], chunk_id: &str) -> bool {
-        // 将客户端ranges转换为标准化的字符串格式
-        let client_range_str = Self::ranges_to_string(client_ranges);
-
-        // 直接比较字符串
-        client_range_str == chunk_id
+        if Self::ranges_to_string(client_ranges) == chunk_id {
+            return true;
+        }
+        // hashed 整文件：服务器是 `0-`，安装器上报 `(0, u32::MAX)`
+        if let Some(start_str) = chunk_id.strip_suffix('-')
+            && !start_str.is_empty()
+            && !start_str.contains('-')
+            && !chunk_id.contains(',')
+            && let Ok(start) = start_str.parse::<u32>()
+        {
+            return client_ranges.len() == 1 && client_ranges[0].0 == start;
+        }
+        false
     }
 
     /// 将range列表转换为标准字符串格式
@@ -458,5 +482,24 @@ impl SessionLogger {
                 .collect::<Vec<_>>()
                 .join(",")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionLogger;
+
+    #[test]
+    fn closed_range_matches_exact_chunk() {
+        assert!(SessionLogger::ranges_match(&[(100, 200)], "100-200"));
+        assert!(!SessionLogger::ranges_match(&[(100, 200)], "0-"));
+    }
+
+    #[test]
+    fn open_chunk_matches_same_start() {
+        assert!(SessionLogger::ranges_match(&[(0, u32::MAX)], "0-"));
+        assert!(SessionLogger::ranges_match(&[(0, 10)], "0-"));
+        assert!(!SessionLogger::ranges_match(&[(1, u32::MAX)], "0-"));
+        assert!(!SessionLogger::ranges_match(&[(0, 10), (11, 20)], "0-"));
     }
 }

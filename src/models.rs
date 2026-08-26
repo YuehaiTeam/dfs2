@@ -154,6 +154,15 @@ pub struct FlowResult {
     pub plugin_server_mapping: HashMap<String, (Option<String>, bool)>, // 插件元数据映射
 }
 
+/// 调度惩罚：重试才硬剔除，仅签过则降权摊开。
+#[derive(Debug, Clone, Default)]
+pub struct FlowPenalties {
+    /// 该客户端已经拿过这些节点后又要新 URL，加池时跳过。
+    pub banned: Vec<String>,
+    /// 这个 sid 已经签过、尚未被换掉。仍进池，权重 / 2（下限 1）。
+    pub demoted: Vec<String>,
+}
+
 /// 批量chunk请求结构
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BatchChunkRequest {

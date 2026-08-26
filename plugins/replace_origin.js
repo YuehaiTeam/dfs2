@@ -1,6 +1,7 @@
 /**
  * DFS2 Plugin Demo: replace_origin
  * @description This plugin replaces [source] with [target] in all urls in the pool.
+ * @usage plugin replace_origin <source> <target>
  * @param {[string, number][]} pool [url, weight][]
  * @param {string} indirect 'from to'
  * @param {never} options

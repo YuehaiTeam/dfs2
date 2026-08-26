@@ -30,8 +30,59 @@ pub enum DownloadResponse {
     Cached {
         content: Vec<u8>,
         metadata: CacheMetadata,
+        status: CacheStatus,
     },
     Redirect(String),
+}
+
+/// 本次响应的字节是取自缓存层，还是刚从源节点拉取并顺手回填
+#[derive(Debug, Clone, Copy)]
+pub enum CacheStatus {
+    Hit,
+    Miss,
+}
+
+impl CacheStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            CacheStatus::Hit => "hit",
+            CacheStatus::Miss => "miss",
+        }
+    }
+}
+
+/// 为缓存响应装配头部，缺少来源信息时省略 `x-dfs-cache-from`
+fn cached_response_headers(metadata: &CacheMetadata, status: CacheStatus) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    let remaining_max_age = metadata.remaining_max_age();
+
+    if let Ok(value) = format!("public, max-age={remaining_max_age}").parse() {
+        headers.insert("cache-control", value);
+    }
+    if let Ok(value) = metadata.etag.parse() {
+        headers.insert("etag", value);
+    }
+    if let Ok(value) = status.as_str().parse() {
+        headers.insert("x-dfs-cache-status", value);
+    }
+    if let Some(src) = metadata.src.as_deref()
+        && let Ok(value) = src.parse()
+    {
+        headers.insert("x-dfs-cache-from", value);
+    }
+    if let Ok(value) = metadata.content_length.to_string().parse() {
+        headers.insert("content-length", value);
+    }
+
+    let content_type = metadata
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    if let Ok(value) = content_type.parse() {
+        headers.insert("content-type", value);
+    }
+
+    headers
 }
 
 // 统一下载逻辑函数 - 合并原有的handle_download_request和handle_prefix_download_request
@@ -214,32 +265,30 @@ pub async fn handle_download_request_unified(
                 .get_full_cached_content(&resid, &version, &path)
                 .await
             {
-                // 缓存命中！记录缓存命中日志
-                if matches!(resource_config.download, DownloadPolicy::Free) {
-                    if let Some(ip) = client_ip {
-                        let session_logger = crate::modules::analytics::SessionLogger::new(
-                            ctx.shared_config.clone(),
-                            ctx.data_store.clone(),
-                        );
-                        let log_result = session_logger
-                            .log_cached_download(
-                                &resid,
-                                &version,
-                                ip,
-                                user_agent.clone(),
-                                metadata.content_length,
-                                metadata.max_age,
-                                &metadata.etag,
-                            )
-                            .await;
-                        if let Err(e) = log_result {
-                            let log_type = if sub_path.is_some() {
-                                "cached prefix download"
-                            } else {
-                                "cached download"
-                            };
-                            error!("Failed to log {}: {}", log_type, e);
-                        }
+                // 缓存命中！所有下载策略都记日志，否则 enabled 资源的命中会完全没有痕迹
+                if let Some(ip) = client_ip {
+                    let session_logger = crate::modules::analytics::SessionLogger::new(
+                        ctx.shared_config.clone(),
+                        ctx.data_store.clone(),
+                    );
+                    let log_result = session_logger
+                        .log_cached_download(
+                            &resid,
+                            &version,
+                            ip,
+                            user_agent.clone(),
+                            original_session_id.clone(),
+                            metadata.content_length,
+                            metadata.src.as_deref(),
+                        )
+                        .await;
+                    if let Err(e) = log_result {
+                        let log_type = if sub_path.is_some() {
+                            "cached prefix download"
+                        } else {
+                            "cached download"
+                        };
+                        error!("Failed to log {}: {}", log_type, e);
                     }
                 }
 
@@ -279,7 +328,11 @@ pub async fn handle_download_request_unified(
                 };
                 debug!("{}", cache_debug_msg);
 
-                return Ok(DownloadResponse::Cached { content, metadata });
+                return Ok(DownloadResponse::Cached {
+                    content,
+                    metadata,
+                    status: CacheStatus::Hit,
+                });
             }
         }
     }
@@ -452,8 +505,8 @@ pub async fn handle_download_request_unified(
                 &context,
                 &options,
                 flow_list,
-                vec![], // penalty_servers for direct download
-                None,   // no session in free mode
+                crate::models::FlowPenalties::default(),
+                None, // no session in free mode
             )
             .await
             .map_err(|e| {
@@ -485,16 +538,17 @@ pub async fn handle_download_request_unified(
     );
 
     // 检查是否应该缓存
+    let cache_source_server = flow_result
+        .selected_server_id
+        .as_deref()
+        .unwrap_or("unknown");
     let cached_result = if !is_version_file
         && let Some((file_size, max_age)) = should_cache_content(
             &config_guard,
             &ctx.data_store,
             &resid,
             sub_path.as_deref(), // 传入子路径用于模式匹配
-            flow_result
-                .selected_server_id
-                .as_deref()
-                .unwrap_or("unknown"),
+            cache_source_server,
             &path,
         )
         .await
@@ -507,9 +561,17 @@ pub async fn handle_download_request_unified(
                 "File size {} within 256KB cache limit, attempting to cache",
                 file_size
             );
-            download_and_cache(&cdn_url, &resid, &version, &path, &ctx.data_store, max_age)
-                .await
-                .ok()
+            download_and_cache(
+                &cdn_url,
+                &resid,
+                &version,
+                &path,
+                &ctx.data_store,
+                max_age,
+                cache_source_server,
+            )
+            .await
+            .ok()
         } else {
             println!(
                 "File size {} exceeds 256KB cache limit, skipping cache",
@@ -651,9 +713,13 @@ pub async fn handle_download_request_unified(
         }
     }
 
-    // 如果有缓存结果，返回缓存内容
+    // 刚回填的内容直接回给客户端，对本次请求而言并不是命中
     if let Some((metadata, content)) = cached_result {
-        return Ok(DownloadResponse::Cached { content, metadata });
+        return Ok(DownloadResponse::Cached {
+            content,
+            metadata,
+            status: CacheStatus::Miss,
+        });
     }
 
     Ok(DownloadResponse::Redirect(cdn_url))
@@ -712,29 +778,12 @@ pub async fn download_redirect(
     )
     .await
     {
-        Ok(DownloadResponse::Cached { content, metadata }) => {
-            let remaining_max_age = metadata.remaining_max_age();
-
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "cache-control",
-                format!("public, max-age={remaining_max_age}")
-                    .parse()
-                    .unwrap(),
-            );
-            headers.insert("etag", metadata.etag.parse().unwrap());
-            headers.insert("x-cache", "HIT".parse().unwrap());
-            headers.insert(
-                "content-length",
-                metadata.content_length.to_string().parse().unwrap(),
-            );
-
-            if let Some(ct) = metadata.content_type {
-                headers.insert("content-type", ct.parse().unwrap());
-            } else {
-                headers.insert("content-type", "application/octet-stream".parse().unwrap());
-            }
-
+        Ok(DownloadResponse::Cached {
+            content,
+            metadata,
+            status,
+        }) => {
+            let headers = cached_response_headers(&metadata, status);
             Ok(crate::responses::ApiResponse::raw(content, headers))
         }
         Ok(DownloadResponse::Redirect(download_url)) => {
@@ -925,29 +974,12 @@ pub async fn download_prefix_redirect(
     )
     .await
     {
-        Ok(DownloadResponse::Cached { content, metadata }) => {
-            let remaining_max_age = metadata.remaining_max_age();
-
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                "cache-control",
-                format!("public, max-age={remaining_max_age}")
-                    .parse()
-                    .unwrap(),
-            );
-            headers.insert("etag", metadata.etag.parse().unwrap());
-            headers.insert("x-cache", "HIT".parse().unwrap());
-            headers.insert(
-                "content-length",
-                metadata.content_length.to_string().parse().unwrap(),
-            );
-
-            if let Some(ct) = metadata.content_type {
-                headers.insert("content-type", ct.parse().unwrap());
-            } else {
-                headers.insert("content-type", "application/octet-stream".parse().unwrap());
-            }
-
+        Ok(DownloadResponse::Cached {
+            content,
+            metadata,
+            status,
+        }) => {
+            let headers = cached_response_headers(&metadata, status);
             Ok(crate::responses::ApiResponse::raw(content, headers))
         }
         Ok(DownloadResponse::Redirect(download_url)) => {
@@ -1090,6 +1122,39 @@ mod tests {
     use super::*;
     use crate::tests::common::*;
 
+    fn cache_metadata(src: Option<&str>) -> CacheMetadata {
+        CacheMetadata {
+            cached_at: 1_000,
+            max_age: 300,
+            content_length: 42,
+            content_type: Some("application/json".to_string()),
+            etag: "\"deadbeef\"".to_string(),
+            src: src.map(|id| id.to_string()),
+        }
+    }
+
+    #[test]
+    fn cache_hit_exposes_source_node() {
+        let headers = cached_response_headers(&cache_metadata(Some("iroha")), CacheStatus::Hit);
+        assert_eq!(headers.get("x-dfs-cache-status").unwrap(), "hit");
+        assert_eq!(headers.get("x-dfs-cache-from").unwrap(), "iroha");
+        assert!(headers.get("x-cache").is_none());
+    }
+
+    #[test]
+    fn freshly_filled_cache_reports_miss() {
+        let headers = cached_response_headers(&cache_metadata(Some("muk")), CacheStatus::Miss);
+        assert_eq!(headers.get("x-dfs-cache-status").unwrap(), "miss");
+        assert_eq!(headers.get("x-dfs-cache-from").unwrap(), "muk");
+    }
+
+    #[test]
+    fn entry_without_source_omits_from_header() {
+        let headers = cached_response_headers(&cache_metadata(None), CacheStatus::Hit);
+        assert_eq!(headers.get("x-dfs-cache-status").unwrap(), "hit");
+        assert!(headers.get("x-dfs-cache-from").is_none());
+    }
+
     #[tokio::test]
     async fn test_free_prefix_sid_reused_across_files() {
         let env = TestEnvironment::new().await;
@@ -1120,12 +1185,16 @@ mod tests {
         let penalties = env
             .services
             .session_service
-            .get_sticky_penalty_servers(&sid)
+            .get_schedule_penalties(&sid, Some("b/two.bin:0-"))
             .await
             .unwrap();
         assert!(
-            !penalties.is_empty(),
-            "first file should record a server for later avoidance"
+            penalties.banned.is_empty(),
+            "first assignment is not a retry"
+        );
+        assert!(
+            !penalties.demoted.is_empty(),
+            "first file should demote its server for later spreading"
         );
 
         let second = handle_download_request_unified(

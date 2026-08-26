@@ -51,6 +51,10 @@ pub struct Metrics {
     pub cached_requests_per_server: CounterVec,   // 服务器缓存请求数
     pub cached_requests_per_resource: CounterVec, // 资源缓存请求数
 
+    // 版本文件一致性指标
+    pub version_file_mismatch_files: GaugeVec, // 各节点与多数派不一致的版本文件数
+    pub version_file_no_majority: GaugeVec,    // 各资源当前无多数派的版本文件数
+
     // 配置引用（用于实时获取ID列表）
     pub config: SharedConfig,
 }
@@ -213,6 +217,25 @@ impl Metrics {
         )?;
         registry.register(Box::new(cached_requests_per_resource.clone()))?;
 
+        // 版本文件一致性指标
+        let version_file_mismatch_files = GaugeVec::new(
+            Opts::new(
+                "dfs_version_file_mismatch_files",
+                "Number of version files whose content hash differs from the cluster majority",
+            ),
+            &["server_id", "resource_id"],
+        )?;
+        registry.register(Box::new(version_file_mismatch_files.clone()))?;
+
+        let version_file_no_majority = GaugeVec::new(
+            Opts::new(
+                "dfs_version_file_no_majority",
+                "Number of version files currently without a strict majority",
+            ),
+            &["resource_id"],
+        )?;
+        registry.register(Box::new(version_file_no_majority.clone()))?;
+
         Ok(Self {
             registry,
             requests_total,
@@ -237,6 +260,8 @@ impl Metrics {
             cached_requests_total,
             cached_requests_per_server,
             cached_requests_per_resource,
+            version_file_mismatch_files,
+            version_file_no_majority,
             config,
         })
     }
@@ -329,6 +354,29 @@ impl Metrics {
                 .with_label_values(&[resource_id])
                 .inc();
         }
+    }
+
+    /// 清空版本文件一致性指标
+    ///
+    /// 这两个指标每轮普查全量重算，必须先清空再写入，否则节点恢复一致或从配置中移除后
+    /// 会永远停留在上一轮的数值。
+    pub fn reset_version_file_consistency(&self) {
+        self.version_file_mismatch_files.reset();
+        self.version_file_no_majority.reset();
+    }
+
+    /// 记录单个节点在某资源下不一致的版本文件数（一致时写 0）
+    pub fn set_version_file_mismatch_files(&self, server_id: &str, resource_id: &str, files: u64) {
+        self.version_file_mismatch_files
+            .with_label_values(&[server_id, resource_id])
+            .set(files as f64);
+    }
+
+    /// 记录某资源下当前无多数派的版本文件数
+    pub fn set_version_file_no_majority(&self, resource_id: &str, files: u64) {
+        self.version_file_no_majority
+            .with_label_values(&[resource_id])
+            .set(files as f64);
     }
 
     /// Update bandwidth metrics (在/metrics端点处理时调用)

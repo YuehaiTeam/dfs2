@@ -1,7 +1,10 @@
 use crate::{
     config::SharedConfig,
     error::{DfsError, DfsResult},
-    models::{FlowContext, FlowJsContext, FlowOptions, FlowResult, FlowTarget, PluginMetadata},
+    models::{
+        FlowContext, FlowJsContext, FlowOptions, FlowPenalties, FlowResult, FlowTarget,
+        PluginMetadata,
+    },
     modules::{
         external::geolocation,
         flow::{FlowComp, FlowCond, FlowItem, FlowMode, FlowUse, ResourcePattern},
@@ -35,10 +38,12 @@ impl FlowService {
         bandwidth_cache: crate::services::BandwidthCacheService,
         resource_service: crate::services::ResourceService,
     ) -> Self {
+        // 只用于读取普查结论，不跑普查，因此不需要 metrics
         let version_file_service = VersionFileService::new(
             shared_config.clone(),
             data_store.clone(),
             resource_service.clone(),
+            None,
         );
         Self {
             shared_config,
@@ -58,7 +63,7 @@ impl FlowService {
         context: &FlowContext,
         options: &FlowOptions,
         flow_items: &[FlowItem],
-        penalty_servers: Vec<String>, // 外部传入惩罚服务器列表
+        penalties: FlowPenalties,
         session: Option<&crate::models::Session>,
     ) -> DfsResult<FlowResult> {
         let mut server_pool = Vec::new();
@@ -77,7 +82,7 @@ impl FlowService {
                     options,
                     session,
                     &mut plugin_server_mapping,
-                    &penalty_servers,
+                    &penalties,
                     &mut selected_server_id,
                     &mut selected_server_weight,
                 )
@@ -99,7 +104,7 @@ impl FlowService {
                     context,
                     options,
                     &plugin_server_mapping,
-                    &penalty_servers,
+                    &penalties,
                 )
                 .await?
             {
@@ -118,8 +123,12 @@ impl FlowService {
             let config = self.shared_config.load();
             if let Some(server_config) = config.servers.get(server_id) {
                 let health_info = self.get_health_info_for_server(server_id, target).await;
-                final_url =
-                    capabilities::rewrite_url(&final_url, server_config, health_info.as_ref(), &context.capabilities)?;
+                final_url = capabilities::rewrite_url(
+                    &final_url,
+                    server_config,
+                    health_info.as_ref(),
+                    &context.capabilities,
+                )?;
             }
         }
 
@@ -141,7 +150,7 @@ impl FlowService {
         options: &FlowOptions,
         session: Option<&crate::models::Session>,
         plugin_server_mapping: &mut HashMap<String, (Option<String>, bool)>,
-        penalty_servers: &[String],
+        penalties: &FlowPenalties,
         selected_server_id: &mut Option<String>,
         selected_server_weight: &mut Option<u32>,
     ) -> DfsResult<bool> {
@@ -158,8 +167,7 @@ impl FlowService {
                 match operation {
                     FlowUse::Clear => pool.clear(),
                     FlowUse::Server { id, weight } => {
-                        // 检查服务器是否在惩罚列表中
-                        if penalty_servers.contains(id) {
+                        if penalties.banned.iter().any(|server_id| server_id == id) {
                             continue;
                         }
 
@@ -286,7 +294,7 @@ impl FlowService {
                                 context,
                                 options,
                                 plugin_server_mapping,
-                                penalty_servers,
+                                penalties,
                             )
                             .await?
                         {
@@ -310,10 +318,13 @@ impl FlowService {
         context: &FlowContext,
         options: &FlowOptions,
         plugin_server_mapping: &HashMap<String, (Option<String>, bool)>,
-        penalty_servers: &[String],
+        penalties: &FlowPenalties,
     ) -> DfsResult<Option<(String, u32)>> {
-        // 应用惩罚：降低惩罚服务器的权重
-        self.apply_penalty_to_pool(pool, penalty_servers);
+        pool.retain(|(name, _)| {
+            let server_id = Self::pool_entry_server_id(name, plugin_server_mapping);
+            !penalties.banned.iter().any(|banned| banned == server_id)
+        });
+        self.apply_penalty_to_pool(pool, &penalties.demoted, plugin_server_mapping);
 
         // 权重随机选择
         let selected_server = self.weighted_random_selection(pool)?;
@@ -337,7 +348,7 @@ impl FlowService {
                     context,
                     options,
                     plugin_server_mapping,
-                    penalty_servers,
+                    penalties,
                 ))
                 .await
             } else {
@@ -629,28 +640,38 @@ impl FlowService {
         Ok(())
     }
 
-    /// 应用惩罚到pool（降低权重而不是移除）
-    fn apply_penalty_to_pool(&self, pool: &mut [(String, u32)], penalty_servers: &[String]) {
-        if penalty_servers.is_empty() {
+    fn pool_entry_server_id<'a>(
+        name: &'a str,
+        plugin_server_mapping: &'a HashMap<String, (Option<String>, bool)>,
+    ) -> &'a str {
+        plugin_server_mapping
+            .get(name)
+            .and_then(|(server_id, _)| server_id.as_deref())
+            .unwrap_or(name)
+    }
+
+    /// 已签过的节点降权摊开：减半，下限 1。
+    fn apply_penalty_to_pool(
+        &self,
+        pool: &mut [(String, u32)],
+        demoted: &[String],
+        plugin_server_mapping: &HashMap<String, (Option<String>, bool)>,
+    ) {
+        if demoted.is_empty() {
             return;
         }
 
-        let mut non_penalized_min_weight = u32::MAX;
-        for (server_name, weight) in pool.iter() {
-            if !penalty_servers.contains(server_name) {
-                non_penalized_min_weight = non_penalized_min_weight.min(*weight);
-            }
-        }
-
-        if non_penalized_min_weight != u32::MAX {
-            for (server_name, weight) in pool.iter_mut() {
-                if penalty_servers.contains(server_name) {
+        for (server_name, weight) in pool.iter_mut() {
+            let server_id = Self::pool_entry_server_id(server_name, plugin_server_mapping);
+            if demoted.iter().any(|id| id == server_id) {
+                let new_weight = (*weight / 2).max(1);
+                if new_weight != *weight {
                     info!(
-                        "Applied penalty to server {} for repeated request: {} -> {}",
-                        server_name, *weight, non_penalized_min_weight
+                        "Demoted server {} for reuse: {} -> {}",
+                        server_id, *weight, new_weight
                     );
-                    *weight = non_penalized_min_weight;
                 }
+                *weight = new_weight;
             }
         }
     }
@@ -873,7 +894,7 @@ fn normalize_path_simple(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-        use crate::modules::network::capabilities::{rewrite_url, ClientCapabilities};
+    use crate::modules::network::capabilities::{ClientCapabilities, rewrite_url};
     use crate::tests::common::TestEnvironment;
     use serde_json::json;
     use size::Size;
@@ -1324,122 +1345,55 @@ mod tests {
     #[tokio::test]
     async fn test_apply_penalty_to_pool() {
         let service = create_test_flow_service().await;
+        let mapping = HashMap::new();
 
-        // 测试空惩罚列表 - 权重应该不变
         let mut pool = vec![
             ("server1".to_string(), 10),
             ("server2".to_string(), 5),
             ("server3".to_string(), 8),
         ];
         let original_pool = pool.clone();
-        service.apply_penalty_to_pool(&mut pool, &[]);
+        service.apply_penalty_to_pool(&mut pool, &[], &mapping);
         assert_eq!(
             pool, original_pool,
-            "Empty penalty list should not change weights"
+            "Empty demoted list should not change weights"
         );
 
-        // 测试标准惩罚 - 惩罚服务器权重被调整到最低非惩罚权重
-        let mut pool = vec![
-            ("server1".to_string(), 10),
-            ("server2".to_string(), 5), // 最低非惩罚权重
-            ("server3".to_string(), 8),
-        ];
-        let penalty_servers = vec!["server1".to_string(), "server3".to_string()];
-        service.apply_penalty_to_pool(&mut pool, &penalty_servers);
-
-        // server1 和 server3 应该被调整到 5 (最低非惩罚权重)
-        // server2 保持 5 不变
-        assert_eq!(
-            pool[0].1, 5,
-            "Penalized server1 should have weight reduced to min non-penalized"
-        );
-        assert_eq!(
-            pool[1].1, 5,
-            "Non-penalized server2 should keep original weight"
-        );
-        assert_eq!(
-            pool[2].1, 5,
-            "Penalized server3 should have weight reduced to min non-penalized"
-        );
-
-        // 测试全部服务器被惩罚 - 权重应该保持不变
         let mut pool = vec![
             ("server1".to_string(), 10),
             ("server2".to_string(), 5),
             ("server3".to_string(), 8),
         ];
-        let original_pool = pool.clone();
-        let all_penalty = vec![
+        let demoted = vec!["server1".to_string(), "server3".to_string()];
+        service.apply_penalty_to_pool(&mut pool, &demoted, &mapping);
+        assert_eq!(pool[0].1, 5, "server1 10 should halve to 5");
+        assert_eq!(pool[1].1, 5, "untouched server should keep weight");
+        assert_eq!(pool[2].1, 4, "server3 8 should halve to 4");
+
+        let mut pool = vec![
+            ("server1".to_string(), 10),
+            ("server2".to_string(), 5),
+            ("server3".to_string(), 8),
+        ];
+        let all_demoted = vec![
             "server1".to_string(),
             "server2".to_string(),
             "server3".to_string(),
         ];
-        service.apply_penalty_to_pool(&mut pool, &all_penalty);
-        assert_eq!(
-            pool, original_pool,
-            "All penalized servers should keep original weights"
-        );
+        service.apply_penalty_to_pool(&mut pool, &all_demoted, &mapping);
+        assert_eq!(pool[0].1, 5);
+        assert_eq!(pool[1].1, 2);
+        assert_eq!(pool[2].1, 4);
 
-        // 测试惩罚不存在的服务器 - 应该没有影响
+        let mut pool = vec![("server1".to_string(), 1), ("server2".to_string(), 6)];
+        service.apply_penalty_to_pool(&mut pool, &["server1".to_string()], &mapping);
+        assert_eq!(pool[0].1, 1, "weight 1 must stay at least 1");
+        assert_eq!(pool[1].1, 6);
+
         let mut pool = vec![("server1".to_string(), 10), ("server2".to_string(), 5)];
         let original_pool = pool.clone();
-        let nonexistent_penalty = vec!["nonexistent_server".to_string()];
-        service.apply_penalty_to_pool(&mut pool, &nonexistent_penalty);
-        assert_eq!(
-            pool, original_pool,
-            "Non-existent penalty servers should have no effect"
-        );
-
-        // 测试部分惩罚 - 只有被惩罚的服务器权重改变
-        let mut pool = vec![
-            ("server1".to_string(), 20),
-            ("server2".to_string(), 15),
-            ("server3".to_string(), 10), // 最低非惩罚权重
-            ("server4".to_string(), 25),
-        ];
-        let partial_penalty = vec!["server1".to_string(), "server4".to_string()];
-        service.apply_penalty_to_pool(&mut pool, &partial_penalty);
-
-        assert_eq!(
-            pool[0].1, 10,
-            "Penalized server1 should be reduced to min non-penalized (10)"
-        );
-        assert_eq!(
-            pool[1].1, 15,
-            "Non-penalized server2 should keep weight (15)"
-        );
-        assert_eq!(
-            pool[2].1, 10,
-            "Non-penalized server3 should keep weight (10)"
-        );
-        assert_eq!(
-            pool[3].1, 10,
-            "Penalized server4 should be reduced to min non-penalized (10)"
-        );
-
-        // 测试边界情况：只有一个非惩罚服务器
-        let mut pool = vec![
-            ("server1".to_string(), 10),
-            ("server2".to_string(), 5), // 唯一非惩罚服务器
-            ("server3".to_string(), 8),
-        ];
-        let single_non_penalty = vec!["server1".to_string(), "server3".to_string()];
-        service.apply_penalty_to_pool(&mut pool, &single_non_penalty);
-
-        assert_eq!(
-            pool[0].1, 5,
-            "Penalized server should match single non-penalized weight"
-        );
-        assert_eq!(
-            pool[1].1, 5,
-            "Non-penalized server should keep original weight"
-        );
-        assert_eq!(
-            pool[2].1, 5,
-            "Penalized server should match single non-penalized weight"
-        );
-
-        println!("✅ All penalty application tests passed");
+        service.apply_penalty_to_pool(&mut pool, &["missing".to_string()], &mapping);
+        assert_eq!(pool, original_pool);
     }
 
     #[tokio::test]
@@ -1967,7 +1921,7 @@ mod tests {
                 &options,
                 None,
                 &mut plugin_server_mapping,
-                &[],
+                &FlowPenalties::default(),
                 &mut selected_server_id,
                 &mut selected_server_weight,
             )
@@ -2013,7 +1967,7 @@ mod tests {
                 &options,
                 None,
                 &mut plugin_server_mapping,
-                &[],
+                &FlowPenalties::default(),
                 &mut selected_server_id,
                 &mut selected_server_weight,
             )
@@ -2062,7 +2016,7 @@ mod tests {
                 &options,
                 None,
                 &mut plugin_server_mapping,
-                &[],
+                &FlowPenalties::default(),
                 &mut selected_server_id,
                 &mut selected_server_weight,
             )
@@ -2117,7 +2071,7 @@ mod tests {
                 &options,
                 None,
                 &mut plugin_server_mapping,
-                &[],
+                &FlowPenalties::default(),
                 &mut selected_server_id,
                 &mut selected_server_weight,
             )
@@ -2146,7 +2100,7 @@ mod tests {
                 &options,
                 None,
                 &mut plugin_server_mapping,
-                &[],
+                &FlowPenalties::default(),
                 &mut selected_server_id,
                 &mut selected_server_weight,
             )
@@ -2175,8 +2129,11 @@ mod tests {
         let (target, mut context, options) = create_test_context();
         context.capabilities.h3 = true;
 
-        // h3_server is both h3_only AND penalized
-        let penalty_servers = vec!["h3_server".to_string()];
+        // h3_server is both h3_only AND banned after a retry
+        let penalties = FlowPenalties {
+            banned: vec!["h3_server".to_string()],
+            demoted: Vec::new(),
+        };
 
         let item = FlowItem {
             rules: vec![],
@@ -2203,7 +2160,7 @@ mod tests {
                 &options,
                 None,
                 &mut plugin_server_mapping,
-                &penalty_servers,
+                &penalties,
                 &mut selected_server_id,
                 &mut selected_server_weight,
             )
@@ -2250,7 +2207,7 @@ mod tests {
                 &options,
                 None,
                 &mut plugin_server_mapping,
-                &[],
+                &FlowPenalties::default(),
                 &mut selected_server_id,
                 &mut selected_server_weight,
             )
@@ -2265,6 +2222,58 @@ mod tests {
         assert_eq!(pool[0].0, "unknown_server");
 
         println!("✅ Unknown server not filtered by h3_only gate");
+    }
+
+    #[tokio::test]
+    async fn test_demoted_servers_stay_in_pool_with_half_weight() {
+        let service = create_h3_test_flow_service().await;
+
+        let mut pool = Vec::new();
+        let mut plugin_server_mapping = HashMap::new();
+        let mut selected_server_id = None;
+        let mut selected_server_weight = None;
+        let (target, mut context, options) = create_test_context();
+        context.capabilities.h3 = true;
+        let penalties = FlowPenalties {
+            banned: Vec::new(),
+            demoted: vec!["normal_server".to_string()],
+        };
+        let item = FlowItem {
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec![
+                FlowUse::Server {
+                    id: "h3_server".to_string(),
+                    weight: 10,
+                },
+                FlowUse::Server {
+                    id: "normal_server".to_string(),
+                    weight: 6,
+                },
+            ],
+            r#break: false,
+        };
+
+        service
+            .execute_flow_item(
+                &mut pool,
+                &item,
+                &target,
+                &context,
+                &options,
+                None,
+                &mut plugin_server_mapping,
+                &penalties,
+                &mut selected_server_id,
+                &mut selected_server_weight,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(pool.len(), 2, "demoted servers must still enter the pool");
+        service.apply_penalty_to_pool(&mut pool, &penalties.demoted, &plugin_server_mapping);
+        assert_eq!(pool[0].1, 10);
+        assert_eq!(pool[1].1, 3);
     }
 
     // ======================== rewrite_h3_url tests ========================
@@ -2569,9 +2578,7 @@ mod tests {
         ver_map.insert("h3_pinned".to_string(), "/files/app.zip".to_string());
         ver_map.insert("default".to_string(), "/files/app.zip".to_string());
         h3_resource.versions.insert("1.0.0".to_string(), ver_map);
-        config
-            .resources
-            .insert("h3_app".to_string(), h3_resource);
+        config.resources.insert("h3_app".to_string(), h3_resource);
 
         // Resource using mixed pool (h3 + regular)
         let mut mixed_resource = ResourceConfig {
@@ -2653,7 +2660,14 @@ mod tests {
             r#break: false,
         }];
         let result = service
-            .execute_flow(&target, &context, &options, &flow_items, vec![], None)
+            .execute_flow(
+                &target,
+                &context,
+                &options,
+                &flow_items,
+                FlowPenalties::default(),
+                None,
+            )
             .await;
 
         // Should fail: no servers available (h3_only filtered out for non-capable client)
@@ -2717,7 +2731,14 @@ mod tests {
             r#break: false,
         }];
         let result = service
-            .execute_flow(&target, &context, &options, &flow_items, vec![], None)
+            .execute_flow(
+                &target,
+                &context,
+                &options,
+                &flow_items,
+                FlowPenalties::default(),
+                None,
+            )
             .await;
 
         assert!(

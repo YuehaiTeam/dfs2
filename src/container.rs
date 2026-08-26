@@ -174,6 +174,7 @@ impl AppContainer {
             self.shared_config.clone(),
             self.data_store.clone(),
             resource_service.clone(),
+            Some(self.metrics.clone()),
         );
 
         AppContext::new(

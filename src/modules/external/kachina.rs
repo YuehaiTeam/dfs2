@@ -196,7 +196,14 @@ pub async fn fetch_file_range(
 
     // 执行Flow获取URL
     let flow_result = flow_service
-        .execute_flow(&target, &context, &options, flow_list, vec![], None)
+        .execute_flow(
+            &target,
+            &context,
+            &options,
+            flow_list,
+            crate::models::FlowPenalties::default(),
+            None,
+        )
         .await?;
     let cdn_url = flow_result.url;
 

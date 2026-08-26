@@ -19,6 +19,7 @@ pub async fn download_and_cache(
     path: &str,
     redis: &Arc<dyn DataStoreBackend>,
     max_age: u32,
+    source_server: &str,
 ) -> Result<(CacheMetadata, Vec<u8>), String> {
     // 下载内容
     let response = FETCH_CLIENT
@@ -57,6 +58,7 @@ pub async fn download_and_cache(
         content_length: content.len() as u64,
         content_type,
         etag,
+        src: Some(source_server.to_string()),
     };
 
     // 存储到Redis（分离存储）
@@ -172,6 +174,18 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_metadata_without_src_still_parses() {
+        // 线上 Redis 里已有一批没有 src 字段的条目，反序列化失败会导致缓存全量击穿
+        let legacy = r#"{"cached_at":1,"max_age":300,"content_length":10,"content_type":null,"etag":"\"x\""}"#;
+        let metadata: CacheMetadata =
+            serde_json::from_str(legacy).expect("legacy cache metadata must stay readable");
+        assert!(metadata.src.is_none());
+
+        let round_trip = serde_json::to_string(&metadata).expect("serialize");
+        assert!(!round_trip.contains("src"));
+    }
 
     #[test]
     fn test_glob_match() {

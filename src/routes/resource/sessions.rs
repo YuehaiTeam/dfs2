@@ -440,10 +440,7 @@ mod tests {
         println!("✅ Prefix session creation test completed!");
     }
 
-    async fn solve_stored_md5_challenge(
-        env: &TestEnvironment,
-        session_id: &str,
-    ) -> String {
+    async fn solve_stored_md5_challenge(env: &TestEnvironment, session_id: &str) -> String {
         let stored_challenge_data = env
             .data_store
             .get_challenge(session_id)
@@ -512,7 +509,10 @@ mod tests {
         )
         .await;
         let rechallenge = axum::response::IntoResponse::into_response(rechallenge);
-        assert_eq!(rechallenge.into_parts().0.status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(
+            rechallenge.into_parts().0.status,
+            StatusCode::PAYMENT_REQUIRED
+        );
 
         let second = handle_create_session_unified(
             "game_assets".to_string(),
@@ -538,13 +538,14 @@ mod tests {
         assert_eq!(stored.sub_path, Some("b/two.bin".to_string()));
         assert_eq!(stored.resource_id, "game_assets");
 
-        let sticky = env
+        let penalties = env
             .services
             .session_service
-            .get_sticky_penalty_servers(session_id)
+            .get_schedule_penalties(session_id, Some("b/two.bin:0-"))
             .await
             .unwrap();
-        assert_eq!(sticky, vec!["test_server_1".to_string()]);
+        assert!(penalties.banned.is_empty());
+        assert_eq!(penalties.demoted, vec!["test_server_1".to_string()]);
     }
 
     // 测试已删除: test_create_prefix_session_invalid_resource_type - 边界情况

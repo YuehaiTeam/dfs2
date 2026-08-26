@@ -356,6 +356,7 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
         app_container.shared_config.clone(),
         app_container.data_store.clone(),
         app_context.resource_service.clone(),
+        Some(app_container.metrics.clone()),
     ));
     match version_file_service
         .census_all(false, &std::collections::HashSet::new())
