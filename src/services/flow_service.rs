@@ -688,8 +688,10 @@ impl FlowService {
         let mut rng = rand::rng();
         let mut random_weight = rng.random_range(0..total_weight);
 
+        // 抽样区间是半开的 [0, total)，比较必须同为严格小于：写成 `<=` 会让每个条目多占一格，
+        // 权重 0 的条目变得可选（`server x 0` 本意是禁用），且靠前的条目被系统性偏向。
         for (server_id, weight) in pool.iter() {
-            if random_weight <= *weight {
+            if random_weight < *weight {
                 return Ok((server_id.clone(), *weight));
             }
             random_weight -= weight;
@@ -1340,6 +1342,55 @@ mod tests {
         );
 
         println!("✅ All weighted random selection tests passed");
+    }
+
+    /// 权重语义的精确边界。上面那个分布测试的 ±10% 容差盖不住这些情况：
+    /// 等权时末位可达、首位 0 权重不可选、小权重下的配比不偏。
+    #[tokio::test]
+    async fn weighted_selection_respects_exact_weights() {
+        let service = create_test_flow_service().await;
+
+        // 等权两节点：末位必须可达。区间半开而比较取闭时，(1,1) 的第二个节点永远选不到。
+        let equal_pool = vec![("first".to_string(), 1), ("second".to_string(), 1)];
+        let mut seen_second = false;
+        let mut first_count = 0;
+        for _ in 0..400 {
+            let (selected, _) = service
+                .weighted_random_selection(&equal_pool)
+                .expect("equal pool selects");
+            if selected == "second" {
+                seen_second = true;
+            } else {
+                first_count += 1;
+            }
+        }
+        assert!(
+            seen_second,
+            "second entry of an equal-weight pool is unreachable"
+        );
+        let first_ratio = f64::from(first_count) / 400.0;
+        assert!(
+            (0.40..=0.60).contains(&first_ratio),
+            "equal weights should split evenly, first got {:.1}%",
+            first_ratio * 100.0
+        );
+
+        // 首位 0 权重：`server x 0` 表示禁用，不能因为落在区间端点而被选中
+        let leading_zero_pool = vec![
+            ("disabled".to_string(), 0),
+            ("alpha".to_string(), 1),
+            ("beta".to_string(), 1),
+        ];
+        for _ in 0..400 {
+            let (selected, weight) = service
+                .weighted_random_selection(&leading_zero_pool)
+                .expect("pool with positive total selects");
+            assert_ne!(
+                selected, "disabled",
+                "zero-weight entry must stay unselected"
+            );
+            assert!(weight > 0);
+        }
     }
 
     #[tokio::test]
