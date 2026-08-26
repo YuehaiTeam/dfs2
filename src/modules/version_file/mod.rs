@@ -274,6 +274,44 @@ mod tests {
     }
 
     #[test]
+    fn silent_cluster_is_not_reported_as_a_split() {
+        let view = apply_observations(
+            None,
+            &observations(&[("a", None), ("b", None)]),
+            10,
+            300,
+            false,
+        );
+
+        assert_eq!(view.responder_count, 0);
+        assert_eq!(view.majority_hash, None);
+        // 无人响应不是分歧：split_since 保持 None，普查侧据此把它计入 no_responders 而非 no_majority
+        assert_eq!(view.split_since, None);
+        assert_eq!(classify_view(&view), CensusVerdict::NoResponders);
+    }
+
+    #[test]
+    fn no_responders_only_surfaces_in_strict_mode() {
+        let view = apply_observations(None, &observations(&[("a", None)]), 10, 300, false);
+
+        // 运行时（strict_split_fail=false）这条路径不产生任何日志行，
+        // dfs_version_file_no_responders 因此是它在监控侧唯一的出口
+        assert_eq!(
+            report_view("res", "versions.json", &view, false),
+            CensusReport::default()
+        );
+
+        let strict = report_view("res", "versions.json", &view, true);
+        assert!(
+            strict
+                .errors
+                .iter()
+                .any(|line| line.contains("no live responders")),
+            "expected a no-live-responders error under strict mode, got {strict:?}"
+        );
+    }
+
+    #[test]
     fn even_split_has_no_majority() {
         let view = apply_observations(
             None,

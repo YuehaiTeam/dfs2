@@ -358,21 +358,14 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
         app_context.resource_service.clone(),
         Some(app_container.metrics.clone()),
     ));
-    match version_file_service
-        .census_all(false, &std::collections::HashSet::new())
-        .await
-    {
-        Ok(report) => {
-            for error in &report.errors {
-                warn!("Version-file census: {}", error);
-            }
-            for warning in &report.warnings {
-                warn!("Version-file census: {}", warning);
-            }
-        }
-        Err(e) => warn!("Initial version-file census failed: {}", e),
-    }
+    // 首轮普查交给后台任务的首个 tick：在此同步等待会把监听推迟整整一轮，而普查结论缺失时
+    // 版本文件请求本就退回普通健康检查（VersionFileDecision::Unknown 不施加限制）。
     version_file_service.start_background_task().await;
+
+    // 地理库是惰性初始化的，不预热则由第一个到达的请求承担整个数据库的读取
+    tokio::task::spawn_blocking(|| {
+        lazy_static::initialize(&modules::external::geolocation::IPDB);
+    });
     info!("Version-file census background task started");
 
     // 启动会话清理任务

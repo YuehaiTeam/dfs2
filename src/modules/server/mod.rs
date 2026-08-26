@@ -1,9 +1,11 @@
 use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use tracing::warn;
+use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::{debug, warn};
 
-use crate::config::{CertHashPolicy, ServerConfig};
+use crate::config::{AppConfig, CertHashPolicy, ServerConfig};
 use crate::modules::network::h3_middleware::{CertVerifyPolicy, H3TransportInfo};
 
 pub mod dfs_node;
@@ -11,6 +13,12 @@ pub mod dfs_sftp;
 pub mod dfs_wt;
 pub mod git_lfs;
 pub mod s3;
+
+/// 单次版本文件探测的总时限。
+///
+/// 底层客户端的分段超时（H3 连接 10s、HTTP 读 60s）之和远大于取一个版本文件该花的时间，
+/// 而普查一轮要跨节点乘路径地探测多次。设总时限使单次探测的最坏耗时有明确上界。
+const VERSION_FILE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 健康检查结果，包含存活状态和文件大小信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +50,81 @@ pub struct FileProbe {
     pub file_size: Option<u64>,
     pub observed_cert_hash: Option<String>,
     pub body: Option<Vec<u8>>,
+}
+
+/// 单个节点的连通性探测结果。
+#[derive(Debug, Clone)]
+pub struct ServerPing {
+    pub server_id: String,
+    pub health_check_path: String,
+    pub is_alive: bool,
+}
+
+/// 全量节点连通性探测的结果。
+#[derive(Debug, Clone, Default)]
+pub struct PingReport {
+    /// 配置了健康检查路径、且服务器实现构造成功的节点。
+    pub probed: Vec<ServerPing>,
+    /// 配置了健康检查路径但无法构造实现的节点，属于配置错误。
+    pub implementation_missing: Vec<String>,
+}
+
+impl PingReport {
+    /// 探测失败的节点，供版本文件普查整轮跳过。
+    pub fn unreachable(&self) -> HashSet<String> {
+        self.probed
+            .iter()
+            .filter(|ping| !ping.is_alive)
+            .map(|ping| ping.server_id.clone())
+            .collect()
+    }
+
+    pub fn alive_count(&self) -> usize {
+        self.probed.iter().filter(|ping| ping.is_alive).count()
+    }
+}
+
+/// 并发探测所有配置了健康检查路径的节点。
+///
+/// 不读健康信息缓存：结果用于决定普查是否整轮跳过某节点，而过期的"不可达"判定会让该节点缺席
+/// 一整轮多数派计算，节点数少时足以改变多数派是否成立，因此每次都实测。未配置健康检查路径的
+/// 节点不出现在结果中——无从判定，交由普查按路径逐个探测。
+pub async fn ping_servers(config: &AppConfig, concurrency: usize) -> PingReport {
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let mut report = PingReport::default();
+    let mut tasks = Vec::new();
+
+    for (server_id, server_config) in &config.servers {
+        let Some(health_check_path) = &server_config.health_check_path else {
+            continue;
+        };
+        let Some(server_impl) = config.get_server(server_id) else {
+            report.implementation_missing.push(server_id.clone());
+            continue;
+        };
+
+        let server_id = server_id.clone();
+        let server_config = server_config.clone();
+        let server_impl = server_impl.clone();
+        let health_check_path = health_check_path.clone();
+        let semaphore = semaphore.clone();
+        tasks.push(async move {
+            let _permit = semaphore.acquire().await.ok();
+            debug!("Pinging server {} (path: {})", server_id, health_check_path);
+            let is_alive = server_impl
+                .is_alive(&server_id, &server_config, &health_check_path, None)
+                .await;
+            ServerPing {
+                server_id,
+                health_check_path,
+                is_alive,
+            }
+        });
+    }
+
+    report.probed = futures::future::join_all(tasks).await;
+    report.implementation_missing.sort_unstable();
+    report
 }
 
 /// 从HTTP响应中提取文件大小
@@ -425,8 +508,22 @@ impl ServerImpl {
             }
         };
 
-        let (is_alive, file_size, observed_cert_hash, body) =
-            execute_full_probe(&check_url, server_config, max_bytes).await;
+        let (is_alive, file_size, observed_cert_hash, body) = match tokio::time::timeout(
+            VERSION_FILE_PROBE_TIMEOUT,
+            execute_full_probe(&check_url, server_config, max_bytes),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                warn!(
+                    "Version-file probe exceeded {}s for URL {}",
+                    VERSION_FILE_PROBE_TIMEOUT.as_secs(),
+                    check_url
+                );
+                (false, None, None, None)
+            }
+        };
         FileProbe {
             is_alive,
             file_size,
@@ -577,7 +674,53 @@ async fn execute_full_probe(
 
 #[cfg(test)]
 mod tests {
-    use super::to_http3_url;
+    use super::{PingReport, ServerPing, ping_servers, to_http3_url};
+
+    fn ping(server_id: &str, is_alive: bool) -> ServerPing {
+        ServerPing {
+            server_id: server_id.to_string(),
+            health_check_path: "health".to_string(),
+            is_alive,
+        }
+    }
+
+    #[test]
+    fn unreachable_lists_only_failed_pings() {
+        let report = PingReport {
+            probed: vec![ping("alive", true), ping("dead", false)],
+            implementation_missing: vec![],
+        };
+
+        let unreachable = report.unreachable();
+        assert_eq!(unreachable.len(), 1);
+        assert!(unreachable.contains("dead"));
+        assert_eq!(report.alive_count(), 1);
+    }
+
+    #[test]
+    fn servers_without_implementation_are_not_reported_unreachable() {
+        // 无法构造实现的节点是配置错误，普查侧本就会给它记空观测，不该混进"不可达"集合
+        let report = PingReport {
+            probed: vec![],
+            implementation_missing: vec!["broken".to_string()],
+        };
+
+        assert!(report.unreachable().is_empty());
+        assert_eq!(report.alive_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn servers_without_health_check_path_are_not_probed() {
+        let mut config = crate::tests::mocks::create_default_test_config();
+        for server_config in config.servers.values_mut() {
+            server_config.health_check_path = None;
+        }
+
+        let report = ping_servers(&config, 4).await;
+        assert!(report.probed.is_empty());
+        assert!(report.implementation_missing.is_empty());
+        assert!(report.unreachable().is_empty());
+    }
 
     #[test]
     fn converts_https_probe_url_to_http3() {

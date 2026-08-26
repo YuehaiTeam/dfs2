@@ -1,10 +1,12 @@
 use crate::{
     config::{AppConfig, SharedConfig},
     error::DfsResult,
-    modules::{qjs::JsRunner, storage::data_store::DataStore, version_file::PROBE_CONCURRENCY},
+    modules::{
+        qjs::JsRunner, server::ping_servers, storage::data_store::DataStore,
+        version_file::PROBE_CONCURRENCY,
+    },
 };
 use std::collections::HashSet;
-use std::sync::Arc;
 use tracing::info;
 
 /// 验证报告结构
@@ -419,36 +421,8 @@ impl ConfigValidator {
     ) -> HashSet<String> {
         info!("验证服务器连接性...");
 
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(PROBE_CONCURRENCY));
-        let mut tasks = Vec::new();
-        let mut ping_failed = HashSet::new();
-
         for (server_id, server_config) in &config.servers {
-            // 检查是否配置了健康检查路径
-            if let Some(health_check_path) = &server_config.health_check_path {
-                if let Some(server_impl) = config.get_server(server_id) {
-                    let server_id = server_id.clone();
-                    let server_config = server_config.clone();
-                    let server_impl = server_impl.clone();
-                    let health_check_path = health_check_path.clone();
-                    let semaphore = semaphore.clone();
-                    tasks.push(async move {
-                        let _permit = semaphore.acquire().await.ok();
-                        info!(
-                            "测试服务器连接: {} (路径: {})",
-                            server_id, health_check_path
-                        );
-                        let is_alive = server_impl
-                            .is_alive(&server_id, &server_config, &health_check_path, None)
-                            .await;
-                        (server_id, health_check_path, is_alive)
-                    });
-                } else {
-                    // 服务器配置错误是致命问题
-                    report.add_error(format!("服务器 '{server_id}' 配置错误，无法创建服务器实现"));
-                    report.servers_valid = false;
-                }
-            } else {
+            if server_config.health_check_path.is_none() {
                 info!(
                     "跳过服务器 '{}' 的连接性测试（未配置健康检查路径）",
                     server_id
@@ -456,19 +430,27 @@ impl ConfigValidator {
             }
         }
 
-        let results = futures::future::join_all(tasks).await;
-        let tested_servers = results.len();
-        let mut valid_servers = 0;
+        // 与运行时普查共用同一套探测逻辑，避免 validate 通过而普查跳过的节点集合不一致
+        let ping = ping_servers(config, PROBE_CONCURRENCY).await;
 
-        for (server_id, health_check_path, is_alive) in results {
-            if is_alive {
-                valid_servers += 1;
-                info!("服务器 '{}' 连接正常", server_id);
+        for server_id in &ping.implementation_missing {
+            // 服务器配置错误是致命问题
+            report.add_error(format!("服务器 '{server_id}' 配置错误，无法创建服务器实现"));
+            report.servers_valid = false;
+        }
+
+        let tested_servers = ping.probed.len();
+        let valid_servers = ping.alive_count();
+        let ping_failed = ping.unreachable();
+
+        for result in &ping.probed {
+            if result.is_alive {
+                info!("服务器 '{}' 连接正常", result.server_id);
             } else {
-                ping_failed.insert(server_id.clone());
                 // 服务器连接失败只是警告，不影响配置验证结果
                 report.add_warning(format!(
-                    "服务器 '{server_id}' 连接失败或不可用 (测试路径: {health_check_path})"
+                    "服务器 '{}' 连接失败或不可用 (测试路径: {})",
+                    result.server_id, result.health_check_path
                 ));
             }
         }

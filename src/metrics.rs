@@ -54,6 +54,7 @@ pub struct Metrics {
     // 版本文件一致性指标
     pub version_file_mismatch_files: GaugeVec, // 各节点与多数派不一致的版本文件数
     pub version_file_no_majority: GaugeVec,    // 各资源当前无多数派的版本文件数
+    pub version_file_no_responders: GaugeVec,  // 各资源一个存活响应者都没有的版本文件数
 
     // 配置引用（用于实时获取ID列表）
     pub config: SharedConfig,
@@ -236,6 +237,15 @@ impl Metrics {
         )?;
         registry.register(Box::new(version_file_no_majority.clone()))?;
 
+        let version_file_no_responders = GaugeVec::new(
+            Opts::new(
+                "dfs_version_file_no_responders",
+                "Number of version files for which no server returned content in the last census",
+            ),
+            &["resource_id"],
+        )?;
+        registry.register(Box::new(version_file_no_responders.clone()))?;
+
         Ok(Self {
             registry,
             requests_total,
@@ -262,6 +272,7 @@ impl Metrics {
             cached_requests_per_resource,
             version_file_mismatch_files,
             version_file_no_majority,
+            version_file_no_responders,
             config,
         })
     }
@@ -358,11 +369,12 @@ impl Metrics {
 
     /// 清空版本文件一致性指标
     ///
-    /// 这两个指标每轮普查全量重算，必须先清空再写入，否则节点恢复一致或从配置中移除后
+    /// 这几个指标每轮普查全量重算，必须先清空再写入，否则节点恢复一致或从配置中移除后
     /// 会永远停留在上一轮的数值。
     pub fn reset_version_file_consistency(&self) {
         self.version_file_mismatch_files.reset();
         self.version_file_no_majority.reset();
+        self.version_file_no_responders.reset();
     }
 
     /// 记录单个节点在某资源下不一致的版本文件数（一致时写 0）
@@ -375,6 +387,16 @@ impl Metrics {
     /// 记录某资源下当前无多数派的版本文件数
     pub fn set_version_file_no_majority(&self, resource_id: &str, files: u64) {
         self.version_file_no_majority
+            .with_label_values(&[resource_id])
+            .set(files as f64);
+    }
+
+    /// 记录某资源下一个存活响应者都没有的版本文件数
+    ///
+    /// 与 mismatch 系列区分开：无响应者说明本轮谁都没取到内容，多数派无从谈起，属于连通性
+    /// 问题而非一致性问题。
+    pub fn set_version_file_no_responders(&self, resource_id: &str, files: u64) {
+        self.version_file_no_responders
             .with_label_values(&[resource_id])
             .set(files as f64);
     }
