@@ -561,6 +561,7 @@ impl FlowService {
                     FlowComp::Le => current_time <= *expected_time,
                 })
             }
+            FlowCond::Internal(expected) => Ok(*expected == context.internal),
             FlowCond::Not(inner) => {
                 // 取反的是内层的求值结果，不是"内层为真的补集"：内层因信息缺失而为 false 时，
                 // 取反给出 true。判定失败（Err）不参与取反，照原样上抛。
@@ -924,6 +925,7 @@ mod tests {
             session_id: Some("test_session".to_string()),
             extras: json!({"test_flag": true}),
             capabilities: Default::default(),
+            internal: false,
         };
 
         let options = FlowOptions {
@@ -2001,6 +2003,87 @@ mod tests {
         env.services.flow_service
     }
 
+    /// 内部取件的能力面取自本进程的 fetch 客户端，而不是"什么都不支持"。
+    /// 用全 false 的 `Default` 时，h3_only 节点对内部取件永远不可选。
+    #[tokio::test]
+    async fn internal_fetch_can_use_h3_only_servers() {
+        let service = create_h3_test_flow_service().await;
+
+        let mut pool = Vec::new();
+        let mut plugin_server_mapping = HashMap::new();
+        let mut selected_server_id = None;
+        let mut selected_server_weight = None;
+
+        let (target, _client_context, options) = create_test_context();
+        let context = FlowContext::internal();
+        assert!(context.internal);
+        assert!(context.capabilities.h3, "内部取件走 H3 middleware");
+        assert!(!context.capabilities.wt, "本进程不做 WebTransport 客户端");
+
+        let item = FlowItem {
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec![FlowUse::Server {
+                id: "h3_server".to_string(),
+                weight: 10,
+            }],
+            r#break: false,
+        };
+
+        service
+            .execute_flow_item(
+                &mut pool,
+                &item,
+                &target,
+                &context,
+                &options,
+                None,
+                &mut plugin_server_mapping,
+                &FlowPenalties::default(),
+                &mut selected_server_id,
+                &mut selected_server_weight,
+            )
+            .await
+            .expect("flow item executes for an internal fetch");
+
+        assert_eq!(
+            pool,
+            vec![("h3_server".to_string(), 10)],
+            "h3_only server should be selectable for an internal fetch"
+        );
+    }
+
+    /// `internal` 条件区分的是"谁发起的取件"，不是"客户端 IP 是否已知"。
+    #[tokio::test]
+    async fn internal_condition_distinguishes_the_originator() {
+        let service = create_test_flow_service().await;
+        let (target, mut client_context, _options) = create_test_context();
+
+        let internal_context = FlowContext::internal();
+        assert!(
+            service
+                .evaluate_condition(&FlowCond::Internal(true), &target, &internal_context)
+                .await
+                .expect("internal condition evaluates")
+        );
+
+        // 客户端 IP 缺失的客户端请求仍然不是内部取件
+        client_context.client_ip = None;
+        assert!(
+            !service
+                .evaluate_condition(&FlowCond::Internal(true), &target, &client_context)
+                .await
+                .expect("internal condition evaluates"),
+            "a client request without a resolved IP is not an internal fetch"
+        );
+        assert!(
+            service
+                .evaluate_condition(&FlowCond::Internal(false), &target, &client_context)
+                .await
+                .expect("internal condition evaluates")
+        );
+    }
+
     #[tokio::test]
     async fn test_h3_only_server_skipped_when_not_h3_capable() {
         let service = create_h3_test_flow_service().await;
@@ -2757,6 +2840,7 @@ mod tests {
             session_id: Some("test_sid".to_string()),
             extras: json!({}),
             capabilities: Default::default(), // Client does NOT support h3
+            internal: false,
         };
         let options = FlowOptions {
             cdn_full_range: false,
@@ -2822,6 +2906,7 @@ mod tests {
             session_id: Some("test_sid".to_string()),
             extras: json!({}),
             capabilities: Default::default(),
+            internal: false,
         };
         let options = FlowOptions {
             cdn_full_range: false,

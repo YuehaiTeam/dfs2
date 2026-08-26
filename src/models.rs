@@ -136,6 +136,25 @@ pub struct FlowContext {
     /// Derived from UA markers + X-DFS-Override header.
     #[serde(default)]
     pub capabilities: ClientCapabilities,
+    /// 本次取件由调度器自身发起，而非代表某个客户端。
+    ///
+    /// 需要单独一位而不能靠 `client_ip.is_none()` 推断：客户端 IP 也会因取不到而缺失，
+    /// 两种情况下该往哪些节点调度并不相同。
+    #[serde(default)]
+    pub internal: bool,
+}
+
+impl FlowContext {
+    /// 调度器自身发起的取件：没有客户端，能力取本进程 fetch 客户端的实际支持面。
+    pub fn internal() -> Self {
+        Self {
+            client_ip: None,
+            session_id: None,
+            extras: serde_json::json!({}),
+            capabilities: ClientCapabilities::internal_fetcher(),
+            internal: true,
+        }
+    }
 }
 
 /// 执行选项 - "如何访问"

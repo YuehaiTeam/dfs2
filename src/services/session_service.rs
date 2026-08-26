@@ -272,6 +272,7 @@ impl SessionService {
             session_id: Some(session_id.to_string()),
             extras: session.extras.clone(),
             capabilities,
+            internal: false,
         };
 
         // 6. 执行Flow（纯函数）

@@ -191,6 +191,8 @@ pub enum FlowCond {
     /// 取反内层条件的求值结果，包括"信息缺失"导致的 false（例如没有客户端 IP 时 `cnip` 恒为
     /// false，因而 `not cnip true` 恒为 true）。
     Not(Box<FlowCond>),
+    /// 本次取件是否由调度器自身发起。用来把只对真实客户端有意义的层与内部取件分开。
+    Internal(bool),
 }
 
 /// 取第 `index` 个空格分隔的词，缺失时给出带用法的错误。
@@ -220,6 +222,12 @@ impl FromStr for FlowCond {
                     .parse::<bool>()
                     .map_err(|e| e.to_string())?;
                 Ok(FlowCond::CnIp(value))
+            }
+            "internal" => {
+                let value = cond_arg(&parts, 1, "internal {true|false}")?
+                    .parse::<bool>()
+                    .map_err(|e| e.to_string())?;
+                Ok(FlowCond::Internal(value))
             }
             "ipversion" => {
                 let version = cond_arg(&parts, 1, "ipversion {4|6}")?
@@ -339,6 +347,7 @@ impl std::fmt::Display for FlowCond {
             }
             FlowCond::Time(comp, time) => write!(f, "time {comp} {time}"),
             FlowCond::Not(inner) => write!(f, "not {inner}"),
+            FlowCond::Internal(value) => write!(f, "internal {value}"),
         }
     }
 }
@@ -424,9 +433,22 @@ mod tests {
     }
 
     #[test]
+    fn internal_condition_round_trips() {
+        let cond: FlowCond = serde_yaml::from_str("internal true").unwrap();
+        assert!(matches!(cond, FlowCond::Internal(true)));
+        assert_eq!(cond.to_string(), "internal true");
+
+        let cond: FlowCond = serde_yaml::from_str("not internal true").unwrap();
+        assert_eq!(cond.to_string(), "not internal true");
+
+        assert!(serde_yaml::from_str::<FlowCond>("internal maybe").is_err());
+    }
+
+    #[test]
     fn truncated_conditions_are_errors_not_panics() {
         for text in [
             "cnip",
+            "internal",
             "ipversion",
             "cidr",
             "extras",

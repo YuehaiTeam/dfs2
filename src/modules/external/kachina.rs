@@ -183,12 +183,8 @@ pub async fn fetch_file_range(
         file_size: request_file_size,
     };
 
-    let context = FlowContext {
-        client_ip: None, // Kachina解析通常不需要客户端IP信息
-        session_id: None,
-        extras: serde_json::json!({}),
-        capabilities: Default::default(), // Internal usage, no client context
-    };
+    // 元数据解析由服务端自己取件，不代表任何客户端
+    let context = FlowContext::internal();
 
     let options = FlowOptions {
         cdn_full_range: false, // Kachina解析不使用全范围模式

@@ -89,6 +89,23 @@ pub struct ClientCapabilities {
     pub sftp: bool,
 }
 
+impl ClientCapabilities {
+    /// 本进程 fetch 客户端的能力面。
+    ///
+    /// 与 `Default`（全 false，表示"未从请求中识别出任何能力"）不同，这是一份确定的声明，
+    /// 取自 `FETCH_CLIENT` 实际挂载的 middleware：H3、SSH、SFTP 三者可用；
+    /// WebTransport 与 WebRTC 是浏览器侧协议，本进程作为客户端不具备。
+    pub fn internal_fetcher() -> Self {
+        Self {
+            h3: true,
+            wrtc: false,
+            wt: false,
+            ssh: true,
+            sftp: true,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Capability detection
 // ─────────────────────────────────────────────────────────────────────────────

@@ -342,6 +342,7 @@ async fn process_chunk_with_preloaded_data(
         session_id: Some(session_id.to_string()),
         extras: session.extras.clone(),
         capabilities,
+        internal: false,
     };
 
     let options = crate::models::FlowOptions {

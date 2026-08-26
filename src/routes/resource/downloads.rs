@@ -432,6 +432,7 @@ pub async fn handle_download_request_unified(
         session_id: original_session_id.clone(),
         extras,
         capabilities: compute_capabilities(h3_override.as_deref(), user_agent.as_deref()),
+        internal: false,
     };
 
     let options = crate::models::FlowOptions {
