@@ -1,8 +1,8 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ResourceConfig};
 use crate::container::FETCH_CLIENT;
 use crate::modules::storage::data_store::{CacheMetadata, DataStoreBackend};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{debug, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// 生成ETag（使用xxhash）
@@ -82,50 +82,43 @@ pub async fn should_cache_content(
     server_id: &str,
     full_path: &str,
 ) -> Option<(u64, u32)> {
-    println!(
-        "Checking cache for resource_id: {}, sub_path: {:?}, server_id: {}, full_path: {}",
-        resource_id, sub_path, server_id, full_path
-    );
-    // 检查资源是否启用缓存
     let resource = config.get_resource(resource_id)?;
-    if !resource.cache_enabled {
-        println!("Caching not enabled for resource_id: {}", resource_id);
+    if !cache_eligible(resource, sub_path) {
         return None;
     }
 
-    // 前缀资源检查子路径模式
-    if resource.resource_type == "prefix" {
-        let sub = sub_path?;
-        if !resource
-            .cache_subpaths
-            .iter()
-            .any(|pattern| glob_match(pattern, sub))
-        {
-            println!(
-                "Subpath {} does not match any cache patterns for resource_id: {}",
-                sub, resource_id
-            );
-            return None;
-        }
+    // 文件大小取自健康检查缓存，因此必须问将要供出内容的那个节点
+    if let Ok(Some(health_info)) = redis.get_health_info(server_id, full_path).await
+        && health_info.is_alive
+    {
+        return health_info
+            .file_size
+            .map(|size| (size, resource.cache_max_age));
     }
 
-    // 从健康检查缓存获取文件大小
-    if let Ok(Some(health_info)) = redis.get_health_info(server_id, full_path).await {
-        if health_info.is_alive {
-            println!(
-                "Health info found for server_id: {}, full_path: {}",
-                server_id, full_path
-            );
-            return health_info
-                .file_size
-                .map(|size| (size, resource.cache_max_age));
-        }
-    }
-    println!(
-        "No health info available for server_id: {}, full_path: {}",
+    debug!(
+        "No usable health info for server '{}' path '{}'; cannot decide cache eligibility by size",
         server_id, full_path
     );
     None
+}
+
+/// 该资源与子路径是否在缓存范围内。
+///
+/// 只看配置，不看文件大小，因此可以在选点之前先用它挡掉不缓存的路径。
+pub fn cache_eligible(resource: &ResourceConfig, sub_path: Option<&str>) -> bool {
+    if !resource.cache_enabled {
+        return false;
+    }
+    if resource.resource_type != "prefix" {
+        return true;
+    }
+    sub_path.is_some_and(|sub| {
+        resource
+            .cache_subpaths
+            .iter()
+            .any(|pattern| glob_match(pattern, sub))
+    })
 }
 
 /// 简单的glob模式匹配
@@ -185,6 +178,51 @@ mod tests {
 
         let round_trip = serde_json::to_string(&metadata).expect("serialize");
         assert!(!round_trip.contains("src"));
+    }
+
+    fn resource(cache_enabled: bool, resource_type: &str, subpaths: &[&str]) -> ResourceConfig {
+        ResourceConfig {
+            latest: "1.0.0".to_string(),
+            versions: std::collections::HashMap::new(),
+            tries: vec![],
+            server: vec![],
+            flow: vec![],
+            challenge: None,
+            download: crate::config::DownloadPolicy::Enabled,
+            resource_type: resource_type.to_string(),
+            cache_enabled,
+            cache_subpaths: subpaths.iter().map(|s| s.to_string()).collect(),
+            cache_max_age: 300,
+            legacy_client_support: false,
+            legacy_client_full_range: false,
+            changelog: None,
+            version_provider: None,
+            version_files: vec![],
+            version_file_split_ttl: 300,
+        }
+    }
+
+    #[test]
+    fn cache_eligibility_depends_only_on_configuration() {
+        // 普通资源：开关即结论，与子路径无关
+        assert!(cache_eligible(&resource(true, "file", &[]), None));
+        assert!(cache_eligible(&resource(true, "file", &[]), Some("a.json")));
+        assert!(!cache_eligible(&resource(false, "file", &[]), None));
+
+        // 前缀资源：必须有子路径且匹配某个模式
+        let prefix = resource(true, "prefix", &["*.json", "images/*"]);
+        assert!(cache_eligible(&prefix, Some("meta.json")));
+        assert!(cache_eligible(&prefix, Some("images/logo.png")));
+        assert!(!cache_eligible(&prefix, Some("bin/app.exe")));
+        assert!(!cache_eligible(&prefix, None));
+        assert!(!cache_eligible(
+            &resource(true, "prefix", &[]),
+            Some("meta.json")
+        ));
+        assert!(!cache_eligible(
+            &resource(false, "prefix", &["*"]),
+            Some("meta.json")
+        ));
     }
 
     #[test]

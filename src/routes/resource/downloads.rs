@@ -85,6 +85,110 @@ fn cached_response_headers(metadata: &CacheMetadata, status: CacheStatus) -> Hea
     headers
 }
 
+/// 可缓存内容的大小上限。超过这个大小的文件不进缓存，整份内容会驻留在数据存储里。
+const CACHE_MAX_BYTES: u64 = 256 * 1024;
+
+/// 为缓存回填单独调度一次取件。
+///
+/// 不复用发给客户端的那个 URL。它是按客户端的地理位置与传输能力选出来的，两处对不上：本进程
+/// 无法发起 `h3wt://`、`wrtc://` 这类协议，取件会直接失败；而即使协议可行，客户端在国内选中的
+/// 国内节点对海外的服务端也是反向绕行。回填内容会分发给此后所有客户端，取件方向应当由服务端
+/// 自身的位置决定。
+///
+/// 回填失败不影响本次请求：客户端已经拿到了自己的 URL，这里只是没写进缓存。
+#[allow(clippy::too_many_arguments)]
+async fn fill_cache_via_internal_fetch(
+    ctx: &AppContext,
+    config: &crate::config::AppConfig,
+    resid: &str,
+    version: &str,
+    path: &str,
+    sub_path: Option<&str>,
+    file_size: Option<u64>,
+    flow_list: &[crate::modules::flow::config::FlowItem],
+) -> Option<(CacheMetadata, Vec<u8>)> {
+    let resource = config.get_resource(resid)?;
+    if !crate::modules::storage::cache::cache_eligible(resource, sub_path) {
+        return None;
+    }
+
+    let target = crate::models::FlowTarget {
+        resource_id: resid.to_string(),
+        version: version.to_string(),
+        sub_path: sub_path.map(str::to_string),
+        // 缓存存的是整个文件，与客户端本次请求的区间无关
+        ranges: None,
+        file_size,
+    };
+    let context = crate::models::FlowContext::internal();
+    let options = crate::models::FlowOptions {
+        cdn_full_range: false,
+    };
+
+    let flow_result = match ctx
+        .flow_service
+        .execute_flow(
+            &target,
+            &context,
+            &options,
+            flow_list,
+            crate::models::FlowPenalties::default(),
+            None,
+        )
+        .await
+    {
+        Ok(flow_result) => flow_result,
+        Err(e) => {
+            warn!("Cache fill for {resid}/{path} found no usable server: {e}");
+            return None;
+        }
+    };
+
+    let Some(source_server) = flow_result.selected_server_id.as_deref() else {
+        warn!("Cache fill for {resid}/{path} produced a URL with no server attribution");
+        return None;
+    };
+
+    // 大小闸门要问将要供出内容的那个节点，而不是客户端选中的节点
+    let (fetch_size, max_age) = should_cache_content(
+        config,
+        &ctx.data_store,
+        resid,
+        sub_path,
+        source_server,
+        path,
+    )
+    .await?;
+
+    if fetch_size >= CACHE_MAX_BYTES {
+        debug!(
+            "Not caching {resid}/{path}: {fetch_size} bytes exceeds the {CACHE_MAX_BYTES}-byte limit"
+        );
+        return None;
+    }
+
+    match download_and_cache(
+        &flow_result.url,
+        resid,
+        version,
+        path,
+        &ctx.data_store,
+        max_age,
+        source_server,
+    )
+    .await
+    {
+        Ok(cached) => {
+            debug!("Cached {resid}/{path} ({fetch_size} bytes) from {source_server}");
+            Some(cached)
+        }
+        Err(e) => {
+            warn!("Cache fill for {resid}/{path} from {source_server} failed: {e}");
+            None
+        }
+    }
+}
+
 // 统一下载逻辑函数 - 合并原有的handle_download_request和handle_prefix_download_request
 pub async fn handle_download_request_unified(
     resid: String,
@@ -538,51 +642,20 @@ pub async fn handle_download_request_unified(
         }
     );
 
-    // 检查是否应该缓存
-    let cache_source_server = flow_result
-        .selected_server_id
-        .as_deref()
-        .unwrap_or("unknown");
-    let cached_result = if !is_version_file
-        && let Some((file_size, max_age)) = should_cache_content(
+    let cached_result = if is_version_file {
+        None
+    } else {
+        fill_cache_via_internal_fetch(
+            ctx,
             &config_guard,
-            &ctx.data_store,
             &resid,
-            sub_path.as_deref(), // 传入子路径用于模式匹配
-            cache_source_server,
+            &version,
             &path,
+            sub_path.as_deref(),
+            file_size,
+            flow_list,
         )
         .await
-    {
-        println!("File size from health info: {}", file_size);
-        if file_size < 256 * 1024 {
-            // 256KB限制
-            // 下载并缓存
-            println!(
-                "File size {} within 256KB cache limit, attempting to cache",
-                file_size
-            );
-            download_and_cache(
-                &cdn_url,
-                &resid,
-                &version,
-                &path,
-                &ctx.data_store,
-                max_age,
-                cache_source_server,
-            )
-            .await
-            .ok()
-        } else {
-            println!(
-                "File size {} exceeds 256KB cache limit, skipping cache",
-                file_size
-            );
-            None
-        }
-    } else {
-        println!("Not eligible for caching based on resource or subpath settings");
-        None
     };
 
     // 如果是 Free 模式，记录直接下载日志
