@@ -188,52 +188,72 @@ pub enum FlowCond {
     ServerBwMinutes(String, u32, FlowComp, Size), // 服务器分钟级流量限制：server_id, minutes, comp, size
     Time(FlowComp, chrono::NaiveTime),
     GeoIp(String), // geoip关键词匹配
+    /// 取反内层条件的求值结果，包括"信息缺失"导致的 false（例如没有客户端 IP 时 `cnip` 恒为
+    /// false，因而 `not cnip true` 恒为 true）。
+    Not(Box<FlowCond>),
 }
-impl<'de> Deserialize<'de> for FlowCond {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        // split by space, first is type
+
+/// 取第 `index` 个空格分隔的词，缺失时给出带用法的错误。
+fn cond_arg<'a>(parts: &[&'a str], index: usize, usage: &str) -> Result<&'a str, String> {
+    parts
+        .get(index)
+        .copied()
+        .ok_or_else(|| format!("condition requires format: {usage}"))
+}
+
+impl FromStr for FlowCond {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split_whitespace().collect();
-        let method = parts[0];
+        let method = *parts.first().ok_or_else(|| "empty condition".to_string())?;
         match method {
+            "not" => {
+                let inner = parts[1..].join(" ");
+                if inner.is_empty() {
+                    return Err("condition requires format: not {cond}".to_string());
+                }
+                Ok(FlowCond::Not(Box::new(FlowCond::from_str(&inner)?)))
+            }
             "cnip" => {
-                let value = parts[1].parse::<bool>().map_err(serde::de::Error::custom)?;
+                let value = cond_arg(&parts, 1, "cnip {true|false}")?
+                    .parse::<bool>()
+                    .map_err(|e| e.to_string())?;
                 Ok(FlowCond::CnIp(value))
             }
             "ipversion" => {
-                let version = parts[1].parse::<u8>().map_err(serde::de::Error::custom)?;
+                let version = cond_arg(&parts, 1, "ipversion {4|6}")?
+                    .parse::<u8>()
+                    .map_err(|e| e.to_string())?;
                 if version != 4 && version != 6 {
-                    return Err(serde::de::Error::custom("IP version must be 4 or 6"));
+                    return Err("IP version must be 4 or 6".to_string());
                 }
                 Ok(FlowCond::IpVersion(version))
             }
             "cidr" => {
-                let cidr = parts[1]
+                let cidr = cond_arg(&parts, 1, "cidr {cidr}")?
                     .parse::<cidr::IpCidr>()
-                    .map_err(serde::de::Error::custom)?;
+                    .map_err(|e| e.to_string())?;
                 Ok(FlowCond::Cidr(cidr))
             }
-            "extras" => {
-                let extras = parts[1].to_string();
-                Ok(FlowCond::Extras(extras))
-            }
-            "geoip" => {
-                let keyword = parts[1].to_string();
-                Ok(FlowCond::GeoIp(keyword))
-            }
+            "extras" => Ok(FlowCond::Extras(
+                cond_arg(&parts, 1, "extras {key}")?.to_string(),
+            )),
+            "geoip" => Ok(FlowCond::GeoIp(
+                cond_arg(&parts, 1, "geoip {keyword}")?.to_string(),
+            )),
             "size" => {
-                let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
-                let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
+                let usage = "size {comp} {size}";
+                let comp = FlowComp::from_str(cond_arg(&parts, 1, usage)?)?;
+                let size =
+                    Size::from_str(cond_arg(&parts, 2, usage)?).map_err(|e| e.to_string())?;
                 Ok(FlowCond::Size(comp, size))
             }
             "bw_daily" => {
                 if parts.len() == 3 {
                     // 旧格式：bw_daily <comp> <size> - 视为当前资源
-                    let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
-                    let size = Size::from_str(parts[2]).map_err(serde::de::Error::custom)?;
+                    let comp = FlowComp::from_str(parts[1])?;
+                    let size = Size::from_str(parts[2]).map_err(|e| e.to_string())?;
                     Ok(FlowCond::ResourceBwDaily(
                         ResourcePattern::Current,
                         comp,
@@ -246,46 +266,90 @@ impl<'de> Deserialize<'de> for FlowCond {
                         "$" => ResourcePattern::Current,
                         resource_id => ResourcePattern::Specific(resource_id.to_string()),
                     };
-                    let comp = FlowComp::from_str(parts[2]).map_err(serde::de::Error::custom)?;
-                    let size = Size::from_str(parts[3]).map_err(serde::de::Error::custom)?;
+                    let comp = FlowComp::from_str(parts[2])?;
+                    let size = Size::from_str(parts[3]).map_err(|e| e.to_string())?;
                     Ok(FlowCond::ResourceBwDaily(resource_pattern, comp, size))
                 } else {
-                    return Err(serde::de::Error::custom(
-                        "bw_daily requires format: bw_daily [resource] {comp} {size}",
-                    ));
+                    Err("condition requires format: bw_daily [resource] {comp} {size}".to_string())
                 }
             }
             "server_bw_daily" => {
                 if parts.len() != 4 {
-                    return Err(serde::de::Error::custom(
-                        "server_bw_daily requires format: server_bw_daily {server_id} {comp} {size}",
-                    ));
+                    return Err(
+                        "condition requires format: server_bw_daily {server_id} {comp} {size}"
+                            .to_string(),
+                    );
                 }
-                let server_id = parts[1].to_string();
-                let comp = FlowComp::from_str(parts[2]).map_err(serde::de::Error::custom)?;
-                let size = Size::from_str(parts[3]).map_err(serde::de::Error::custom)?;
-                Ok(FlowCond::ServerBwDaily(server_id, comp, size))
+                let comp = FlowComp::from_str(parts[2])?;
+                let size = Size::from_str(parts[3]).map_err(|e| e.to_string())?;
+                Ok(FlowCond::ServerBwDaily(parts[1].to_string(), comp, size))
             }
             "server_bw_minutes" => {
                 if parts.len() != 5 {
-                    return Err(serde::de::Error::custom(
-                        "server_bw_minutes requires format: server_bw_minutes {server_id} {minutes} {comp} {size}",
-                    ));
+                    return Err(
+                        "condition requires format: server_bw_minutes {server_id} {minutes} {comp} {size}"
+                            .to_string(),
+                    );
                 }
-                let server_id = parts[1].to_string();
-                let minutes = parts[2].parse::<u32>().map_err(serde::de::Error::custom)?;
-                let comp = FlowComp::from_str(parts[3]).map_err(serde::de::Error::custom)?;
-                let size = Size::from_str(parts[4]).map_err(serde::de::Error::custom)?;
-                Ok(FlowCond::ServerBwMinutes(server_id, minutes, comp, size))
+                let minutes = parts[2].parse::<u32>().map_err(|e| e.to_string())?;
+                let comp = FlowComp::from_str(parts[3])?;
+                let size = Size::from_str(parts[4]).map_err(|e| e.to_string())?;
+                Ok(FlowCond::ServerBwMinutes(
+                    parts[1].to_string(),
+                    minutes,
+                    comp,
+                    size,
+                ))
             }
             "time" => {
-                let comp = FlowComp::from_str(parts[1]).map_err(serde::de::Error::custom)?;
-                let time = chrono::NaiveTime::parse_from_str(parts[2], "%H:%M:%S")
-                    .map_err(serde::de::Error::custom)?;
+                let usage = "time {comp} {HH:MM:SS}";
+                let comp = FlowComp::from_str(cond_arg(&parts, 1, usage)?)?;
+                let time =
+                    chrono::NaiveTime::parse_from_str(cond_arg(&parts, 2, usage)?, "%H:%M:%S")
+                        .map_err(|e| e.to_string())?;
                 Ok(FlowCond::Time(comp, time))
             }
-            _ => Err(serde::de::Error::custom(format!("Invalid FlowCond: {s}"))),
+            _ => Err(format!("Invalid FlowCond: {s}")),
         }
+    }
+}
+
+impl std::fmt::Display for FlowCond {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlowCond::CnIp(value) => write!(f, "cnip {value}"),
+            FlowCond::IpVersion(version) => write!(f, "ipversion {version}"),
+            FlowCond::Cidr(cidr) => write!(f, "cidr {cidr}"),
+            FlowCond::Extras(extras) => write!(f, "extras {extras}"),
+            FlowCond::GeoIp(keyword) => write!(f, "geoip {keyword}"),
+            FlowCond::Size(comp, size) => write!(f, "size {comp} {size}"),
+            FlowCond::ResourceBwDaily(pattern, comp, size) => {
+                let pattern_str = match pattern {
+                    ResourcePattern::Global => "*",
+                    ResourcePattern::Current => "$",
+                    ResourcePattern::Specific(resource_id) => resource_id,
+                };
+                write!(f, "bw_daily {pattern_str} {comp} {size}")
+            }
+            FlowCond::ServerBwDaily(server_id, comp, size) => {
+                write!(f, "server_bw_daily {server_id} {comp} {size}")
+            }
+            FlowCond::ServerBwMinutes(server_id, minutes, comp, size) => {
+                write!(f, "server_bw_minutes {server_id} {minutes} {comp} {size}")
+            }
+            FlowCond::Time(comp, time) => write!(f, "time {comp} {time}"),
+            FlowCond::Not(inner) => write!(f, "not {inner}"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FlowCond {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        FlowCond::from_str(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -332,6 +396,49 @@ mod tests {
         assert!(
             matches!(use_plugin, FlowUse::Plugin { ref id, ref indirect } if id == "test_plugin" && indirect == "some_data")
         );
+    }
+
+    #[test]
+    fn not_wraps_any_condition_and_round_trips() {
+        let cond: FlowCond = serde_yaml::from_str("not cnip true").unwrap();
+        assert!(matches!(&cond, FlowCond::Not(inner) if matches!(**inner, FlowCond::CnIp(true))));
+        assert_eq!(cond.to_string(), "not cnip true");
+
+        // 多词条件的参数不能被 not 的切分吃掉。这里比对结构而非文本：
+        // Size 的 Display 会把 100MB 归一化为 95.4 MiB，与 not 无关。
+        let cond: FlowCond = serde_yaml::from_str("not size > 100MB").unwrap();
+        let FlowCond::Not(inner) = &cond else {
+            panic!("expected a negated condition, got {cond:?}");
+        };
+        assert!(
+            matches!(&**inner, FlowCond::Size(FlowComp::Gt, size) if size.bytes() == 100_000_000),
+            "expected size > 100MB inside the negation, got {inner:?}"
+        );
+
+        // 嵌套可解析，与单层等价的判断留给求值侧
+        let cond: FlowCond = serde_yaml::from_str("not not geoip telecom").unwrap();
+        assert_eq!(cond.to_string(), "not not geoip telecom");
+
+        assert!(serde_yaml::from_str::<FlowCond>("not").is_err());
+        assert!(serde_yaml::from_str::<FlowCond>("not bogus_cond").is_err());
+    }
+
+    #[test]
+    fn truncated_conditions_are_errors_not_panics() {
+        for text in [
+            "cnip",
+            "ipversion",
+            "cidr",
+            "extras",
+            "geoip",
+            "size >",
+            "time >=",
+        ] {
+            assert!(
+                serde_yaml::from_str::<FlowCond>(text).is_err(),
+                "'{text}' should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -406,31 +513,7 @@ impl Serialize for FlowCond {
     where
         S: serde::Serializer,
     {
-        match self {
-            FlowCond::CnIp(value) => serializer.serialize_str(&format!("cnip {value}")),
-            FlowCond::IpVersion(version) => {
-                serializer.serialize_str(&format!("ipversion {version}"))
-            }
-            FlowCond::Cidr(cidr) => serializer.serialize_str(&format!("cidr {cidr}")),
-            FlowCond::Extras(extras) => serializer.serialize_str(&format!("extras {extras}")),
-            FlowCond::GeoIp(keyword) => serializer.serialize_str(&format!("geoip {keyword}")),
-            FlowCond::Size(comp, size) => serializer.serialize_str(&format!("size {comp} {size}")),
-            FlowCond::ResourceBwDaily(pattern, comp, size) => {
-                let pattern_str = match pattern {
-                    ResourcePattern::Global => "*",
-                    ResourcePattern::Current => "$",
-                    ResourcePattern::Specific(resource_id) => resource_id,
-                };
-                serializer.serialize_str(&format!("bw_daily {pattern_str} {comp} {size}"))
-            }
-            FlowCond::ServerBwDaily(server_id, comp, size) => {
-                serializer.serialize_str(&format!("server_bw_daily {server_id} {comp} {size}"))
-            }
-            FlowCond::ServerBwMinutes(server_id, minutes, comp, size) => serializer.serialize_str(
-                &format!("server_bw_minutes {server_id} {minutes} {comp} {size}"),
-            ),
-            FlowCond::Time(comp, time) => serializer.serialize_str(&format!("time {comp} {time}")),
-        }
+        serializer.serialize_str(&self.to_string())
     }
 }
 

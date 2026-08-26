@@ -561,6 +561,13 @@ impl FlowService {
                     FlowComp::Le => current_time <= *expected_time,
                 })
             }
+            FlowCond::Not(inner) => {
+                // 取反的是内层的求值结果，不是"内层为真的补集"：内层因信息缺失而为 false 时，
+                // 取反给出 true。判定失败（Err）不参与取反，照原样上抛。
+                let inner_result =
+                    Box::pin(self.evaluate_condition(inner, target, context)).await?;
+                Ok(!inner_result)
+            }
         }
     }
 
@@ -930,6 +937,60 @@ mod tests {
     async fn create_test_flow_service() -> FlowService {
         let env = TestEnvironment::new().await;
         env.services.flow_service
+    }
+
+    /// `not` 取反的是内层的求值结果。这与"内层为真的补集"在信息缺失时不同：
+    /// 没有客户端 IP 时 `cnip true` 与 `cnip false` 同为 false，`not` 把两者都翻成 true。
+    #[tokio::test]
+    async fn not_inverts_the_evaluated_result_including_missing_information() {
+        let service = create_test_flow_service().await;
+        let (target, mut context, _options) = create_test_context();
+
+        context.client_ip = Some("8.8.8.8".parse().unwrap());
+        let inner = FlowCond::CnIp(false);
+        let inner_result = service
+            .evaluate_condition(&inner, &target, &context)
+            .await
+            .expect("inner condition evaluates");
+        let negated = service
+            .evaluate_condition(&FlowCond::Not(Box::new(inner)), &target, &context)
+            .await
+            .expect("negated condition evaluates");
+        assert_eq!(negated, !inner_result);
+
+        // 无 IP 时两个方向都为 false，取反后都为 true
+        context.client_ip = None;
+        for expected_is_cn in [true, false] {
+            assert!(
+                !service
+                    .evaluate_condition(&FlowCond::CnIp(expected_is_cn), &target, &context)
+                    .await
+                    .expect("cnip evaluates without an IP"),
+                "cnip {expected_is_cn} should be false without a client IP"
+            );
+            assert!(
+                service
+                    .evaluate_condition(
+                        &FlowCond::Not(Box::new(FlowCond::CnIp(expected_is_cn))),
+                        &target,
+                        &context
+                    )
+                    .await
+                    .expect("negated cnip evaluates without an IP"),
+                "not cnip {expected_is_cn} is true without a client IP"
+            );
+        }
+
+        // 嵌套取反回到原值
+        context.client_ip = Some("8.8.8.8".parse().unwrap());
+        let double = FlowCond::Not(Box::new(FlowCond::Not(Box::new(FlowCond::CnIp(false)))));
+        assert_eq!(
+            service
+                .evaluate_condition(&double, &target, &context)
+                .await
+                .expect("nested negation evaluates"),
+            inner_result
+        );
     }
 
     #[tokio::test]
