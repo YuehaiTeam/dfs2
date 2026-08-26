@@ -170,6 +170,10 @@ pub struct FlowResult {
     pub url: String, // 主要返回值：最终URL
     pub selected_server_id: Option<String>,
     pub selected_server_weight: Option<u32>,
+    /// 选中的节点来自哪一层。发生降级时它大于最优先层的序号。
+    ///
+    /// 插件在管道中途 `poolize` 选出的节点无法归属到层，此时为 `None`。
+    pub selected_tier: Option<u32>,
     pub plugin_server_mapping: HashMap<String, (Option<String>, bool)>, // 插件元数据映射
 }
 

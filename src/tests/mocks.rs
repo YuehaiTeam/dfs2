@@ -853,6 +853,7 @@ pub fn create_default_test_config() -> AppConfig {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         }],
         challenge: None,
         download: DownloadPolicy::Enabled,
@@ -892,6 +893,7 @@ pub fn create_default_test_config() -> AppConfig {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         }],
         challenge: None,
         download: DownloadPolicy::Enabled,
@@ -937,6 +939,7 @@ pub fn create_default_test_config() -> AppConfig {
                 },
             ],
             r#break: false,
+            tier: 0,
         }],
         challenge: None,
         download: DownloadPolicy::Free,
@@ -973,6 +976,7 @@ pub fn create_default_test_config() -> AppConfig {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         }],
         challenge: None,
         download: DownloadPolicy::Free,
@@ -1010,6 +1014,7 @@ pub fn create_default_test_config() -> AppConfig {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         }],
         challenge: Some(crate::config::ChallengeConfig {
             challenge_type: "md5".to_string(),
@@ -1053,6 +1058,7 @@ pub fn create_default_test_config() -> AppConfig {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         }],
         challenge: Some(crate::config::ChallengeConfig {
             challenge_type: "sha256".to_string(),
@@ -1096,6 +1102,7 @@ pub fn create_default_test_config() -> AppConfig {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         }],
         challenge: Some(crate::config::ChallengeConfig {
             challenge_type: "web".to_string(),
@@ -1139,6 +1146,7 @@ pub fn create_default_test_config() -> AppConfig {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         }],
         challenge: Some(crate::config::ChallengeConfig {
             challenge_type: "md5".to_string(),

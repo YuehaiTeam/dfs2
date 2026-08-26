@@ -622,7 +622,7 @@ pub async fn handle_download_request_unified(
     let cdn_url = flow_result.url;
 
     info!(
-        "{} size={:.2}MB -> {} weight={} ip={} geo={}",
+        "{} size={:.2}MB -> {} weight={} tier={} ip={} geo={}",
         resource_path,
         file_size_mb,
         flow_result
@@ -630,6 +630,9 @@ pub async fn handle_download_request_unified(
             .as_deref()
             .unwrap_or("unknown"),
         flow_result.selected_server_weight.unwrap_or(0),
+        flow_result
+            .selected_tier
+            .map_or_else(|| "unknown".to_string(), |tier| tier.to_string()),
         if let Some(ip) = client_ip {
             ip.to_string()
         } else {

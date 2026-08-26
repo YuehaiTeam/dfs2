@@ -18,7 +18,17 @@ use crate::{
 };
 use rand::Rng;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// 一次选点的结果，含选自哪一层。
+///
+/// 层信息只随结果返回，不进池子：池条目的形状 `(名字, 权重)` 会原样序列化给插件。
+#[derive(Debug, Clone)]
+struct Poolized {
+    server_id: String,
+    weight: u32,
+    tier: u32,
+}
 
 #[derive(Clone)]
 pub struct FlowService {
@@ -68,8 +78,8 @@ impl FlowService {
     ) -> DfsResult<FlowResult> {
         let mut server_pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
+        let mut selection: Option<Poolized> = None;
 
         // 执行Flow pipeline
         for item in flow_items {
@@ -83,8 +93,8 @@ impl FlowService {
                     session,
                     &mut plugin_server_mapping,
                     &penalties,
-                    &mut selected_server_id,
-                    &mut selected_server_weight,
+                    &mut selection,
+                    &mut tier_mapping,
                 )
                 .await?;
 
@@ -97,7 +107,7 @@ impl FlowService {
         if server_pool.len() > 1
             || (server_pool.len() == 1 && !server_pool[0].0.starts_with("http"))
         {
-            if let Some((server_id, weight)) = self
+            if let Some(poolized) = self
                 .poolize_from_pool(
                     &mut server_pool,
                     target,
@@ -105,11 +115,11 @@ impl FlowService {
                     options,
                     &plugin_server_mapping,
                     &penalties,
+                    &tier_mapping,
                 )
                 .await?
             {
-                selected_server_id = Some(server_id);
-                selected_server_weight = Some(weight);
+                selection = Some(poolized);
             }
         }
 
@@ -119,10 +129,12 @@ impl FlowService {
 
         // Post-pipeline URL rewrite: catch plugin literal URLs
         let mut final_url = server_pool[0].0.clone();
-        if let Some(ref server_id) = selected_server_id {
+        if let Some(selected) = &selection {
             let config = self.shared_config.load();
-            if let Some(server_config) = config.servers.get(server_id) {
-                let health_info = self.get_health_info_for_server(server_id, target).await;
+            if let Some(server_config) = config.servers.get(&selected.server_id) {
+                let health_info = self
+                    .get_health_info_for_server(&selected.server_id, target)
+                    .await;
                 final_url = capabilities::rewrite_url(
                     &final_url,
                     server_config,
@@ -134,8 +146,9 @@ impl FlowService {
 
         Ok(FlowResult {
             url: final_url,
-            selected_server_id,
-            selected_server_weight,
+            selected_server_id: selection.as_ref().map(|s| s.server_id.clone()),
+            selected_server_weight: selection.as_ref().map(|s| s.weight),
+            selected_tier: selection.as_ref().map(|s| s.tier),
             plugin_server_mapping,
         })
     }
@@ -151,8 +164,8 @@ impl FlowService {
         session: Option<&crate::models::Session>,
         plugin_server_mapping: &mut HashMap<String, (Option<String>, bool)>,
         penalties: &FlowPenalties,
-        selected_server_id: &mut Option<String>,
-        selected_server_weight: &mut Option<u32>,
+        selection: &mut Option<Poolized>,
+        tier_mapping: &mut HashMap<String, u32>,
     ) -> DfsResult<bool> {
         // 评估规则
         let should_exec = if !item.rules.is_empty() {
@@ -227,6 +240,7 @@ impl FlowService {
                             }
                         }
 
+                        Self::record_pool_entry_tier(tier_mapping, id, item.tier);
                         pool.push((id.clone(), *weight));
                     }
                     FlowUse::Plugin { id, indirect } => {
@@ -296,9 +310,14 @@ impl FlowService {
                                 true
                             });
                         }
+
+                        // 插件可以整体替换池子，因此按"尚未归属"补记而不是记录新增项
+                        for (name, _) in pool.iter() {
+                            Self::record_pool_entry_tier(tier_mapping, name, item.tier);
+                        }
                     }
                     FlowUse::Poolize => {
-                        if let Some((server_id, weight)) = self
+                        if let Some(poolized) = self
                             .poolize_from_pool(
                                 pool,
                                 target,
@@ -306,12 +325,11 @@ impl FlowService {
                                 options,
                                 plugin_server_mapping,
                                 penalties,
+                                tier_mapping,
                             )
                             .await?
                         {
-                            // Poolize成功，保存服务器选择信息
-                            *selected_server_id = Some(server_id);
-                            *selected_server_weight = Some(weight);
+                            *selection = Some(poolized);
                         }
                     }
                 }
@@ -325,6 +343,9 @@ impl FlowService {
     }
 
     /// 从pool中选择服务器并生成URL（不涉及CDN记录）
+    ///
+    /// 按层从最优先向下尝试：只有一层内所有节点都不可用（权重全零、健康检查失败）时才降到
+    /// 下一层。层内的取舍仍是加权随机，权重因此只表达同层内的流量配比。
     async fn poolize_from_pool(
         &self,
         pool: &mut Vec<(String, u32)>,
@@ -333,42 +354,101 @@ impl FlowService {
         options: &FlowOptions,
         plugin_server_mapping: &HashMap<String, (Option<String>, bool)>,
         penalties: &FlowPenalties,
-    ) -> DfsResult<Option<(String, u32)>> {
+        tier_mapping: &HashMap<String, u32>,
+    ) -> DfsResult<Option<Poolized>> {
         pool.retain(|(name, _)| {
             let server_id = Self::pool_entry_server_id(name, plugin_server_mapping);
             !penalties.banned.iter().any(|banned| banned == server_id)
         });
         self.apply_penalty_to_pool(pool, &penalties.demoted, plugin_server_mapping);
 
-        // 权重随机选择
-        let selected_server = self.weighted_random_selection(pool)?;
+        let mut tiers: Vec<u32> = pool
+            .iter()
+            .map(|(name, _)| Self::pool_entry_tier(name, tier_mapping))
+            .collect();
+        tiers.sort_unstable();
+        tiers.dedup();
 
-        // 健康检查
-        if self.is_server_healthy(&selected_server, target).await? {
-            // 生成URL
-            let url = self
-                .generate_server_url(&selected_server, target, context, options)
-                .await?;
-            pool.clear();
-            pool.push((url, selected_server.1));
-            Ok(Some(selected_server))
-        } else {
-            // 服务器不健康，从pool中移除并重试
-            pool.retain(|x| x.0 != selected_server.0);
-            if !pool.is_empty() {
-                Box::pin(self.poolize_from_pool(
-                    pool,
-                    target,
-                    context,
-                    options,
-                    plugin_server_mapping,
-                    penalties,
-                ))
-                .await
-            } else {
-                Ok(None)
+        for tier in &tiers {
+            let mut tier_pool: Vec<(String, u32)> = pool
+                .iter()
+                .filter(|(name, _)| Self::pool_entry_tier(name, tier_mapping) == *tier)
+                .cloned()
+                .collect();
+
+            if let Some((server_id, weight)) = self
+                .select_healthy_from_pool(&mut tier_pool, target, context, options)
+                .await?
+            {
+                debug!(server = %server_id, tier, "Selected server from tier");
+                // tier_pool 此时只剩最终 URL，由它替换整个池子
+                *pool = tier_pool;
+                return Ok(Some(Poolized {
+                    server_id,
+                    weight,
+                    tier: *tier,
+                }));
             }
+
+            // 降级本身值得注意：它意味着一整层当前没有可用节点
+            warn!(
+                "Tier {} has no usable server; falling through (tiers in pool: {:?})",
+                tier, tiers
+            );
         }
+
+        // 调用方以空池判定 NO_RES_AVAILABLE，池里若留着未解析的节点名会被当成 URL 返回
+        pool.clear();
+        Ok(None)
+    }
+
+    /// 在给定池子内做加权随机并健康检查，不健康的节点就地剔除后重试。
+    ///
+    /// 成功时池子被换成只含最终 URL 的单条目；失败时池子为空。
+    async fn select_healthy_from_pool(
+        &self,
+        pool: &mut Vec<(String, u32)>,
+        target: &FlowTarget,
+        context: &FlowContext,
+        options: &FlowOptions,
+    ) -> DfsResult<Option<(String, u32)>> {
+        while !pool.is_empty() {
+            let selected_server = match self.weighted_random_selection(pool) {
+                Ok(selected) => selected,
+                Err(e) => {
+                    // 权重全零属于配置意图（整层禁用），不是错误
+                    debug!("No selectable server in this tier: {}", e);
+                    pool.clear();
+                    return Ok(None);
+                }
+            };
+
+            if self.is_server_healthy(&selected_server, target).await? {
+                let url = self
+                    .generate_server_url(&selected_server, target, context, options)
+                    .await?;
+                pool.clear();
+                pool.push((url, selected_server.1));
+                return Ok(Some(selected_server));
+            }
+
+            pool.retain(|x| x.0 != selected_server.0);
+        }
+
+        Ok(None)
+    }
+
+    /// 池条目所属的层，未记录的条目视为最优先层
+    fn pool_entry_tier(name: &str, tier_mapping: &HashMap<String, u32>) -> u32 {
+        tier_mapping.get(name).copied().unwrap_or(0)
+    }
+
+    /// 记录池条目的层。同一条目被多层引用时以最优先的那层为准。
+    fn record_pool_entry_tier(tier_mapping: &mut HashMap<String, u32>, name: &str, tier: u32) {
+        tier_mapping
+            .entry(name.to_string())
+            .and_modify(|existing| *existing = (*existing).min(tier))
+            .or_insert(tier);
     }
 
     /// 评估Flow规则（只使用必要的参数）
@@ -2025,8 +2105,8 @@ mod tests {
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let (target, _client_context, options) = create_test_context();
         let context = FlowContext::internal();
@@ -2042,6 +2122,7 @@ mod tests {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         };
 
         service
@@ -2054,8 +2135,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .expect("flow item executes for an internal fetch");
@@ -2104,8 +2185,8 @@ mod tests {
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let (target, mut context, options) = create_test_context();
         context.capabilities.h3 = false;
@@ -2119,6 +2200,7 @@ mod tests {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         };
 
         let _should_break = service
@@ -2131,8 +2213,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .unwrap();
@@ -2151,8 +2233,8 @@ mod tests {
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let (target, mut context, options) = create_test_context();
         context.capabilities.h3 = true;
@@ -2165,6 +2247,7 @@ mod tests {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         };
 
         let _should_break = service
@@ -2177,8 +2260,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .unwrap();
@@ -2200,8 +2283,8 @@ mod tests {
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let (target, mut context, options) = create_test_context();
         context.capabilities.h3 = false;
@@ -2214,6 +2297,7 @@ mod tests {
                 weight: 5,
             }],
             r#break: false,
+            tier: 0,
         };
 
         let _should_break = service
@@ -2226,8 +2310,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .unwrap();
@@ -2248,8 +2332,8 @@ mod tests {
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let (target, mut context, options) = create_test_context();
         context.capabilities.h3 = false;
@@ -2269,6 +2353,7 @@ mod tests {
                 },
             ],
             r#break: false,
+            tier: 0,
         };
 
         let _should_break = service
@@ -2281,8 +2366,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .unwrap();
@@ -2310,8 +2395,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .unwrap();
@@ -2332,8 +2417,8 @@ mod tests {
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let (target, mut context, options) = create_test_context();
         context.capabilities.h3 = true;
@@ -2358,6 +2443,7 @@ mod tests {
                 },
             ],
             r#break: false,
+            tier: 0,
         };
 
         let _should_break = service
@@ -2370,8 +2456,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &penalties,
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .unwrap();
@@ -2391,8 +2477,8 @@ mod tests {
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let (target, mut context, options) = create_test_context();
         context.capabilities.h3 = false;
@@ -2405,6 +2491,7 @@ mod tests {
                 weight: 7,
             }],
             r#break: false,
+            tier: 0,
         };
 
         let _should_break = service
@@ -2417,8 +2504,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .unwrap();
@@ -2450,6 +2537,7 @@ mod tests {
                 weight: 10,
             }],
             r#break: true,
+            tier: 0,
         };
         let fallback_item = FlowItem {
             rules: vec![],
@@ -2459,12 +2547,13 @@ mod tests {
                 weight: 5,
             }],
             r#break: false,
+            tier: 0,
         };
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let should_break = service
             .execute_flow_item(
@@ -2476,8 +2565,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .expect("flow item executes");
@@ -2503,8 +2592,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .expect("flow item executes");
@@ -2525,13 +2614,113 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .expect("flow item executes");
         assert!(!should_break);
         assert_eq!(pool, vec![("test_server_1".to_string(), 5)]);
+    }
+
+    /// 同层内权重仍然只表达流量配比，不表达优先级。
+    #[tokio::test]
+    async fn weights_within_a_tier_still_split_traffic() {
+        let service = create_h3_test_flow_service().await;
+        let (target, mut context, options) = create_test_context();
+        context.capabilities.h3 = true;
+
+        let mut pool = Vec::new();
+        let mut plugin_server_mapping = HashMap::new();
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
+
+        let item = FlowItem {
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec![
+                FlowUse::Server {
+                    id: "normal_server".to_string(),
+                    weight: 3,
+                },
+                FlowUse::Server {
+                    id: "h3_server".to_string(),
+                    weight: 7,
+                },
+            ],
+            r#break: false,
+            tier: 2,
+        };
+
+        service
+            .execute_flow_item(
+                &mut pool,
+                &item,
+                &target,
+                &context,
+                &options,
+                None,
+                &mut plugin_server_mapping,
+                &FlowPenalties::default(),
+                &mut selection,
+                &mut tier_mapping,
+            )
+            .await
+            .expect("flow item executes");
+
+        // 同一项贡献的节点同层，权重原样保留
+        assert_eq!(
+            pool,
+            vec![
+                ("normal_server".to_string(), 3),
+                ("h3_server".to_string(), 7)
+            ]
+        );
+        assert_eq!(tier_mapping.get("normal_server"), Some(&2));
+        assert_eq!(tier_mapping.get("h3_server"), Some(&2));
+    }
+
+    /// 同一节点被多层引用时按最优先的那层处理，否则层归属取决于配置书写顺序。
+    #[tokio::test]
+    async fn a_server_referenced_by_several_tiers_takes_the_highest() {
+        let service = create_h3_test_flow_service().await;
+        let (target, mut context, options) = create_test_context();
+        context.capabilities.h3 = true;
+
+        let mut pool = Vec::new();
+        let mut plugin_server_mapping = HashMap::new();
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
+
+        for tier in [3, 1, 4] {
+            let item = FlowItem {
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![FlowUse::Server {
+                    id: "normal_server".to_string(),
+                    weight: 5,
+                }],
+                r#break: false,
+                tier,
+            };
+            service
+                .execute_flow_item(
+                    &mut pool,
+                    &item,
+                    &target,
+                    &context,
+                    &options,
+                    None,
+                    &mut plugin_server_mapping,
+                    &FlowPenalties::default(),
+                    &mut selection,
+                    &mut tier_mapping,
+                )
+                .await
+                .expect("flow item executes");
+        }
+
+        assert_eq!(tier_mapping.get("normal_server"), Some(&1));
     }
 
     /// `break` 与 `continue` 作为命令，位置决定它们截断到哪里。
@@ -2561,12 +2750,13 @@ mod tests {
                     },
                 ],
                 r#break: false,
+                tier: 0,
             };
 
             let mut pool = Vec::new();
             let mut plugin_server_mapping = HashMap::new();
-            let mut selected_server_id = None;
-            let mut selected_server_weight = None;
+            let mut selection: Option<Poolized> = None;
+            let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
             let should_break = service
                 .execute_flow_item(
@@ -2578,8 +2768,8 @@ mod tests {
                     None,
                     &mut plugin_server_mapping,
                     &FlowPenalties::default(),
-                    &mut selected_server_id,
-                    &mut selected_server_weight,
+                    &mut selection,
+                    &mut tier_mapping,
                 )
                 .await
                 .expect("flow item executes");
@@ -2605,12 +2795,13 @@ mod tests {
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Break],
             r#break: false,
+            tier: 0,
         };
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let should_break = service
             .execute_flow_item(
@@ -2622,8 +2813,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &FlowPenalties::default(),
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .expect("flow item executes");
@@ -2640,8 +2831,8 @@ mod tests {
 
         let mut pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
-        let mut selected_server_id = None;
-        let mut selected_server_weight = None;
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
         let (target, mut context, options) = create_test_context();
         context.capabilities.h3 = true;
         let penalties = FlowPenalties {
@@ -2662,6 +2853,7 @@ mod tests {
                 },
             ],
             r#break: false,
+            tier: 0,
         };
 
         service
@@ -2674,8 +2866,8 @@ mod tests {
                 None,
                 &mut plugin_server_mapping,
                 &penalties,
-                &mut selected_server_id,
-                &mut selected_server_weight,
+                &mut selection,
+                &mut tier_mapping,
             )
             .await
             .unwrap();
@@ -2970,6 +3162,7 @@ mod tests {
                     weight: 10,
                 }],
                 r#break: false,
+                tier: 0,
             }],
             challenge: None,
             download: DownloadPolicy::Free,
@@ -3010,6 +3203,7 @@ mod tests {
                     },
                 ],
                 r#break: false,
+                tier: 0,
             }],
             challenge: None,
             download: DownloadPolicy::Free,
@@ -3034,6 +3228,239 @@ mod tests {
             .insert("mixed_app".to_string(), mixed_resource);
 
         config
+    }
+
+    const TIER_TEST_PATH: &str = "/files/tier.bin";
+
+    /// 分层选点用的配置：两个普通 direct 节点，节点可用性完全由健康缓存决定，
+    /// 因此测试不必接触网络。
+    fn create_tier_integration_config() -> crate::config::AppConfig {
+        use crate::config::{DownloadPolicy, ResourceConfig, ServerConfig};
+
+        let mut config = crate::tests::mocks::create_default_test_config();
+
+        for id in ["tier_primary", "tier_backup"] {
+            config.servers.insert(
+                id.to_string(),
+                ServerConfig {
+                    id: id.to_string(),
+                    r#type: "direct".to_string(),
+                    url: format!("https://{id}.example.com"),
+                    h3_only: false,
+                    cert_hash: None,
+                    ..Default::default()
+                },
+            );
+            if let Some(server_config) = config.servers.get(id)
+                && let Ok(server_impl) = crate::modules::server::ServerImpl::new(server_config)
+            {
+                config.server_impl.insert(id.to_string(), server_impl);
+            }
+        }
+
+        let mut resource = ResourceConfig {
+            latest: "1.0.0".to_string(),
+            versions: HashMap::new(),
+            tries: vec![],
+            server: vec![],
+            flow: vec![],
+            challenge: None,
+            download: DownloadPolicy::Free,
+            resource_type: "file".to_string(),
+            cache_enabled: false,
+            cache_subpaths: vec![],
+            cache_max_age: 300,
+            legacy_client_support: false,
+            legacy_client_full_range: false,
+            changelog: None,
+            version_provider: None,
+            version_files: vec![],
+            version_file_split_ttl: 300,
+        };
+        let mut versions = HashMap::new();
+        versions.insert("default".to_string(), TIER_TEST_PATH.to_string());
+        resource.versions.insert("1.0.0".to_string(), versions);
+        config.resources.insert("tier_app".to_string(), resource);
+
+        config
+    }
+
+    async fn set_tier_server_alive(env: &TestEnvironment, server_id: &str, is_alive: bool) {
+        let health = HealthInfo {
+            is_alive,
+            file_size: Some(1024),
+            last_check: chrono::Utc::now().timestamp() as u64,
+            observed_cert_hash: None,
+            content_hash: None,
+        };
+        env.data_store
+            .set_health_info(server_id, TIER_TEST_PATH, &health)
+            .await
+            .expect("seed health info");
+    }
+
+    fn tier_flow_target() -> FlowTarget {
+        FlowTarget {
+            resource_id: "tier_app".to_string(),
+            version: "1.0.0".to_string(),
+            file_size: Some(1024),
+            sub_path: None,
+            ranges: None,
+        }
+    }
+
+    fn tier_flow_items() -> Vec<FlowItem> {
+        vec![
+            FlowItem {
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![FlowUse::Server {
+                    id: "tier_primary".to_string(),
+                    weight: 5,
+                }],
+                r#break: false,
+                tier: 0,
+            },
+            FlowItem {
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![FlowUse::Server {
+                    id: "tier_backup".to_string(),
+                    weight: 100,
+                }],
+                r#break: false,
+                tier: 1,
+            },
+        ]
+    }
+
+    /// 优先层可用时不降级，即使低优先层权重高出 20 倍——这正是权重做不到的那件事。
+    #[tokio::test]
+    async fn a_usable_top_tier_is_never_bypassed_by_a_heavier_lower_tier() {
+        let env = TestEnvironment::with_config(create_tier_integration_config()).await;
+        set_tier_server_alive(&env, "tier_primary", true).await;
+        set_tier_server_alive(&env, "tier_backup", true).await;
+
+        let service = env.services.flow_service.clone();
+        let (_unused_target, context, options) = create_test_context();
+        let target = tier_flow_target();
+        let flow_items = tier_flow_items();
+
+        for _ in 0..30 {
+            let result = service
+                .execute_flow(
+                    &target,
+                    &context,
+                    &options,
+                    &flow_items,
+                    FlowPenalties::default(),
+                    None,
+                )
+                .await
+                .expect("top tier is healthy");
+            assert_eq!(
+                result.selected_server_id.as_deref(),
+                Some("tier_primary"),
+                "a usable top tier must not fall through"
+            );
+            assert_eq!(result.selected_tier, Some(0));
+        }
+    }
+
+    /// 优先层内节点全部不可用时降到下一层。
+    #[tokio::test]
+    async fn an_exhausted_tier_falls_through_to_the_next() {
+        let env = TestEnvironment::with_config(create_tier_integration_config()).await;
+        set_tier_server_alive(&env, "tier_primary", false).await;
+        set_tier_server_alive(&env, "tier_backup", true).await;
+
+        let service = env.services.flow_service.clone();
+        let (_unused_target, context, options) = create_test_context();
+
+        let result = service
+            .execute_flow(
+                &tier_flow_target(),
+                &context,
+                &options,
+                &tier_flow_items(),
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect("tier 1 is healthy");
+
+        assert_eq!(result.selected_server_id.as_deref(), Some("tier_backup"));
+        assert_eq!(result.selected_tier, Some(1));
+    }
+
+    /// 所有层都无可用节点时报 NO_RES_AVAILABLE，而不是把节点名当 URL 返回。
+    #[tokio::test]
+    async fn all_tiers_exhausted_reports_no_resource() {
+        let env = TestEnvironment::with_config(create_tier_integration_config()).await;
+        set_tier_server_alive(&env, "tier_primary", false).await;
+        set_tier_server_alive(&env, "tier_backup", false).await;
+
+        let service = env.services.flow_service.clone();
+        let (_unused_target, context, options) = create_test_context();
+
+        let error = service
+            .execute_flow(
+                &tier_flow_target(),
+                &context,
+                &options,
+                &tier_flow_items(),
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect_err("no tier has a healthy server");
+
+        assert!(
+            format!("{error:?}").contains("NO_RES_AVAILABLE"),
+            "expected NO_RES_AVAILABLE, got {error:?}"
+        );
+    }
+
+    /// 不写 tier 的配置全部落在同一层，两个分开书写的节点仍然按权重竞争。
+    #[tokio::test]
+    async fn items_without_tiers_compete_in_one_tier() {
+        let env = TestEnvironment::with_config(create_tier_integration_config()).await;
+        set_tier_server_alive(&env, "tier_primary", true).await;
+        set_tier_server_alive(&env, "tier_backup", true).await;
+
+        let service = env.services.flow_service.clone();
+        let (_unused_target, context, options) = create_test_context();
+        let target = tier_flow_target();
+
+        let flow_items: Vec<FlowItem> = tier_flow_items()
+            .into_iter()
+            .map(|item| FlowItem { tier: 0, ..item })
+            .collect();
+
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..80 {
+            let result = service
+                .execute_flow(
+                    &target,
+                    &context,
+                    &options,
+                    &flow_items,
+                    FlowPenalties::default(),
+                    None,
+                )
+                .await
+                .expect("one tier with two healthy servers selects");
+            assert_eq!(result.selected_tier, Some(0));
+            if let Some(id) = result.selected_server_id {
+                seen.insert(id);
+            }
+        }
+
+        assert_eq!(
+            seen.len(),
+            2,
+            "servers in separate items without tiers must compete together, saw {seen:?}"
+        );
     }
 
     #[tokio::test]
@@ -3069,6 +3496,7 @@ mod tests {
                 weight: 10,
             }],
             r#break: false,
+            tier: 0,
         }];
         let result = service
             .execute_flow(
@@ -3141,6 +3569,7 @@ mod tests {
                 },
             ],
             r#break: false,
+            tier: 0,
         }];
         let result = service
             .execute_flow(

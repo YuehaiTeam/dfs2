@@ -576,4 +576,10 @@ pub struct FlowItem {
     pub r#use: Vec<FlowUse>,
     #[serde(default)]
     pub rules: Vec<FlowCond>,
+    /// 本项贡献的节点属于哪一层，数字越小越优先。
+    ///
+    /// 选点先在最优先的层内做加权随机，只有该层内所有节点都不可用时才降到下一层。缺省 0，
+    /// 因此不写 tier 的配置全部落在同一层，行为与分层引入前一致。
+    #[serde(default)]
+    pub tier: u32,
 }
