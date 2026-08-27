@@ -3432,9 +3432,23 @@ mod tests {
         let (_unused_target, context, options) = create_test_context();
         let target = tier_flow_target();
 
+        // 等权而非沿用 tier_flow_items 的 5 对 100：那个悬殊权重下弱者每轮只有 4.8% 的机会，
+        // 80 轮全部落空的概率约 2%，测试会偶发失败。同层竞争与权重配比是两件事，后者由
+        // weights_within_a_tier_still_split_traffic 覆盖。
         let flow_items: Vec<FlowItem> = tier_flow_items()
             .into_iter()
-            .map(|item| FlowItem { tier: 0, ..item })
+            .map(|item| FlowItem {
+                tier: 0,
+                r#use: item
+                    .r#use
+                    .into_iter()
+                    .map(|operation| match operation {
+                        FlowUse::Server { id, .. } => FlowUse::Server { id, weight: 10 },
+                        other => other,
+                    })
+                    .collect(),
+                ..item
+            })
             .collect();
 
         let mut seen = std::collections::HashSet::new();
