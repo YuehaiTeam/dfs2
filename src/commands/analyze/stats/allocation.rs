@@ -65,13 +65,9 @@ fn collect_chunk_data(sessions: &[SessionLog]) -> Vec<ChunkData> {
                 if let (Some(server_id), Some(size), Some(time)) =
                     (&cdn_record.srv, cdn_record.size, cdn_record.time)
                 {
-                    // Apply multiple filters for accurate speed measurement
-                    // Only include successful downloads (no error)
-                    if cdn_record.err.is_none() 
-                        && time >= 10  // Minimum 50ms to avoid unrealistic high speeds (reduced from 100ms)
-                        && size >= 10240
-                    // Minimum 10KB for accurate measurement
-                    {
+                    // Speed measured over a sub-10ms or sub-10KB transfer is dominated by
+                    // timing granularity, so those samples are dropped rather than averaged in.
+                    if cdn_record.err.is_none() && time >= 10 && size >= 10240 {
                         let download_speed_mbps =
                             (size as f64 / 1024.0 / 1024.0) / (time as f64 / 1000.0);
                         let download_time_seconds = time as f64 / 1000.0;

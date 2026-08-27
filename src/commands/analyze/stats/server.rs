@@ -259,12 +259,9 @@ fn analyze_speed(cdn_records: &[CdnRecordWithMeta]) -> SpeedAnalysis {
             // Calculate speed if both size and time are available
             // Apply multiple filters for accurate speed measurement
             if let (Some(size), Some(time)) = (record_meta.record.size, record_meta.record.time) {
-                // Only include successful downloads (no error)
-                if record_meta.record.err.is_none() 
-                    && time >= 10  // Minimum 50ms to avoid unrealistic high speeds (reduced from 100ms)
-                    && size >= 10240
-                // Minimum 10KB for accurate measurement
-                {
+                // Speed measured over a sub-10ms or sub-10KB transfer is dominated by timing
+                // granularity, so those samples are dropped rather than averaged in.
+                if record_meta.record.err.is_none() && time >= 10 && size >= 10240 {
                     // Convert to MB/s (size in bytes, time in milliseconds)
                     let speed_mbps = (size as f64 / 1024.0 / 1024.0) / (time as f64 / 1000.0);
 
@@ -646,12 +643,9 @@ fn analyze_detailed_server_stats_with_enhanced_data(
             // Collect speed data
             // Apply multiple filters for accurate speed measurement
             if let (Some(size), Some(time)) = (record_meta.record.size, record_meta.record.time) {
-                // Only include successful downloads (no error)
-                if record_meta.record.err.is_none() 
-                    && time >= 10  // Minimum 50ms to avoid unrealistic high speeds (updated from 100ms)
-                    && size >= 10240
-                // Minimum 10KB for accurate measurement
-                {
+                // Speed measured over a sub-10ms or sub-10KB transfer is dominated by timing
+                // granularity, so those samples are dropped rather than averaged in.
+                if record_meta.record.err.is_none() && time >= 10 && size >= 10240 {
                     let speed_mbps = (size as f64 / 1024.0 / 1024.0) / (time as f64 / 1000.0);
 
                     // Apply maximum speed filter (1000MB/s to avoid filtering high-speed downloads, updated from 500MB/s)
