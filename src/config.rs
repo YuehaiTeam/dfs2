@@ -7,7 +7,10 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::modules::auth::challenge::ChallengeType;
-use crate::modules::{flow::FlowItem, server::ServerImpl};
+use crate::modules::{
+    flow::{FlowItem, FlowUse},
+    server::ServerImpl,
+};
 
 /// Challenge configuration for individual resources or global settings
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -599,6 +602,12 @@ pub struct AppConfig {
     pub plugin_code: HashMap<String, String>,
     #[serde(default, skip)]
     pub server_impl: HashMap<String, ServerImpl>,
+    /// flow 中指向未定义节点、已在加载时摘除的引用，元素为 `(资源 id, 节点 id)`，按此顺序排序去重。
+    ///
+    /// 摘除在 `load()` 内完成，运行时看不到这些引用，因此重新扫描配置只会得到空结果——校验必须读
+    /// 本字段而不是自行判定。
+    #[serde(default, skip)]
+    pub pruned_flow_server_refs: Vec<(String, String)>,
 }
 
 impl<'js> IntoJs<'js> for AppConfig {
@@ -643,6 +652,57 @@ impl AppConfig {
             all_warnings.extend(warnings);
         }
         (all_errors, all_warnings)
+    }
+
+    /// flow 中指向 `servers` 未定义节点的引用，元素为 `(资源 id, 节点 id)`。
+    ///
+    /// 结果排序去重，使校验报告的顺序不随 `resources` 的哈希遍历顺序变化。
+    fn undefined_flow_server_refs(&self) -> Vec<(String, String)> {
+        let mut refs: Vec<(String, String)> = self
+            .resources
+            .iter()
+            .flat_map(|(resource_id, resource)| {
+                resource.flow.iter().flat_map(move |item| {
+                    item.r#use
+                        .iter()
+                        .filter_map(move |operation| match operation {
+                            FlowUse::Server { id, .. } if !self.servers.contains_key(id) => {
+                                Some((resource_id.clone(), id.clone()))
+                            }
+                            _ => None,
+                        })
+                })
+            })
+            .collect();
+        refs.sort_unstable();
+        refs.dedup();
+        refs
+    }
+
+    /// 从 flow 中摘除指向未定义节点的引用，返回被摘除的 `(资源 id, 节点 id)`。
+    ///
+    /// 只摘 `server` 这一条命令：同一项的 `use` 里可能还有 `poolize`、`clear`、`break`、
+    /// `continue`，删掉整项会改变控制流，因此引用被摘空的项照原样保留。
+    fn prune_undefined_flow_server_refs(&mut self) -> Vec<(String, String)> {
+        let pruned = self.undefined_flow_server_refs();
+        if pruned.is_empty() {
+            return pruned;
+        }
+
+        let undefined: std::collections::HashSet<&str> = pruned
+            .iter()
+            .map(|(_, server_id)| server_id.as_str())
+            .collect();
+        for resource in self.resources.values_mut() {
+            for item in &mut resource.flow {
+                item.r#use.retain(|operation| match operation {
+                    FlowUse::Server { id, .. } => !undefined.contains(id.as_str()),
+                    _ => true,
+                });
+            }
+        }
+
+        pruned
     }
 
     pub async fn load() -> anyhow::Result<Self> {
@@ -710,6 +770,11 @@ impl AppConfig {
         }
         config.server_impl = server_impl;
 
+        // 死引用摘除必须在 servers 定型之后。留在 flow 里的话它们会带着权重进池，抽中后由健康检查
+        // 剔除——流量配比不受影响，但它们所在的层会被判为"整层不可用"而触发降级告警，与节点真的全
+        // 挂无从区分。摘除本身不打日志，报告职责在 `dfs2 validate`。
+        config.pruned_flow_server_refs = config.prune_undefined_flow_server_refs();
+
         Ok(config)
     }
 
@@ -758,6 +823,112 @@ impl SharedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 只有 `real` 一个节点有定义，`flow` 由调用方给出，用来观察摘除对 `use` 列表的影响。
+    fn config_with_flow(flow: &str) -> AppConfig {
+        let yaml = format!(
+            r#"
+servers:
+  real:
+    id: real
+    url: "https://real.example.com/"
+    type: direct
+plugins: {{}}
+resources:
+  app:
+    versions:
+      default:
+        default: "path/${{version}}"
+    tries: []
+    server: []
+    flow:
+{flow}
+"#
+        );
+        serde_yaml::from_str(&yaml).expect("test config should parse")
+    }
+
+    fn use_list(config: &AppConfig, item: usize) -> Vec<FlowUse> {
+        config.resources["app"].flow[item].r#use.clone()
+    }
+
+    #[test]
+    fn undefined_server_refs_are_pruned_and_returned() {
+        let mut config = config_with_flow(
+            r#"      - use:
+          - "server real 10"
+          - "server ghost 5"
+"#,
+        );
+
+        let pruned = config.prune_undefined_flow_server_refs();
+
+        assert_eq!(pruned, vec![("app".to_string(), "ghost".to_string())]);
+        assert_eq!(
+            use_list(&config, 0),
+            vec![FlowUse::Server {
+                id: "real".to_string(),
+                weight: 10
+            }]
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_the_item_and_its_control_commands() {
+        // 摘空的项若被整条删掉，poolize 与 break 就一并消失，控制流随之改变。
+        let mut config = config_with_flow(
+            r#"      - use:
+          - "server ghost 5"
+          - "poolize"
+          - "break"
+"#,
+        );
+
+        config.prune_undefined_flow_server_refs();
+
+        assert_eq!(config.resources["app"].flow.len(), 1);
+        assert_eq!(use_list(&config, 0), vec![FlowUse::Poolize, FlowUse::Break]);
+    }
+
+    #[test]
+    fn a_fully_defined_flow_is_left_untouched() {
+        let mut config = config_with_flow(
+            r#"      - use:
+          - "server real 10"
+"#,
+        );
+        let before = use_list(&config, 0);
+
+        let pruned = config.prune_undefined_flow_server_refs();
+
+        assert!(pruned.is_empty());
+        assert_eq!(use_list(&config, 0), before);
+    }
+
+    #[test]
+    fn one_undefined_name_used_repeatedly_is_reported_once_per_resource() {
+        let mut config = config_with_flow(
+            r#"      - use:
+          - "server ghost 5"
+      - use:
+          - "server ghost 7"
+          - "server missing 1"
+"#,
+        );
+
+        let pruned = config.prune_undefined_flow_server_refs();
+
+        // 报告按 (资源, 节点) 去重排序，摘除仍然覆盖每一处出现。
+        assert_eq!(
+            pruned,
+            vec![
+                ("app".to_string(), "ghost".to_string()),
+                ("app".to_string(), "missing".to_string()),
+            ]
+        );
+        assert!(use_list(&config, 0).is_empty());
+        assert!(use_list(&config, 1).is_empty());
+    }
 
     #[test]
     fn test_cert_hash_policy_valid_cert() {
@@ -1036,6 +1207,7 @@ cert_hash: "trust"
             challenge: ChallengeConfig::default(),
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
+            pruned_flow_server_refs: Vec::new(),
         };
         let (errors, _warnings) = config.validate_servers_transport();
         assert!(!errors.is_empty());
@@ -1144,6 +1316,7 @@ cert_hash: "trust"
             challenge: global_challenge,
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
+            pruned_flow_server_refs: Vec::new(),
         };
 
         // 测试有资源特定配置的情况 - 应该使用资源配置

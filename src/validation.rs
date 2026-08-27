@@ -250,6 +250,14 @@ impl ConfigValidator {
             }
         }
 
+        // flow 的节点引用与 resource.server / resource.tries 不同，不影响配置有效性：加载时已经
+        // 摘除，运行时不会看到它们。这里只报告，让死引用能在部署前被发现而不阻断部署。
+        for (resource_id, server_id) in &config.pruned_flow_server_refs {
+            report.add_warning(format!(
+                "资源 '{resource_id}' 的 flow 引用了未定义的服务器 '{server_id}'，该引用已被忽略"
+            ));
+        }
+
         // 检查插件配置
         if !config.plugins.is_empty() {
             info!("找到 {} 个插件配置", config.plugins.len());
@@ -743,5 +751,65 @@ impl ConfigValidator {
         if store_type == "redis" && std::env::var("REDIS_URL").is_err() {
             report.add_warning("使用Redis存储但未设置REDIS_URL，将使用默认值".to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一份自身完整的配置，`flow` 留空——死引用的信息来自 `pruned_flow_server_refs`，
+    /// 因为加载时已经把引用摘掉了，`flow` 里再也看不到它们。
+    fn complete_config() -> AppConfig {
+        let yaml = r#"
+servers:
+  real:
+    id: real
+    url: "https://real.example.com/"
+    type: direct
+plugins: {}
+resources:
+  app:
+    latest: "1.0.0"
+    versions:
+      default:
+        default: "path/${version}"
+    tries: []
+    server: []
+    flow: []
+"#;
+        serde_yaml::from_str(yaml).expect("test config should parse")
+    }
+
+    #[tokio::test]
+    async fn pruned_flow_refs_are_reported_without_failing_validation() {
+        let mut config = complete_config();
+        config.pruned_flow_server_refs = vec![("app".to_string(), "ghost".to_string())];
+        let mut report = ValidationReport::new();
+
+        ConfigValidator::validate_config_completeness(&config, &mut report).await;
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("app") && w.contains("ghost") && w.contains("已被忽略")),
+            "死引用应当报为警告并说明已被忽略，实际警告：{:?}",
+            report.warnings
+        );
+        // 部署链路按退出码判断是否放行，死引用不能阻断部署。
+        assert!(report.config_valid);
+        assert!(report.is_valid());
+    }
+
+    #[tokio::test]
+    async fn a_config_without_dead_refs_reports_no_such_warning() {
+        let config = complete_config();
+        let mut report = ValidationReport::new();
+
+        ConfigValidator::validate_config_completeness(&config, &mut report).await;
+
+        assert!(!report.warnings.iter().any(|w| w.contains("已被忽略")));
+        assert!(report.is_valid());
     }
 }

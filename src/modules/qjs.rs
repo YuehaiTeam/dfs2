@@ -390,6 +390,7 @@ mod tests {
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
             challenge: crate::config::ChallengeConfig::default(),
+            pruned_flow_server_refs: Vec::new(),
         };
 
         let config = crate::config::SharedConfig::new(app_config);

@@ -47,19 +47,19 @@ flow 是一条线性管道：每个项求值自己的规则，命中就把节点
 | 优先层可用时不降级 | PASS：`a_usable_top_tier_is_never_bypassed_by_a_heavier_lower_tier` 用权重 5 对 100 的两层跑 30 次，全部落在优先层 |
 | 层内节点全部不可用时降到下一层 | PASS：`an_exhausted_tier_falls_through_to_the_next` |
 | 所有层耗尽时报 `NO_RES_AVAILABLE` | PASS：`all_tiers_exhausted_reports_no_resource`，同时确认不会把节点名当 URL 返回 |
-| 不写 tier 的配置落在同一层 | PASS：`items_without_tiers_compete_in_one_tier` 跑 80 次，两个分开书写的节点都出现过 |
+| 不写 tier 的配置落在同一层 | PASS：`items_without_tiers_compete_in_one_tier` 跑 80 次，分开书写的两个等权节点都出现过 |
 | 同层内权重仍表达流量配比 | PASS：`weights_within_a_tier_still_split_traffic` 断言同项节点同层且权重原样保留 |
 | 同一节点被多层引用取最优先层 | PASS：`a_server_referenced_by_several_tiers_takes_the_highest`（按 3、1、4 顺序引用后归属为 1） |
 | 日志能看出本次选点来自哪个层 | PASS：每请求的选点日志含 `tier=`；降级另有 warn 指明是哪一层耗尽 |
 | 插件产出的节点继承所在层 | 未覆盖：补记逻辑已实现，但没有插件参与的自动化测试 |
 | 配置中不再有仅表达优先级的 `999` 类权重 | 未做：配置不在本仓库内，迁移在部署侧进行 |
-| `dfs2 validate` 报出引用未定义节点的 flow | 未做：见下 |
+| `dfs2 validate` 报出引用未定义节点的 flow | PASS：见[未定义节点引用的校验与摘除](2026-08-27-undefined-flow-server-refs.md) |
 
 ## Consequences
 
 分层机制到位，配置迁移未做——配置不在本仓库内。在配置写上 `tier` 之前，一切行为不变：所有项都在层 0，选点与分层引入前完全一致。迁移应当按资源逐个进行并观察流量分布，一次改完的话，若层划分与原意不符，分布会明显偏移而难以归因。
 
-分层引入一个新的失败模式：某层条件写得过窄会导致该层无节点可用而降级，日志上表现为"降级"而非"配置错误"。区分二者需要静态检查——flow 引用了 `servers` 里没有的节点时应当报错，而不是静默进池等健康检查剔除。这项检查尚未实现，是分层落地前应当补齐的一环，也是当前最大的缺口。
+分层引入一个新的失败模式：某层条件写得过窄会导致该层无节点可用而降级，日志上表现为"降级"而非"配置错误"。指向未定义节点这一类配置错误由[未定义节点引用的校验与摘除](2026-08-27-undefined-flow-server-refs.md)在加载时摘掉并单独报出，不再混进降级信号；条件写得过窄导致的空层仍然只能从降级 warn 上看出来。
 
 `poolize_from_pool` 的参数数到 8，超过 clippy 的阈值，新增一条同类告警（该告警在本仓库已有十余处）。把 `plugin_server_mapping` 与层表合并为"池条目旁挂信息"能消掉它，但两张表用途不同，合并的抽象说服力不足，暂未做。
 
