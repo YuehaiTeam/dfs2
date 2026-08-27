@@ -17,8 +17,19 @@ use crate::{
     services::VersionFileService,
 };
 use rand::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
+
+/// 一个 flow 项执行完后对管道的处置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemControl {
+    /// 继续执行后续项
+    Proceed,
+    /// 本层到此为止：后续属于同一层的项一概跳过，其它层照常执行
+    EndTier,
+    /// 整条 flow 到此为止
+    EndFlow,
+}
 
 /// 一次选点的结果，含选自哪一层。
 ///
@@ -82,8 +93,13 @@ impl FlowService {
         let mut selection: Option<Poolized> = None;
 
         // 执行Flow pipeline
+        let mut ended_tiers: HashSet<u32> = HashSet::new();
         for item in flow_items {
-            let should_break = self
+            if ended_tiers.contains(&item.tier) {
+                continue;
+            }
+
+            let control = self
                 .execute_flow_item(
                     &mut server_pool,
                     item,
@@ -98,8 +114,12 @@ impl FlowService {
                 )
                 .await?;
 
-            if should_break {
-                break;
+            match control {
+                ItemControl::Proceed => {}
+                ItemControl::EndTier => {
+                    ended_tiers.insert(item.tier);
+                }
+                ItemControl::EndFlow => break,
             }
         }
 
@@ -166,7 +186,7 @@ impl FlowService {
         penalties: &FlowPenalties,
         selection: &mut Option<Poolized>,
         tier_mapping: &mut HashMap<String, u32>,
-    ) -> DfsResult<bool> {
+    ) -> DfsResult<ItemControl> {
         // 评估规则
         let should_exec = if !item.rules.is_empty() {
             self.evaluate_flow_rules(&item.rules, &item.mode, target, context)
@@ -176,16 +196,19 @@ impl FlowService {
         };
 
         // 规则不命中的项不执行任何命令，也就无从截断——后续各项照常参与选点。
-        let mut stop_flow = false;
+        let mut control = ItemControl::Proceed;
 
         if should_exec {
             for operation in &item.r#use {
                 match operation {
                     FlowUse::Break => {
-                        stop_flow = true;
+                        control = ItemControl::EndFlow;
                         break;
                     }
-                    FlowUse::Continue => break,
+                    FlowUse::Continue => {
+                        control = ItemControl::EndTier;
+                        break;
+                    }
                     FlowUse::Clear => pool.clear(),
                     FlowUse::Server { id, weight } => {
                         if penalties.banned.iter().any(|server_id| server_id == id) {
@@ -251,7 +274,7 @@ impl FlowService {
             }
         }
 
-        Ok(stop_flow)
+        Ok(control)
     }
 
     /// 从pool中选择服务器并生成URL（不涉及CDN记录）
@@ -2741,11 +2764,11 @@ mod tests {
         let (target, context, options) = create_test_context();
 
         let cases = [
-            (FlowUse::Break, true, "break"),
-            (FlowUse::Continue, false, "continue"),
+            (FlowUse::Break, ItemControl::EndFlow, "break"),
+            (FlowUse::Continue, ItemControl::EndTier, "continue"),
         ];
 
-        for (command, expected_break, name) in cases {
+        for (command, expected_control, name) in cases {
             let item = FlowItem {
                 rules: vec![],
                 mode: FlowMode::AND,
@@ -2768,7 +2791,7 @@ mod tests {
             let mut selection: Option<Poolized> = None;
             let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
-            let should_break = service
+            let control = service
                 .execute_flow_item(
                     &mut pool,
                     &item,
@@ -2784,7 +2807,7 @@ mod tests {
                 .await
                 .expect("flow item executes");
 
-            assert_eq!(should_break, expected_break, "{name} controls the flow");
+            assert_eq!(control, expected_control, "{name} controls the flow");
             assert_eq!(
                 pool,
                 vec![("before".to_string(), 3)],
@@ -2812,7 +2835,7 @@ mod tests {
         let mut selection: Option<Poolized> = None;
         let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
-        let should_break = service
+        let control = service
             .execute_flow_item(
                 &mut pool,
                 &item,
@@ -2828,8 +2851,9 @@ mod tests {
             .await
             .expect("flow item executes");
 
-        assert!(
-            !should_break,
+        assert_eq!(
+            control,
+            ItemControl::Proceed,
             "a break command in an unmatched item is inert"
         );
     }
@@ -3245,7 +3269,7 @@ mod tests {
 
         let mut config = crate::tests::mocks::create_default_test_config();
 
-        for id in ["tier_primary", "tier_backup"] {
+        for id in ["tier_primary", "tier_secondary", "tier_backup"] {
             config.servers.insert(
                 id.to_string(),
                 ServerConfig {
@@ -3369,6 +3393,104 @@ mod tests {
             );
             assert_eq!(result.selected_tier, Some(0));
         }
+    }
+
+    /// 同层三项：第一项以 `continue` 结束本层，第二项（同层）应被跳过，第三项（下一层）照常执行。
+    ///
+    /// 判据落在选点结果上：`tier_primary` 不健康，若同层的 `tier_secondary` 也进了池，层 0 就
+    /// 是可用的、绝不会降级。选中 `tier_backup` 才说明本层确实在 `continue` 处结束了。
+    fn tier_items_with_control_command(command: FlowUse) -> Vec<FlowItem> {
+        vec![
+            FlowItem {
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![
+                    FlowUse::Server {
+                        id: "tier_primary".to_string(),
+                        weight: 5,
+                    },
+                    command,
+                ],
+                tier: 0,
+            },
+            FlowItem {
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![FlowUse::Server {
+                    id: "tier_secondary".to_string(),
+                    weight: 5,
+                }],
+                tier: 0,
+            },
+            FlowItem {
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![FlowUse::Server {
+                    id: "tier_backup".to_string(),
+                    weight: 100,
+                }],
+                tier: 1,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn continue_ends_its_own_tier_and_leaves_the_others() {
+        let env = TestEnvironment::with_config(create_tier_integration_config()).await;
+        set_tier_server_alive(&env, "tier_primary", false).await;
+        set_tier_server_alive(&env, "tier_secondary", true).await;
+        set_tier_server_alive(&env, "tier_backup", true).await;
+
+        let service = env.services.flow_service.clone();
+        let (_unused_target, context, options) = create_test_context();
+
+        let result = service
+            .execute_flow(
+                &tier_flow_target(),
+                &context,
+                &options,
+                &tier_items_with_control_command(FlowUse::Continue),
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect("the lower tier is still built");
+
+        assert_eq!(
+            result.selected_server_id.as_deref(),
+            Some("tier_backup"),
+            "the rest of tier 0 must be skipped while tier 1 still runs"
+        );
+        assert_eq!(result.selected_tier, Some(1));
+    }
+
+    /// 同一组配置换成 `break`：下一层也不再构建，池子空到报 NO_RES_AVAILABLE。
+    #[tokio::test]
+    async fn break_ends_every_tier_not_just_its_own() {
+        let env = TestEnvironment::with_config(create_tier_integration_config()).await;
+        set_tier_server_alive(&env, "tier_primary", false).await;
+        set_tier_server_alive(&env, "tier_secondary", true).await;
+        set_tier_server_alive(&env, "tier_backup", true).await;
+
+        let service = env.services.flow_service.clone();
+        let (_unused_target, context, options) = create_test_context();
+
+        let error = service
+            .execute_flow(
+                &tier_flow_target(),
+                &context,
+                &options,
+                &tier_items_with_control_command(FlowUse::Break),
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect_err("break stops the pipeline before any other tier is built");
+
+        assert!(
+            format!("{error:?}").contains("NO_RES_AVAILABLE"),
+            "expected NO_RES_AVAILABLE, got {error:?}"
+        );
     }
 
     /// 优先层内节点全部不可用时降到下一层。

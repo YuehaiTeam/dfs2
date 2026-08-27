@@ -19,10 +19,16 @@ Ok(item.r#break)
 
 ## Decision
 
-`break` 与 `continue` 成为 `use` 列表里的命令，与 `clear`、`poolize`、`server`、`plugin` 同权：
+`break` 与 `continue` 成为 `use` 列表里的命令，与 `clear`、`poolize`、`server`、`plugin` 同权，两者的作用域差一层：
 
-- `break`：停止执行后续 flow 项。本项 `use` 中它之后的命令也不执行——它在命令序列里就是这个意思。
-- `continue`：结束本项的 `use`，继续执行后续 flow 项。
+- `break`：停止执行整条 flow，后续各项无论属于哪一层都不再执行。
+- `continue`：结束本项所在的层，后续 `tier` 相同的项一概跳过，其它层照常执行。
+
+两者都截断本项 `use` 中位于其后的命令——那些命令同属本项、也就同属本层，在命令序列里这就是它们的意思。
+
+**`continue` 的作用域是层，不是项。** "结束本项的 `use`"不是一个语义：配置是静态的，把后面的命令删掉就得到同样的结果，这样的命令改变不了任何调度结果。层给了它一个真正的作用域——本层的节点已经够了，不必再往里加，但下面各层的兜底仍然要构建出来。这个区分只有在[调度流分层选点](2026-08-27-flow-tiering.md)之后才成立。
+
+**跳过按层号判定，不按书写位置。** 同一层的项不必在配置里连续，`continue` 之后遇到的每一项都比对 `tier` 是否等于发出 `continue` 的那层。若按"连续区间"判定，中间插入一个别层的项就会让后面的同层项重新生效，而配置读起来看不出这种依赖。
 
 命令位于 `use` 内，因此只在规则命中时执行；规则不命中的项一条命令都不执行，也就无从截断。`FlowItem` 不再有 `break` 字段，截断只有命令这一条路径。
 
@@ -36,6 +42,10 @@ Ok(item.r#break)
 
 **让 `break` 命令只截断后续 flow 项，不影响本项剩余命令。** 落选：那样 `break` 的位置就不再有意义，等于字段的另一种写法。命令的价值正在于位置可控。
 
+**`continue` 只结束本项的 `use`。** 落选：这个语义等价于把该命令之后的命令删掉，配置能写出的调度结果一个都没多。它在 `break` 还是字段时另有用途——覆盖那个位于项末尾的无条件截断——字段移除后这份用途也没有了。
+
+**`continue` 按书写位置结束一段连续的同层区间。** 落选：跳过范围会依赖别层的项插在哪里，同样的层划分换个书写顺序就是不同的行为。
+
 **用 `mode` 或新字段表达"独占层"（命中即终止）。** 落选：这把控制流塞进了条件语义，且无法表达 `continue`。
 
 ## Verification
@@ -43,8 +53,9 @@ Ok(item.r#break)
 | 判据 | 结果 |
 |---|---|
 | 规则不命中的项不执行控制命令，也不截断 flow | PASS：`control_commands_do_not_run_when_rules_miss` |
-| `break` 命令截断 flow，且本项后续命令不执行 | PASS：`break_and_continue_commands_stop_at_their_position` |
-| `continue` 命令结束本项但不截断 flow | PASS：同一测试 |
+| 两个命令都截断本项 `use` 中位于其后的命令 | PASS：`break_and_continue_commands_stop_at_their_position` |
+| `continue` 跳过后续同层项，下一层照常构建 | PASS：`continue_ends_its_own_tier_and_leaves_the_others`，同层第二项若执行则层 0 可用、结果会落在层 0 |
+| `break` 连下一层也不构建 | PASS：`break_ends_every_tier_not_just_its_own`，同一组配置换成 `break` 后报 `NO_RES_AVAILABLE` |
 | `break` / `continue` 可解析并序列化回原文本 | PASS：`test_flow_use_deserialize` |
 | 线上配置的 flow 项不使用 `break` 字段 | PASS：脱敏镜像里 flow 项只出现 `rules`、`mode`、`use` 三种键 |
 
@@ -52,4 +63,6 @@ Ok(item.r#break)
 
 `break: true` 现在是个未知键，serde 静默忽略它，写了它的项因此不再截断 flow。线上配置一处都没有，但这个方向的错误不会有任何提示——真要用到截断，得写成 `use` 里的 `break` 命令。
 
-`continue` 是新增能力，暂无配置使用。它的用处在分层选点（见[调度流分层选点](2026-08-27-flow-tiering.md)）里：一层可以先无条件补几个节点，再按条件决定是否放行到下一层。
+`continue` 暂无配置使用。它的作用域绑在 `tier` 上：不写 `tier` 的配置全部落在层 0，那里的 `continue` 等于 `break`，因为没有别的层可留。要用它就得先给资源划分层。
+
+`execute_flow_item` 的返回值从 `bool` 变成三值的 `ItemControl`。调用点只有管道循环一处，但今后再加控制命令要同时改这个枚举与循环里的分派。

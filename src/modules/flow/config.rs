@@ -33,9 +33,10 @@ pub enum FlowUse {
     },
     // poolize
     Poolize,
-    /// 停止执行后续 flow 项。本项 `use` 中它之后的命令也不再执行。
+    /// 停止执行整条 flow。本项 `use` 中它之后的命令也不再执行。
     Break,
-    /// 结束本项的 `use`，继续执行后续 flow 项。
+    /// 结束本项所在的层：后续属于同一 `tier` 的项一概跳过，其它层照常执行。
+    /// 本项 `use` 中它之后的命令同属本层，因此也不再执行。
     Continue,
 }
 impl<'de> Deserialize<'de> for FlowUse {
