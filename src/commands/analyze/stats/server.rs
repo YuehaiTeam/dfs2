@@ -1,3 +1,5 @@
+#![allow(dead_code, clippy::too_many_arguments)]
+
 use crate::commands::analyze::models::{
     BottleneckAnalysis, BottleneckType, CdnRecordLog, DataCoverage, DetailedStatistics,
     ErrorAnalysis, FileSizeDistribution, FileSizePerformance, FileSizeStats,
@@ -174,7 +176,7 @@ fn analyze_ttfb(cdn_records: &[CdnRecordWithMeta]) -> TtfbAnalysis {
         if let (Some(server_id), Some(ttfb)) = (&record_meta.server_id, record_meta.record.ttfb) {
             server_ttfbs
                 .entry(server_id.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(ttfb);
         }
 
@@ -235,11 +237,20 @@ fn analyze_ttfb(cdn_records: &[CdnRecordWithMeta]) -> TtfbAnalysis {
 
 fn classify_ttfb_performance(avg_ttfb_ms: f64) -> (String, Option<String>) {
     if avg_ttfb_ms > 4000.0 {
-        ("critical".to_string(), None)
+        (
+            "critical".to_string(),
+            Some("Check server status immediately - TTFB exceeds 4 seconds".to_string()),
+        )
     } else if avg_ttfb_ms > 2500.0 {
-        ("warning".to_string(), None)
+        (
+            "warning".to_string(),
+            Some("Consider CDN provider change or server optimization".to_string()),
+        )
     } else if avg_ttfb_ms > 1500.0 {
-        ("needs_attention".to_string(), None)
+        (
+            "needs_attention".to_string(),
+            Some("Monitor server performance and consider optimization".to_string()),
+        )
     } else if avg_ttfb_ms < 800.0 {
         ("excellent".to_string(), None)
     } else {
@@ -269,7 +280,7 @@ fn analyze_speed(cdn_records: &[CdnRecordWithMeta]) -> SpeedAnalysis {
                     if speed_mbps <= 1000.0 {
                         server_speeds
                             .entry(server_id.clone())
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(speed_mbps);
                     }
                 }
@@ -330,11 +341,20 @@ fn analyze_speed(cdn_records: &[CdnRecordWithMeta]) -> SpeedAnalysis {
 
 fn classify_speed_performance(avg_speed_mbps: f64) -> (String, Option<String>) {
     if avg_speed_mbps < 1.0 {
-        ("critical".to_string(), None)
+        (
+            "critical".to_string(),
+            Some("Bandwidth severely insufficient - consider immediate upgrade".to_string()),
+        )
     } else if avg_speed_mbps < 2.0 {
-        ("warning".to_string(), None)
+        (
+            "warning".to_string(),
+            Some("Poor download speed - investigate bandwidth limitations".to_string()),
+        )
     } else if avg_speed_mbps < 3.0 {
-        ("needs_attention".to_string(), None)
+        (
+            "needs_attention".to_string(),
+            Some("Below average speed - monitor and consider optimization".to_string()),
+        )
     } else if avg_speed_mbps > 5.0 {
         ("excellent".to_string(), None)
     } else {
@@ -460,11 +480,20 @@ fn classify_reliability_performance(
     penalty_rate: f64,
 ) -> (String, Option<String>) {
     if avg_retries > 2.5 || penalty_rate > 60.0 {
-        ("critical".to_string(), None)
+        (
+            "critical".to_string(),
+            Some("Extremely unreliable - frequent failures detected".to_string()),
+        )
     } else if avg_retries > 1.5 || penalty_rate > 30.0 {
-        ("warning".to_string(), None)
+        (
+            "warning".to_string(),
+            Some("Network instability detected - monitor closely".to_string()),
+        )
     } else if avg_retries > 0.8 || penalty_rate > 15.0 {
-        ("needs_attention".to_string(), None)
+        (
+            "needs_attention".to_string(),
+            Some("Some reliability issues - consider investigation".to_string()),
+        )
     } else if avg_retries < 0.5 && penalty_rate < 8.0 {
         ("excellent".to_string(), None)
     } else {
@@ -636,7 +665,7 @@ fn analyze_detailed_server_stats_with_enhanced_data(
             if let Some(ttfb) = record_meta.record.ttfb {
                 server_ttfbs
                     .entry(server_id.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(ttfb as f64);
             }
 
@@ -652,7 +681,7 @@ fn analyze_detailed_server_stats_with_enhanced_data(
                     if speed_mbps <= 1000.0 {
                         server_speeds
                             .entry(server_id.clone())
-                            .or_insert_with(Vec::new)
+                            .or_default()
                             .push(speed_mbps);
                     }
                 }
@@ -718,7 +747,7 @@ fn analyze_detailed_server_stats_with_enhanced_data(
     }
 
     // Sort by request count (most active servers first)
-    detailed_stats.sort_by(|a, b| b.request_count.cmp(&a.request_count));
+    detailed_stats.sort_by_key(|a| std::cmp::Reverse(a.request_count));
 
     detailed_stats
 }
@@ -744,7 +773,7 @@ fn calculate_detailed_statistics(data: &[f64]) -> DetailedStatistics {
     let mean = sorted_data.iter().sum::<f64>() / len as f64;
 
     // Median
-    let median = if len % 2 == 0 {
+    let median = if len.is_multiple_of(2) {
         (sorted_data[len / 2 - 1] + sorted_data[len / 2]) / 2.0
     } else {
         sorted_data[len / 2]
@@ -811,9 +840,7 @@ fn analyze_file_size_performance(
     // Collect data by server and file size category
     for record_meta in cdn_records {
         if let Some(server_id) = &record_meta.server_id {
-            let entry = server_data
-                .entry(server_id.clone())
-                .or_insert_with(FileSizeCategoryData::new);
+            let entry = server_data.entry(server_id.clone()).or_default();
 
             if let (Some(size), Some(time)) = (record_meta.record.size, record_meta.record.time) {
                 // Only include successful downloads
@@ -834,10 +861,10 @@ fn analyze_file_size_performance(
                         category_data.durations.push(duration_seconds);
 
                         // Collect TTFB for tiny and small files (where it's most relevant)
-                        if file_size_mb < SMALL_THRESHOLD {
-                            if let Some(ttfb) = record_meta.record.ttfb {
-                                category_data.ttfbs.push(ttfb as f64);
-                            }
+                        if file_size_mb < SMALL_THRESHOLD
+                            && let Some(ttfb) = record_meta.record.ttfb
+                        {
+                            category_data.ttfbs.push(ttfb as f64);
                         }
 
                         // Collect speed for small, medium, and large files (where it's most accurate)
@@ -961,7 +988,7 @@ fn calculate_cpi_v5(
     server: &str,
     sessions: &[SessionLog],
     timeline_cache: &HashMap<String, SessionConcurrencyTimeline>,
-    usage_rate: f64,
+    _usage_rate: f64,
     data_processed: u64,
     global_stats: &GlobalPerformanceStats,
 ) -> f64 {
@@ -1035,8 +1062,8 @@ fn calculate_cpi_v5(
         // 4. Critical path reliability (performance when it matters most)
         let critical_reliability = if server_in_critical_path_session(server, session) {
             // If this server is in critical path, how did it perform?
-            let critical_performance = calculate_critical_path_performance(server, session);
-            critical_performance
+
+            calculate_critical_path_performance(server, session)
         } else {
             0.8 // Good score if not in critical path (doesn't cause problems)
         };
@@ -1078,7 +1105,7 @@ fn calculate_cpi_v5(
         * (100.0 - BASE_SCORE);
 
     // Final score with base score guarantee
-    (BASE_SCORE + performance_score).max(0.0).min(100.0)
+    (BASE_SCORE + performance_score).clamp(0.0, 100.0)
 }
 
 /// Check if server is in critical path for a session
@@ -1089,14 +1116,13 @@ fn server_in_critical_path_session(server: &str, session: &SessionLog) -> bool {
     // Check if server has any downloads that complete near the end
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
-            if let Some(server_id) = &cdn_record.srv {
-                if server_id == server {
-                    if let Some(duration) = cdn_record.time {
-                        let completion_time = cdn_record.ts + duration as u64;
-                        if completion_time >= critical_threshold {
-                            return true;
-                        }
-                    }
+            if let Some(server_id) = &cdn_record.srv
+                && server_id == server
+                && let Some(duration) = cdn_record.time
+            {
+                let completion_time = cdn_record.ts + duration as u64;
+                if completion_time >= critical_threshold {
+                    return true;
                 }
             }
         }
@@ -1114,16 +1140,14 @@ fn calculate_critical_path_performance(server: &str, session: &SessionLog) -> f6
 
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
-            if let Some(server_id) = &cdn_record.srv {
-                if server_id == server {
-                    if let (Some(size), Some(duration)) = (cdn_record.size, cdn_record.time) {
-                        let completion_time = cdn_record.ts + duration as u64;
-                        if completion_time >= critical_threshold && duration > 10 {
-                            let speed =
-                                (size as f64 / 1024.0 / 1024.0) / (duration as f64 / 1000.0);
-                            critical_speeds.push(speed);
-                        }
-                    }
+            if let Some(server_id) = &cdn_record.srv
+                && server_id == server
+                && let (Some(size), Some(duration)) = (cdn_record.size, cdn_record.time)
+            {
+                let completion_time = cdn_record.ts + duration as u64;
+                if completion_time >= critical_threshold && duration > 10 {
+                    let speed = (size as f64 / 1024.0 / 1024.0) / (duration as f64 / 1000.0);
+                    critical_speeds.push(speed);
                 }
             }
         }
@@ -1168,7 +1192,7 @@ fn calculate_layered_efficiency(file_size_stats: &FileSizeDistribution, total_fi
         medium_weight * normalize_speed(file_size_stats.medium_file_speed, 5.0) +  // Assume 5MB/s is good for medium
         large_weight * normalize_speed(file_size_stats.large_file_speed, 10.0); // Assume 10MB/s is good for large
 
-    weighted_efficiency.min(1.0).max(0.0)
+    weighted_efficiency.clamp(0.0, 1.0)
 }
 
 /// Normalize speed to 0-1 scale based on expected good speed
@@ -1271,7 +1295,7 @@ fn calculate_median(values: &mut [f64]) -> f64 {
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
@@ -1302,7 +1326,7 @@ fn calculate_scheduling_delay(start_time: u64, session_start: u64, session_durat
     }
 
     let relative_start = (start_time - session_start) as f64 / session_duration;
-    relative_start.max(0.0).min(1.0) // Clamp to 0-1 range
+    relative_start.clamp(0.0, 1.0)
 }
 
 /// Calculate true bottleneck weight distinguishing real performance issues from scheduling delays
@@ -1519,14 +1543,15 @@ fn calculate_context_aware_speed_score(
     // Calculate tail performance (last 10% of session)
     let tail_samples: Vec<_> = speed_samples
         .iter()
-        .filter(|s| {
+        .filter(|_s| {
             // Check if any download from this server happened in tail period
             for chunk in &session.chunks {
                 for cdn_record in &chunk.cdns {
-                    if let Some(srv) = &cdn_record.srv {
-                        if srv == server && cdn_record.ts >= tail_threshold {
-                            return true;
-                        }
+                    if let Some(srv) = &cdn_record.srv
+                        && srv == server
+                        && cdn_record.ts >= tail_threshold
+                    {
+                        return true;
                     }
                 }
             }
@@ -1583,12 +1608,12 @@ fn analyze_tail_performance(server: &str, session: &SessionLog) -> TailPerforman
     let mut tail_downloads = Vec::new();
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
-            if let Some(server_id) = &cdn_record.srv {
-                if server_id == server && cdn_record.ts >= tail_start {
-                    if let (Some(size), Some(duration)) = (cdn_record.size, cdn_record.time) {
-                        tail_downloads.push((size, duration, cdn_record.ts));
-                    }
-                }
+            if let Some(server_id) = &cdn_record.srv
+                && server_id == server
+                && cdn_record.ts >= tail_start
+                && let (Some(size), Some(duration)) = (cdn_record.size, cdn_record.time)
+            {
+                tail_downloads.push((size, duration, cdn_record.ts));
             }
         }
     }
@@ -1764,7 +1789,7 @@ fn collect_global_performance_stats(
     let mut total_tail_appearances = 0;
     let mut total_sessions_count = 0;
 
-    for (_, data) in server_impacts {
+    for data in server_impacts.values() {
         if data.total_sessions > 0 {
             // Collect small file efficiencies
             if !data.small_file_times.is_empty() {
@@ -2035,9 +2060,7 @@ fn calculate_cpi_v4(
     let total_penalty = base_penalty + execution_delay_penalty;
 
     // Final score with base score guarantee
-    (BASE_SCORE + performance_score - total_penalty)
-        .max(0.0)
-        .min(100.0)
+    (BASE_SCORE + performance_score - total_penalty).clamp(0.0, 100.0)
 }
 
 /// Calculate Comprehensive Performance Index v3 for a server (legacy)
@@ -2092,9 +2115,7 @@ fn calculate_cpi_v3(
     let penalty = calculate_soft_penalty(ttfb_p95, error_rate);
 
     // Final score with base score guarantee
-    (BASE_SCORE + performance_score - penalty)
-        .max(0.0)
-        .min(100.0)
+    (BASE_SCORE + performance_score - penalty).clamp(0.0, 100.0)
 }
 
 /// Calculate Comprehensive Performance Index v2 for a server
@@ -2231,14 +2252,12 @@ fn calculate_speed_based_extension(
 
     for chunk in &session.chunks {
         for cdn_record in &chunk.cdns {
-            if let Some(server_id) = &cdn_record.srv {
-                if server_id == target_server {
-                    if let Some(duration) = cdn_record.time {
-                        target_bytes +=
-                            (allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0) as u64;
-                        target_duration += duration as f64 / 1000.0; // Convert to seconds
-                    }
-                }
+            if let Some(server_id) = &cdn_record.srv
+                && server_id == target_server
+                && let Some(duration) = cdn_record.time
+            {
+                target_bytes += (allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0) as u64;
+                target_duration += duration as f64 / 1000.0; // Convert to seconds
             }
         }
     }
@@ -2250,7 +2269,7 @@ fn calculate_speed_based_extension(
     // Calculate average speed of other servers
     let mut other_speeds: Vec<f64> = Vec::new();
 
-    for (server_id, _) in server_analysis {
+    for server_id in server_analysis.keys() {
         if server_id == target_server {
             continue; // Skip target server
         }
@@ -2260,14 +2279,13 @@ fn calculate_speed_based_extension(
 
         for chunk in &session.chunks {
             for cdn_record in &chunk.cdns {
-                if let Some(srv_id) = &cdn_record.srv {
-                    if srv_id == server_id {
-                        if let Some(duration) = cdn_record.time {
-                            server_bytes +=
-                                (allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0) as u64;
-                            server_duration += duration as f64 / 1000.0;
-                        }
-                    }
+                if let Some(srv_id) = &cdn_record.srv
+                    && srv_id == server_id
+                    && let Some(duration) = cdn_record.time
+                {
+                    server_bytes +=
+                        (allocation::parse_chunk_size(&chunk.rng) * 1024.0 * 1024.0) as u64;
+                    server_duration += duration as f64 / 1000.0;
                 }
             }
         }
@@ -2334,7 +2352,7 @@ fn analyze_session_impact(sessions: &[SessionLog]) -> HashMap<String, ServerImpa
         .filter(|session| (session.end - session.start) as f64 > 0.0) // 过滤无效会话
         .map(|session| analyze_single_session(session, &timeline_cache))
         .reduce(
-            || HashMap::<String, ServerImpactData>::new(),
+            HashMap::<String, ServerImpactData>::new,
             |mut acc, session_data| {
                 // 合并各会话的服务器数据
                 for (server_id, data) in session_data {
@@ -2377,7 +2395,7 @@ fn analyze_single_session(
     let session_duration = (session.end - session.start) as f64;
 
     // 获取此会话的时间线缓存
-    let timeline = match session.sid.as_ref().and_then(|sid| timeline_cache.get(sid)) {
+    let _timeline = match session.sid.as_ref().and_then(|sid| timeline_cache.get(sid)) {
         Some(timeline) => timeline,
         None => return session_server_impacts, // 如果没有时间线，跳过此会话
     };
@@ -2388,7 +2406,7 @@ fn analyze_single_session(
         let mut sorted_speeds = session_speeds;
         sorted_speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mid = sorted_speeds.len() / 2;
-        if sorted_speeds.len() % 2 == 0 {
+        if sorted_speeds.len().is_multiple_of(2) {
             (sorted_speeds[mid - 1] + sorted_speeds[mid]) / 2.0
         } else {
             sorted_speeds[mid]
@@ -2652,13 +2670,13 @@ fn calculate_final_server_statistics(
             }
 
             // 获取时间线缓存
-            if let Some(ref session_id) = session.sid {
-                if let Some(timeline) = timeline_cache.get(session_id) {
-                    let context_speed =
-                        calculate_context_aware_speed_score(server_id, session, timeline);
-                    if context_speed.low_concurrency_speed > 0.0 || context_speed.tail_speed > 0.0 {
-                        return Some(context_speed);
-                    }
+            if let Some(ref session_id) = session.sid
+                && let Some(timeline) = timeline_cache.get(session_id)
+            {
+                let context_speed =
+                    calculate_context_aware_speed_score(server_id, session, timeline);
+                if context_speed.low_concurrency_speed > 0.0 || context_speed.tail_speed > 0.0 {
+                    return Some(context_speed);
                 }
             }
             None
@@ -2667,17 +2685,17 @@ fn calculate_final_server_statistics(
 
     // 收集并发度数据（优化版本）
     for session in sessions {
-        if let Some(ref session_id) = session.sid {
-            if let Some(timeline) = timeline_cache.get(session_id) {
-                for chunk in &session.chunks {
-                    for cdn_record in &chunk.cdns {
-                        if let Some(srv) = &cdn_record.srv {
-                            if srv == server_id {
-                                let concurrency = timeline.get_concurrency_at_time(cdn_record.ts);
-                                total_concurrency += concurrency as f64;
-                                concurrency_samples += 1;
-                            }
-                        }
+        if let Some(ref session_id) = session.sid
+            && let Some(timeline) = timeline_cache.get(session_id)
+        {
+            for chunk in &session.chunks {
+                for cdn_record in &chunk.cdns {
+                    if let Some(srv) = &cdn_record.srv
+                        && srv == server_id
+                    {
+                        let concurrency = timeline.get_concurrency_at_time(cdn_record.ts);
+                        total_concurrency += concurrency as f64;
+                        concurrency_samples += 1;
                     }
                 }
             }
@@ -2726,7 +2744,7 @@ fn calculate_final_server_statistics(
     let adaptability_score = if !all_context_speeds.is_empty() {
         all_context_speeds
             .iter()
-            .map(|cs| calculate_performance_adaptability(cs))
+            .map(calculate_performance_adaptability)
             .sum::<f64>()
             / all_context_speeds.len() as f64
     } else {
@@ -2842,7 +2860,7 @@ fn analyze_session_bottlenecks(session: &SessionLog) -> HashMap<String, Bottlene
         let mut sorted_speeds = session_speeds;
         sorted_speeds.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mid = sorted_speeds.len() / 2;
-        if sorted_speeds.len() % 2 == 0 {
+        if sorted_speeds.len().is_multiple_of(2) {
             (sorted_speeds[mid - 1] + sorted_speeds[mid]) / 2.0
         } else {
             sorted_speeds[mid]
@@ -3022,7 +3040,7 @@ fn calculate_workload_rankings(
         .map(|(server_id, perf)| (server_id.clone(), perf.total_bytes))
         .collect();
 
-    servers_by_workload.sort_by(|a, b| b.1.cmp(&a.1)); // Descending: highest workload first
+    servers_by_workload.sort_by_key(|a| std::cmp::Reverse(a.1));
 
     let total_servers = servers_by_workload.len() as f64;
     if total_servers == 0.0 {
@@ -3173,12 +3191,18 @@ mod tests {
         let sessions = vec![create_test_session()];
         let analysis = analyze_server_performance(&sessions);
 
-        // Should have analysis for each component - the test session has acceptable performance
-        // so it won't appear in worst servers list, but the analysis should still work
+        // The fixture moves 1MB in 5s, which is 0.2MB/s and therefore critical, so its one
+        // server lands in the slowest list. Its 1234ms TTFB and single attempt are merely
+        // acceptable, which keeps it out of both the worst and the best lists.
         assert!(analysis.ttfb_analysis.worst_servers.is_empty());
         assert!(analysis.ttfb_analysis.best_servers.is_empty());
-        assert!(analysis.speed_analysis.slowest_servers.len() >= 0);
-        assert!(analysis.reliability_analysis.highest_retry_servers.len() >= 0);
+        assert_eq!(analysis.speed_analysis.slowest_servers.len(), 1);
+        assert!(
+            analysis
+                .reliability_analysis
+                .highest_retry_servers
+                .is_empty()
+        );
     }
 
     fn create_test_session() -> SessionLog {

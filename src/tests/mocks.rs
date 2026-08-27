@@ -19,6 +19,7 @@ use crate::services::{
 };
 
 /// 统一的测试环境，包含所有必要的服务和Mock
+#[allow(dead_code)]
 pub struct TestEnvironment {
     pub data_store: crate::modules::storage::data_store::DataStore,
     pub shared_config: SharedConfig,
@@ -28,6 +29,7 @@ pub struct TestEnvironment {
     pub mock_data_store: Arc<MockDataStore>, // 直接存储MockDataStore引用
 }
 
+#[allow(dead_code)]
 pub struct TestServices {
     pub session_service: SessionService,
     pub flow_service: FlowService,
@@ -125,17 +127,20 @@ impl TestEnvironment {
     }
 }
 
+type NestedCdnRecords = HashMap<String, HashMap<String, Vec<CdnRecord>>>;
+type ExpiringValue = (String, Option<u64>);
+
 /// Mock数据存储实现
 pub struct MockDataStore {
     sessions: Arc<RwLock<HashMap<String, Session>>>,
     challenges: Arc<RwLock<HashMap<String, String>>>,
-    cdn_records: Arc<RwLock<HashMap<String, HashMap<String, Vec<CdnRecord>>>>>,
+    cdn_records: Arc<RwLock<NestedCdnRecords>>,
     download_counts: Arc<RwLock<HashMap<String, u32>>>,
-    js_storage: Arc<RwLock<HashMap<String, (String, Option<u64>)>>>, // (value, expires_at)
+    js_storage: Arc<RwLock<HashMap<String, ExpiringValue>>>,
     health_info: Arc<RwLock<HashMap<String, HealthInfo>>>,
     cache_metadata: Arc<RwLock<HashMap<String, CacheMetadata>>>,
     cache_content: Arc<RwLock<HashMap<String, Vec<u8>>>>,
-    string_storage: Arc<RwLock<HashMap<String, (String, Option<u64>)>>>,
+    string_storage: Arc<RwLock<HashMap<String, ExpiringValue>>>,
     bandwidth_stats: Arc<RwLock<HashMap<String, u64>>>,
     // 分钟级流量统计存储
     minute_bandwidth: Arc<RwLock<HashMap<String, HashMap<u32, u64>>>>, // server_id -> (minute_index -> bytes)
@@ -315,10 +320,10 @@ impl DataStoreBackend for MockDataStore {
 
     async fn get_cdn_records(&self, sid: &str, chunk: &str) -> Result<Vec<CdnRecord>, String> {
         let cdn_records = self.cdn_records.read().await;
-        if let Some(session_records) = cdn_records.get(sid) {
-            if let Some(chunk_records) = session_records.get(chunk) {
-                return Ok(chunk_records.clone());
-            }
+        if let Some(session_records) = cdn_records.get(sid)
+            && let Some(chunk_records) = session_records.get(chunk)
+        {
+            return Ok(chunk_records.clone());
         }
         Ok(Vec::new())
     }
@@ -364,15 +369,15 @@ impl DataStoreBackend for MockDataStore {
         true
     }
 
-    async fn get_cached_metadata(&self, key: &str) -> Result<Option<String>, String> {
+    async fn get_cached_metadata(&self, _key: &str) -> Result<Option<String>, String> {
         // Mock实现：这里简化为返回空
         Ok(None)
     }
 
     async fn set_cached_metadata(
         &self,
-        key: &str,
-        value: &str,
+        _key: &str,
+        _value: &str,
         _expires: u32,
     ) -> Result<(), String> {
         // Mock实现：这里不做实际存储
@@ -423,7 +428,7 @@ impl DataStoreBackend for MockDataStore {
 
     async fn scan_expired_sessions(
         &self,
-        timeout_seconds: u64,
+        _timeout_seconds: u64,
     ) -> Result<Vec<(String, String, std::net::IpAddr)>, String> {
         // Mock实现：返回空列表
         Ok(Vec::new())
@@ -449,20 +454,20 @@ impl DataStoreBackend for MockDataStore {
 
         // 模拟一些CDN记录
         let mut cdn_records = std::collections::HashMap::new();
-        if let Some(first_chunk) = chunks.first() {
-            if !first_chunk.contains("invalid") {
-                cdn_records.insert(
-                    first_chunk.clone(),
-                    vec![crate::models::CdnRecord {
-                        url: "https://mock-cdn.com/file".to_string(),
-                        server_id: Some("mock-server".to_string()),
-                        skip_penalty: false,
-                        timestamp: 1234567890,
-                        weight: 10,
-                        size: Some(1024),
-                    }],
-                );
-            }
+        if let Some(first_chunk) = chunks.first()
+            && !first_chunk.contains("invalid")
+        {
+            cdn_records.insert(
+                first_chunk.clone(),
+                vec![crate::models::CdnRecord {
+                    url: "https://mock-cdn.com/file".to_string(),
+                    server_id: Some("mock-server".to_string()),
+                    skip_penalty: false,
+                    timestamp: 1234567890,
+                    weight: 10,
+                    size: Some(1024),
+                }],
+            );
         }
 
         Ok(crate::models::BatchChunkData {

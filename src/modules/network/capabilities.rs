@@ -326,11 +326,6 @@ fn rewrite_to_scheme(url: &str, scheme: &str) -> String {
     url.to_string()
 }
 
-/// Rewrite an HTTP URL to ssh+http:// with credentials in fragment.
-///
-/// For dfs_node type servers, the DFS signature is used as password:
-/// - user = hex-encoded path
-/// - pass = the `?$=` signature value
 /// Format a host string for URL output, adding brackets for IPv6 addresses.
 pub fn format_host_for_url(host: &str) -> String {
     if host.contains(':') && !host.starts_with('[') {
@@ -340,9 +335,14 @@ pub fn format_host_for_url(host: &str) -> String {
     }
 }
 
+/// Rewrite an HTTP URL to `ssh+http://` with credentials in the fragment.
 ///
-/// For other server types, none-auth is used:
-/// - user = "" (empty, triggers authenticate_none in SSH middleware)
+/// For `dfs_node` servers the DFS signature is the password:
+/// - user = hex-encoded path
+/// - pass = the `?$=` signature value
+///
+/// For other server types none-auth is used:
+/// - user = "" (empty, triggers `authenticate_none` in the SSH middleware)
 /// - pass = ""
 fn rewrite_to_ssh(url: &str, server_config: &ServerConfig) -> DfsResult<String> {
     let parsed = Url::parse(url).map_err(|e| {
@@ -390,7 +390,7 @@ fn rewrite_to_ssh(url: &str, server_config: &ServerConfig) -> DfsResult<String> 
         "user={}&pass={}&fingerprint={}",
         percent_encode(&ssh_user),
         percent_encode(&ssh_pass),
-        &fingerprint,
+        fingerprint,
     );
 
     // Append optional internal_host and internal_port

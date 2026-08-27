@@ -133,12 +133,12 @@ impl BandwidthCacheService {
     async fn get_from_cache(&self, server_id: &str, minutes: u32) -> Option<u64> {
         let cache = self.read_cache.read().await;
 
-        if let Some(server_cache) = cache.get(server_id) {
-            if let Some(cached_data) = server_cache.get(&minutes) {
-                // 检查缓存是否过期
-                if cached_data.cached_at.elapsed().unwrap_or(Duration::MAX) < self.cache_ttl {
-                    return Some(cached_data.total_bytes);
-                }
+        if let Some(server_cache) = cache.get(server_id)
+            && let Some(cached_data) = server_cache.get(&minutes)
+        {
+            // 检查缓存是否过期
+            if cached_data.cached_at.elapsed().unwrap_or(Duration::MAX) < self.cache_ttl {
+                return Some(cached_data.total_bytes);
             }
         }
 
@@ -190,7 +190,7 @@ impl BandwidthCacheService {
         let mut cache = self.read_cache.write().await;
 
         if let Some(server_cache) = cache.get_mut(server_id) {
-            for (_, cached_data) in server_cache.iter_mut() {
+            for cached_data in server_cache.values_mut() {
                 // 如果这个字节数应该包含在缓存的时间窗口内
                 let cache_start_minute = cached_data
                     .last_redis_sync
@@ -317,6 +317,7 @@ impl BandwidthCacheService {
     }
 
     /// 获取缓存统计信息（用于监控和调试）
+    #[allow(dead_code)]
     pub async fn get_cache_stats(&self) -> CacheStats {
         let cache = self.read_cache.read().await;
 
@@ -374,6 +375,7 @@ impl BandwidthCacheService {
 
 /// 缓存统计信息
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct CacheStats {
     pub cached_servers: usize,  // 缓存的服务器数量
     pub cached_entries: usize,  // 缓存的条目总数

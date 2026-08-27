@@ -85,7 +85,7 @@ impl S3Signer {
         if let Some(custom_headers) = headers {
             for (key, value) in custom_headers {
                 let header_key = key.to_lowercase();
-                canonical_headers.push_str(&format!("{}:{}\n", &header_key, value));
+                canonical_headers.push_str(&format!("{}:{}\n", header_key, value));
                 signed_headers.push(header_key.clone());
                 header_values.insert(header_key, value);
             }

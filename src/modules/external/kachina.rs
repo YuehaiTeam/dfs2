@@ -316,17 +316,17 @@ pub fn parse_index_data(index_data: &[u8], index_start: u32) -> Value {
 
         match name.as_str() {
             "\0CONFIG" => {
-                if let Ok(config_str) = String::from_utf8(data.to_vec()) {
-                    if let Ok(config_json) = serde_json::from_str::<Value>(&config_str) {
-                        segments["config"] = config_json;
-                    }
+                if let Ok(config_str) = String::from_utf8(data.to_vec())
+                    && let Ok(config_json) = serde_json::from_str::<Value>(&config_str)
+                {
+                    segments["config"] = config_json;
                 }
             }
             "\0META" => {
-                if let Ok(meta_str) = String::from_utf8(data.to_vec()) {
-                    if let Ok(meta_json) = serde_json::from_str::<Value>(&meta_str) {
-                        segments["metadata"] = meta_json;
-                    }
+                if let Ok(meta_str) = String::from_utf8(data.to_vec())
+                    && let Ok(meta_json) = serde_json::from_str::<Value>(&meta_str)
+                {
+                    segments["metadata"] = meta_json;
                 }
             }
             "\0THEME" => {

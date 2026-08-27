@@ -408,10 +408,10 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
         }
         #[cfg(not(unix))]
         {
-            return Err(DfsError::invalid_input(
+            Err(DfsError::invalid_input(
                 "BIND_ADDRESS",
                 "Unix domain sockets are not supported on this platform".to_string(),
-            ));
+            ))
         }
     } else {
         let addr: SocketAddr = bind_addr.parse().map_err(|e: std::net::AddrParseError| {

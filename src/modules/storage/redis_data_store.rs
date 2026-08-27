@@ -21,10 +21,10 @@ impl RedisDataStore {
     /// 格式: prefix:namespace:key 或者 namespace:key (如果没有设置前缀)
     /// 前缀通过环境变量 REDIS_PREFIX 设置
     fn redis_key(&self, namespace: &str, key: &str) -> String {
-        if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
-            if !prefix.is_empty() {
-                return format!("{prefix}:{namespace}:{key}");
-            }
+        if let Ok(prefix) = std::env::var("REDIS_PREFIX")
+            && !prefix.is_empty()
+        {
+            return format!("{prefix}:{namespace}:{key}");
         }
         format!("{namespace}:{key}")
     }
@@ -1001,10 +1001,10 @@ impl DataStoreBackend for RedisDataStore {
                     .is_some_and(|expires_at| chrono::Utc::now().timestamp() as u64 >= expires_at);
 
                 if direct_expired {
-                    if let Some(session_id) = self.extract_session_id(&key) {
-                        if let Ok(Some(session_info)) = self.get_session_info(&session_id).await {
-                            expired_sessions.push(session_info);
-                        }
+                    if let Some(session_id) = self.extract_session_id(&key)
+                        && let Ok(Some(session_info)) = self.get_session_info(&session_id).await
+                    {
+                        expired_sessions.push(session_info);
                     }
                     continue;
                 }
@@ -1016,23 +1016,21 @@ impl DataStoreBackend for RedisDataStore {
                 {
                     Ok(ttl) if ttl > 0 && ttl < 60 => {
                         // TTL > 0 表示键存在且有过期时间，TTL < 60 表示即将过期
-                        if let Some(session_id) = self.extract_session_id(&key) {
-                            if let Ok(Some(session_info)) = self.get_session_info(&session_id).await
-                            {
-                                expired_sessions.push(session_info);
-                            }
+                        if let Some(session_id) = self.extract_session_id(&key)
+                            && let Ok(Some(session_info)) = self.get_session_info(&session_id).await
+                        {
+                            expired_sessions.push(session_info);
                         }
                     }
                     Ok(-1) => {
                         // TTL = -1 表示键存在但没有设置过期时间，这是异常情况
                         // 根据创建时间判断是否应该过期
-                        if let Some(session_id) = self.extract_session_id(&key) {
-                            if let Ok(Some(session_info)) = self
+                        if let Some(session_id) = self.extract_session_id(&key)
+                            && let Ok(Some(session_info)) = self
                                 .check_session_timeout(&session_id, timeout_seconds)
                                 .await
-                            {
-                                expired_sessions.push(session_info);
-                            }
+                        {
+                            expired_sessions.push(session_info);
                         }
                     }
                     _ => {
@@ -1125,10 +1123,10 @@ impl DataStoreBackend for RedisDataStore {
                 let values = self.hmget(&ring_key, &fields_to_query).await?;
 
                 for value in values {
-                    if let Some(bytes_str) = value {
-                        if let Ok(bytes) = bytes_str.parse::<u64>() {
-                            total_bytes += bytes;
-                        }
+                    if let Some(bytes_str) = value
+                        && let Ok(bytes) = bytes_str.parse::<u64>()
+                    {
+                        total_bytes += bytes;
                     }
                 }
             }
@@ -1196,10 +1194,135 @@ impl DataStoreBackend for RedisDataStore {
     }
 }
 
+impl RedisDataStore {
+    /// 获取或创建环形缓冲区
+    async fn get_or_create_ring_buffer(
+        &self,
+        ring_key: &str,
+        minute_timestamp: u64,
+    ) -> Result<RingBufferMeta, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        // 尝试获取现有元数据
+        let existing_meta: Option<String> = redis::cmd("HGET")
+            .arg(ring_key)
+            .arg("meta_start_minute")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        match existing_meta {
+            Some(start_minute_str) => {
+                // 环形缓冲区已存在
+                let start_minute: u64 = start_minute_str.parse().unwrap_or(minute_timestamp);
+                let head_index_str: Option<String> = redis::cmd("HGET")
+                    .arg(ring_key)
+                    .arg("meta_head_index")
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let head_index_str = head_index_str.unwrap_or_else(|| "0".to_string());
+
+                Ok(RingBufferMeta {
+                    start_minute,
+                    head_index: head_index_str.parse().unwrap_or(0),
+                    ring_size: 1440,
+                })
+            }
+            None => {
+                // 创建新的环形缓冲区
+                let meta = RingBufferMeta {
+                    start_minute: minute_timestamp,
+                    head_index: 0,
+                    ring_size: 1440,
+                };
+
+                // 初始化元数据
+                let _: () = redis::cmd("HMSET")
+                    .arg(ring_key)
+                    .arg("meta_start_minute")
+                    .arg(minute_timestamp)
+                    .arg("meta_head_index")
+                    .arg(0u32)
+                    .arg("meta_ring_size")
+                    .arg(1440u32)
+                    .arg("0")
+                    .arg(0u64)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                Ok(meta)
+            }
+        }
+    }
+
+    /// 从 Redis 键中提取会话 ID
+    fn extract_session_id(&self, key: &str) -> Option<String> {
+        // key 格式: "session:session_id" 或 "prefix:session:session_id"
+        if let Ok(prefix) = std::env::var("REDIS_PREFIX")
+            && !prefix.is_empty()
+        {
+            let expected_prefix = format!("{prefix}:session:");
+            if key.starts_with(&expected_prefix) {
+                return Some(key[expected_prefix.len()..].to_string());
+            }
+        }
+
+        key.strip_prefix("session:").map(str::to_string)
+    }
+
+    /// 获取会话信息（resource_id 和 client_ip）
+    async fn get_session_info(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(String, String, std::net::IpAddr)>, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let session_key = self.redis_key("session", session_id);
+
+        let (resource_id, extras): (Option<String>, Option<String>) = redis::pipe()
+            .hget(&session_key, "resource_id")
+            .hget(&session_key, "extras")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let (Some(resource_id), Some(extras_json)) = (resource_id, extras)
+            && let Ok(extras) = serde_json::from_str::<serde_json::Value>(&extras_json)
+            && let Some(client_ip_str) = extras.get("client_ip").and_then(|v| v.as_str())
+            && let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>()
+        {
+            return Ok(Some((session_id.to_string(), resource_id, client_ip)));
+        }
+
+        Ok(None)
+    }
+
+    /// 检查没有设置TTL的会话是否超时
+    async fn check_session_timeout(
+        &self,
+        session_id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<Option<(String, String, std::net::IpAddr)>, String> {
+        // 这里可以根据会话的创建时间来判断是否超时
+        // 但由于当前实现中没有存储创建时间，我们暂时跳过这些会话
+        // 在实际生产环境中，建议所有会话都设置TTL
+        warn!("Found session without TTL: {}, skipping", session_id);
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::modules::storage::data_store::DataStoreBackend;
     use crate::tests::mocks::MockDataStore;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1335,138 +1458,5 @@ mod tests {
 
         // 验证结果
         assert!(result.is_ok());
-    }
-}
-
-impl RedisDataStore {
-    /// 获取或创建环形缓冲区
-    async fn get_or_create_ring_buffer(
-        &self,
-        ring_key: &str,
-        minute_timestamp: u64,
-    ) -> Result<RingBufferMeta, String> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // 尝试获取现有元数据
-        let existing_meta: Option<String> = redis::cmd("HGET")
-            .arg(ring_key)
-            .arg("meta_start_minute")
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        match existing_meta {
-            Some(start_minute_str) => {
-                // 环形缓冲区已存在
-                let start_minute: u64 = start_minute_str.parse().unwrap_or(minute_timestamp);
-                let head_index_str: Option<String> = redis::cmd("HGET")
-                    .arg(ring_key)
-                    .arg("meta_head_index")
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let head_index_str = head_index_str.unwrap_or_else(|| "0".to_string());
-
-                Ok(RingBufferMeta {
-                    start_minute,
-                    head_index: head_index_str.parse().unwrap_or(0),
-                    ring_size: 1440,
-                })
-            }
-            None => {
-                // 创建新的环形缓冲区
-                let meta = RingBufferMeta {
-                    start_minute: minute_timestamp,
-                    head_index: 0,
-                    ring_size: 1440,
-                };
-
-                // 初始化元数据
-                let _: () = redis::cmd("HMSET")
-                    .arg(ring_key)
-                    .arg("meta_start_minute")
-                    .arg(minute_timestamp)
-                    .arg("meta_head_index")
-                    .arg(0u32)
-                    .arg("meta_ring_size")
-                    .arg(1440u32)
-                    .arg("0")
-                    .arg(0u64)
-                    .query_async(&mut conn)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                Ok(meta)
-            }
-        }
-    }
-
-    /// 从 Redis 键中提取会话 ID
-    fn extract_session_id(&self, key: &str) -> Option<String> {
-        // key 格式: "session:session_id" 或 "prefix:session:session_id"
-        if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
-            if !prefix.is_empty() {
-                let expected_prefix = format!("{prefix}:session:");
-                if key.starts_with(&expected_prefix) {
-                    return Some(key[expected_prefix.len()..].to_string());
-                }
-            }
-        }
-
-        if key.starts_with("session:") {
-            Some(key[8..].to_string()) // "session:".len() = 8
-        } else {
-            None
-        }
-    }
-
-    /// 获取会话信息（resource_id 和 client_ip）
-    async fn get_session_info(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<(String, String, std::net::IpAddr)>, String> {
-        let mut conn = self
-            .client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let session_key = self.redis_key("session", session_id);
-
-        let (resource_id, extras): (Option<String>, Option<String>) = redis::pipe()
-            .hget(&session_key, "resource_id")
-            .hget(&session_key, "extras")
-            .query_async(&mut conn)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        if let (Some(resource_id), Some(extras_json)) = (resource_id, extras) {
-            if let Ok(extras) = serde_json::from_str::<serde_json::Value>(&extras_json) {
-                if let Some(client_ip_str) = extras.get("client_ip").and_then(|v| v.as_str()) {
-                    if let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() {
-                        return Ok(Some((session_id.to_string(), resource_id, client_ip)));
-                    }
-                }
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// 检查没有设置TTL的会话是否超时
-    async fn check_session_timeout(
-        &self,
-        session_id: &str,
-        _timeout_seconds: u64,
-    ) -> Result<Option<(String, String, std::net::IpAddr)>, String> {
-        // 这里可以根据会话的创建时间来判断是否超时
-        // 但由于当前实现中没有存储创建时间，我们暂时跳过这些会话
-        // 在实际生产环境中，建议所有会话都设置TTL
-        warn!("Found session without TTL: {}, skipping", session_id);
-        Ok(None)
     }
 }

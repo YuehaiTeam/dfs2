@@ -36,10 +36,10 @@ pub fn generate_dfsync_servers(config: &AppConfig, profile_filter: Option<&str>)
             continue;
         }
 
-        if let Some(filter) = profile_filter {
-            if server.profile.as_deref() != Some(filter) {
-                continue;
-            }
+        if let Some(filter) = profile_filter
+            && server.profile.as_deref() != Some(filter)
+        {
+            continue;
         }
 
         match server.r#type.as_str() {

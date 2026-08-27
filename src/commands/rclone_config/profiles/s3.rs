@@ -20,10 +20,10 @@ pub fn generate_s3_section(server_id: &str, server_config: &ServerConfig) -> Res
     writeln!(&mut section, "type = s3")?;
 
     // 只有当profile为minio时才添加provider行
-    if let Some(ref profile) = server_config.profile {
-        if profile == "minio" {
-            writeln!(&mut section, "provider = Minio")?;
-        }
+    if let Some(ref profile) = server_config.profile
+        && profile == "minio"
+    {
+        writeln!(&mut section, "provider = Minio")?;
     }
 
     writeln!(&mut section, "access_key_id = {}", s3_signer.access_key())?;

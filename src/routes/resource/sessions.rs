@@ -85,13 +85,13 @@ pub async fn handle_create_session_unified(
         other => other,
     };
 
-    if let Some(existing) = existing.as_ref() {
-        if existing.resource_id != resid {
-            return Err(DfsError::download_not_allowed(
-                &resid,
-                "sid is already associated with a different download",
-            ));
-        }
+    if let Some(existing) = existing.as_ref()
+        && existing.resource_id != resid
+    {
+        return Err(DfsError::download_not_allowed(
+            &resid,
+            "sid is already associated with a different download",
+        ));
     }
 
     // 同 sid 再创建：保留已有退避记录，只刷新当前认证的文件

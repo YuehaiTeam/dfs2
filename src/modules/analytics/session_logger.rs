@@ -102,6 +102,7 @@ impl SessionLogger {
     }
 
     /// 记录直接下载
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_direct_download(
         &self,
         resource_id: &str,
@@ -157,6 +158,7 @@ impl SessionLogger {
     ///
     /// 命中不经过 CDN，但仍合成一条 CDN 记录，把字节归到当初供出这份缓存的节点上，
     /// 否则缓存流量在按 `srv` 聚合的分析里会整体消失。`mode` 固定为 `cache`，便于剔除。
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_cached_download(
         &self,
         resource_id: &str,
@@ -208,6 +210,7 @@ impl SessionLogger {
     }
 
     /// 构建 Session 日志
+    #[allow(clippy::too_many_arguments)]
     async fn build_session_log(
         &self,
         log_type: &str,
@@ -322,7 +325,7 @@ impl SessionLogger {
                 let range_str = format!("{}-{}", start, end);
                 additional_chunks
                     .entry(range_str)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(insight.clone());
             }
         }

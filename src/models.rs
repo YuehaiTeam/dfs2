@@ -73,6 +73,7 @@ fn default_empty_json() -> serde_json::Value {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[allow(dead_code)]
 pub struct Challenge {
     pub challenge_type: String,
     pub data: String,
@@ -195,6 +196,7 @@ pub struct BatchChunkRequest {
 
 /// 批量Redis操作结果结构
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct BatchChunkData {
     /// 有效chunks及其下载计数
     pub valid_chunks: HashMap<String, u32>,
@@ -206,6 +208,7 @@ pub struct BatchChunkData {
 
 /// 单个chunk处理结果
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct ChunkProcessResult {
     pub chunk_id: String,
     pub url: Option<String>,
@@ -216,6 +219,7 @@ pub struct ChunkProcessResult {
 
 /// 带宽信息结构
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct BandwidthInfo {
     pub server_id: Option<String>,
     pub bytes: u64,

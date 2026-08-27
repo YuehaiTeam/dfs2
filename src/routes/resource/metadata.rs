@@ -106,15 +106,15 @@ async fn handle_metadata_request_unified(
     drop(config_guard); // 释放配置锁
 
     // 先检查缓存
-    if let Ok(Some(cached_data)) = ctx.data_store.get_cached_metadata(&cache_key).await {
-        if let Ok(cached_json) = serde_json::from_str::<serde_json::Value>(&cached_data) {
-            return Ok(ApiResponse::success(ResponseData::Metadata {
-                resource_version: effective_version.clone(),
-                name: response_name,
-                changelog: changelog.clone(),
-                data: cached_json,
-            }));
-        }
+    if let Ok(Some(cached_data)) = ctx.data_store.get_cached_metadata(&cache_key).await
+        && let Ok(cached_json) = serde_json::from_str::<serde_json::Value>(&cached_data)
+    {
+        return Ok(ApiResponse::success(ResponseData::Metadata {
+            resource_version: effective_version.clone(),
+            name: response_name,
+            changelog: changelog.clone(),
+            data: cached_json,
+        }));
     }
 
     // 使用 kachina 模块解析 KachinaInstaller 文件
@@ -136,14 +136,13 @@ async fn handle_metadata_request_unified(
             });
 
             // 缓存解析结果，缓存1小时 (3600秒)
-            if let Ok(cache_value) = serde_json::to_string(&response_data) {
-                if let Err(e) = ctx
+            if let Ok(cache_value) = serde_json::to_string(&response_data)
+                && let Err(e) = ctx
                     .data_store
                     .set_cached_metadata(&cache_key, &cache_value, 3600)
                     .await
-                {
-                    warn!("Failed to cache metadata: {}", e);
-                }
+            {
+                warn!("Failed to cache metadata: {}", e);
             }
 
             // 记录成功的请求指标
@@ -161,14 +160,13 @@ async fn handle_metadata_request_unified(
             let null_data = json!(null);
 
             // 也缓存 null 结果，避免重复检查
-            if let Ok(cache_value) = serde_json::to_string(&null_data) {
-                if let Err(e) = ctx
+            if let Ok(cache_value) = serde_json::to_string(&null_data)
+                && let Err(e) = ctx
                     .data_store
                     .set_cached_metadata(&cache_key, &cache_value, 3600)
                     .await
-                {
-                    warn!("Failed to cache null metadata: {}", e);
-                }
+            {
+                warn!("Failed to cache null metadata: {}", e);
             }
 
             // 记录成功的请求指标

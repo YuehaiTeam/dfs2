@@ -48,12 +48,13 @@ pub fn analyze_data_quality(sessions: &[SessionLog]) -> DataQuality {
                 }
 
                 // Speed data coverage (requires both size and time)
-                if cdn_record.size.is_some() && cdn_record.time.is_some() {
-                    if let (Some(size), Some(time)) = (cdn_record.size, cdn_record.time) {
-                        if size > 0 && time > 0 {
-                            speed_count += 1;
-                        }
-                    }
+                if cdn_record.size.is_some()
+                    && cdn_record.time.is_some()
+                    && let (Some(size), Some(time)) = (cdn_record.size, cdn_record.time)
+                    && size > 0
+                    && time > 0
+                {
+                    speed_count += 1;
                 }
             }
         }
@@ -252,7 +253,7 @@ fn identify_excellent_performers(
         if server.severity == "excellent" {
             server_metrics
                 .entry(server.server_id.clone())
-                .or_insert_with(HashMap::new)
+                .or_default()
                 .insert("ttfb".to_string(), format!("{:.0}ms", server.avg_ttfb_ms));
         }
     }
@@ -262,7 +263,7 @@ fn identify_excellent_performers(
         if server.severity == "excellent" {
             server_metrics
                 .entry(server.server_id.clone())
-                .or_insert_with(HashMap::new)
+                .or_default()
                 .insert(
                     "speed".to_string(),
                     format!("{:.1}MB/s", server.avg_speed_mbps),
@@ -278,7 +279,7 @@ fn identify_excellent_performers(
         if server.severity == "excellent" {
             server_metrics
                 .entry(server.server_id.clone())
-                .or_insert_with(HashMap::new)
+                .or_default()
                 .insert(
                     "reliability".to_string(),
                     format!("{:.1}% penalty rate", server.penalty_rate_percentage),
@@ -304,7 +305,7 @@ fn identify_excellent_performers(
     }
 
     // Sort by number of excellent metrics (most comprehensive first)
-    excellent_performers.sort_by(|a, b| b.metrics.len().cmp(&a.metrics.len()));
+    excellent_performers.sort_by_key(|a| std::cmp::Reverse(a.metrics.len()));
 
     excellent_performers
 }

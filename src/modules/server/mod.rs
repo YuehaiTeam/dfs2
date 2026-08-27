@@ -45,6 +45,7 @@ impl HealthInfo {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FileProbe {
     pub is_alive: bool,
     pub file_size: Option<u64>,
@@ -131,14 +132,12 @@ pub async fn ping_servers(config: &AppConfig, concurrency: usize) -> PingReport 
 fn extract_file_size_from_response(headers: &HeaderMap) -> Option<u64> {
     // 优先从 Content-Range 头部提取总大小 (Range请求的情况)
     // 格式: Content-Range: bytes 0-255/1048576
-    if let Some(content_range) = headers.get("content-range") {
-        if let Ok(range_str) = content_range.to_str() {
-            if let Some(total_size_str) = range_str.split('/').nth(1) {
-                if let Ok(total_size) = total_size_str.parse::<u64>() {
-                    return Some(total_size);
-                }
-            }
-        }
+    if let Some(content_range) = headers.get("content-range")
+        && let Ok(range_str) = content_range.to_str()
+        && let Some(total_size_str) = range_str.split('/').nth(1)
+        && let Ok(total_size) = total_size_str.parse::<u64>()
+    {
+        return Some(total_size);
     }
 
     // 如果是完整文件响应，从Content-Length获取
@@ -231,16 +230,16 @@ impl ServerImpl {
             )),
             ServerImpl::S3(signer) => {
                 let mut headers = BTreeMap::new();
-                if let Some(ranges_vec) = ranges {
-                    if !ranges_vec.is_empty() {
-                        // S3 supports multiple ranges in a single Range header
-                        let range_specs: Vec<String> = ranges_vec
-                            .iter()
-                            .map(|(start, end)| format!("{start}-{end}"))
-                            .collect();
-                        let range_header = format!("bytes={}", range_specs.join(","));
-                        headers.insert("range".to_string(), range_header);
-                    }
+                if let Some(ranges_vec) = ranges
+                    && !ranges_vec.is_empty()
+                {
+                    // S3 supports multiple ranges in a single Range header
+                    let range_specs: Vec<String> = ranges_vec
+                        .iter()
+                        .map(|(start, end)| format!("{start}-{end}"))
+                        .collect();
+                    let range_header = format!("bytes={}", range_specs.join(","));
+                    headers.insert("range".to_string(), range_header);
                 }
                 signer.generate_presigned_url(path, Some(headers))
             }
@@ -274,21 +273,21 @@ impl ServerImpl {
         redis: Option<&crate::modules::storage::data_store::DataStore>,
     ) -> bool {
         // Check cache first if store is available
-        if let Some(redis_store) = redis {
-            if let Ok(Some(cached_health)) = redis_store.get_health_info(server_id, path).await {
-                // Trust mode must learn cert hash at least once.
-                if server_config.h3_only {
-                    let policy = server_config
-                        .cert_hash_policy()
-                        .unwrap_or(CertHashPolicy::ValidCert);
-                    let needs_fresh = matches!(policy, CertHashPolicy::Trust)
-                        && cached_health.observed_cert_hash.is_none();
-                    if !needs_fresh {
-                        return cached_health.is_alive;
-                    }
-                } else {
+        if let Some(redis_store) = redis
+            && let Ok(Some(cached_health)) = redis_store.get_health_info(server_id, path).await
+        {
+            // Trust mode must learn cert hash at least once.
+            if server_config.h3_only {
+                let policy = server_config
+                    .cert_hash_policy()
+                    .unwrap_or(CertHashPolicy::ValidCert);
+                let needs_fresh = matches!(policy, CertHashPolicy::Trust)
+                    && cached_health.observed_cert_hash.is_none();
+                if !needs_fresh {
                     return cached_health.is_alive;
                 }
+            } else {
+                return cached_health.is_alive;
             }
         }
 

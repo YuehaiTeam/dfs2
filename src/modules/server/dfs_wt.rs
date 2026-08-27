@@ -21,6 +21,7 @@ impl DfsWtSigner {
     ///
     /// This produces a standard http(s) URL with dfs_node signature (`?$=...`)
     /// that can be used with HTTP/3 QUIC probe for health checks.
+    #[allow(dead_code)]
     pub fn generate_probe_url_http(&self, path: &str, uuid: &str) -> String {
         // Health check probe: no ranges needed
         self.inner.generate_signed_url(path, uuid, None, None)

@@ -512,6 +512,7 @@ impl<'js> IntoJs<'js> for ServerConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(dead_code)]
 pub struct VersionPaths {
     #[serde(flatten)]
     pub paths: HashMap<String, String>,
@@ -633,10 +634,10 @@ impl AppConfig {
     /// Get effective challenge configuration for a specific resource
     /// Resource-specific config overrides global config
     pub fn get_challenge_config(&self, resource_id: &str) -> &ChallengeConfig {
-        if let Some(resource) = self.resources.get(resource_id) {
-            if let Some(ref resource_challenge) = resource.challenge {
-                return resource_challenge;
-            }
+        if let Some(resource) = self.resources.get(resource_id)
+            && let Some(ref resource_challenge) = resource.challenge
+        {
+            return resource_challenge;
         }
         &self.challenge
     }
@@ -1217,8 +1218,10 @@ cert_hash: "trust"
     #[test]
     fn test_sha256_difficulty_clamping() {
         // 测试范围内的值不变
-        let mut config = ChallengeConfig::default();
-        config.sha256_difficulty = 2;
+        let mut config = ChallengeConfig {
+            sha256_difficulty: 2,
+            ..ChallengeConfig::default()
+        };
         assert_eq!(config.get_sha256_difficulty(), 2);
 
         config.sha256_difficulty = 1;

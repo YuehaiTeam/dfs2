@@ -190,6 +190,7 @@ async fn fill_cache_via_internal_fetch(
 }
 
 // 统一下载逻辑函数 - 合并原有的handle_download_request和handle_prefix_download_request
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_download_request_unified(
     resid: String,
     sub_path: Option<String>, // 关键参数：None=普通资源, Some=前缀资源
@@ -336,16 +337,16 @@ pub async fn handle_download_request_unified(
             extras = session.extras.clone();
             enabled_session = Some(session);
         }
-    } else if let Some(session) = enabled_session.as_mut() {
-        if session.kind != crate::models::SessionKind::Direct {
-            session.make_direct();
-            if !session.chunks.iter().any(|chunk| chunk == "0-") {
-                session.chunks.push("0-".to_string());
-            }
-            ctx.session_service
-                .store_session(original_session_id.as_deref().unwrap_or_default(), session)
-                .await?;
+    } else if let Some(session) = enabled_session.as_mut()
+        && session.kind != crate::models::SessionKind::Direct
+    {
+        session.make_direct();
+        if !session.chunks.iter().any(|chunk| chunk == "0-") {
+            session.chunks.push("0-".to_string());
         }
+        ctx.session_service
+            .store_session(original_session_id.as_deref().unwrap_or_default(), session)
+            .await?;
     }
 
     // 检查资源是否启用缓存，如果是，先检查缓存
@@ -662,13 +663,50 @@ pub async fn handle_download_request_unified(
     };
 
     // 如果是 Free 模式，记录直接下载日志
-    if matches!(resource_config.download, DownloadPolicy::Free) {
+    if matches!(resource_config.download, DownloadPolicy::Free)
+        && let Some(ip) = client_ip
+    {
+        let session_logger = crate::modules::analytics::SessionLogger::new(
+            ctx.shared_config.clone(),
+            ctx.data_store.clone(),
+        );
+        // 使用选中的服务器ID和权重，如果没有则使用默认值
+        let server_id = flow_result
+            .selected_server_id
+            .as_deref()
+            .unwrap_or("unknown");
+        let server_weight = flow_result.selected_server_weight.unwrap_or(10);
+
+        let log_result = session_logger
+            .log_direct_download(
+                &resid,
+                &version,
+                ip,
+                user_agent.clone(),
+                &cdn_url,
+                server_id,
+                server_weight,
+            )
+            .await;
+        if let Err(e) = log_result {
+            let log_type = if sub_path.is_some() {
+                "prefix direct download"
+            } else {
+                "direct download"
+            };
+            error!("Failed to log {}: {}", log_type, e);
+        }
+    }
+
+    // Direct session 保留到其短生命周期结束，以支持使用同一 sid 的节点回退。
+    if matches!(resource_config.download, DownloadPolicy::Enabled) && original_session_id.is_some()
+    {
+        // 在删除之前记录直接下载日志
         if let Some(ip) = client_ip {
             let session_logger = crate::modules::analytics::SessionLogger::new(
                 ctx.shared_config.clone(),
                 ctx.data_store.clone(),
             );
-            // 使用选中的服务器ID和权重，如果没有则使用默认值
             let server_id = flow_result
                 .selected_server_id
                 .as_deref()
@@ -678,7 +716,7 @@ pub async fn handle_download_request_unified(
             let log_result = session_logger
                 .log_direct_download(
                     &resid,
-                    &version,
+                    &version, // 使用实际获取到的版本而不是resource_config.latest
                     ip,
                     user_agent.clone(),
                     &cdn_url,
@@ -688,49 +726,11 @@ pub async fn handle_download_request_unified(
                 .await;
             if let Err(e) = log_result {
                 let log_type = if sub_path.is_some() {
-                    "prefix direct download"
+                    "direct download for prefix"
                 } else {
                     "direct download"
                 };
                 error!("Failed to log {}: {}", log_type, e);
-            }
-        }
-    }
-
-    // Direct session 保留到其短生命周期结束，以支持使用同一 sid 的节点回退。
-    if matches!(resource_config.download, DownloadPolicy::Enabled) {
-        if let Some(ref sid) = original_session_id {
-            // 在删除之前记录直接下载日志
-            if let Some(ip) = client_ip {
-                let session_logger = crate::modules::analytics::SessionLogger::new(
-                    ctx.shared_config.clone(),
-                    ctx.data_store.clone(),
-                );
-                let server_id = flow_result
-                    .selected_server_id
-                    .as_deref()
-                    .unwrap_or("unknown");
-                let server_weight = flow_result.selected_server_weight.unwrap_or(10);
-
-                let log_result = session_logger
-                    .log_direct_download(
-                        &resid,
-                        &version, // 使用实际获取到的版本而不是resource_config.latest
-                        ip,
-                        user_agent.clone(),
-                        &cdn_url,
-                        server_id,
-                        server_weight,
-                    )
-                    .await;
-                if let Err(e) = log_result {
-                    let log_type = if sub_path.is_some() {
-                        "direct download for prefix"
-                    } else {
-                        "direct download"
-                    };
-                    error!("Failed to log {}: {}", log_type, e);
-                }
             }
         }
     }
@@ -744,49 +744,48 @@ pub async fn handle_download_request_unified(
     // 更新流量统计（在成功生成下载URL后）
     if let Some(server_id) = &flow_result.selected_server_id {
         // 尝试从健康检查缓存获取文件大小
-        if let Ok(Some(health_info)) = ctx.data_store.get_health_info(server_id, &path).await {
-            if let Some(full_file_size) = health_info.file_size {
-                // 根据range计算实际传输字节数
-                let actual_bytes =
-                    calculate_actual_bytes_from_range(range.as_deref(), full_file_size);
+        if let Ok(Some(health_info)) = ctx.data_store.get_health_info(server_id, &path).await
+            && let Some(full_file_size) = health_info.file_size
+        {
+            // 根据range计算实际传输字节数
+            let actual_bytes = calculate_actual_bytes_from_range(range.as_deref(), full_file_size);
 
-                // 1. 更新日流量统计（资源、服务器、全局）
-                if let Err(e) = ctx
-                    .data_store
-                    .update_bandwidth_batch(BandwidthUpdateBatch {
-                        resource_id: resid.clone(),
-                        server_id: server_id.to_string(),
-                        bytes: actual_bytes,
-                    })
-                    .await
-                {
-                    let server_type = if sub_path.is_some() {
-                        "prefix server"
-                    } else {
-                        "server"
-                    };
-                    warn!(
-                        "Failed to update daily bandwidth for {} {}: {}",
-                        server_type, server_id, e
-                    );
-                }
-
-                // 2. 记录分钟级流量（独立于日流量更新结果）
-                ctx.bandwidth_cache_service
-                    .record_bandwidth(server_id, actual_bytes)
-                    .await;
-
-                let debug_msg = if sub_path.is_some() {
-                    format!(
-                        "Updated prefix download bandwidth stats: actual_bytes={actual_bytes}, full_file_size={full_file_size}, range={range:?}, server_id={server_id}, session_id={original_session_id:?}"
-                    )
+            // 1. 更新日流量统计（资源、服务器、全局）
+            if let Err(e) = ctx
+                .data_store
+                .update_bandwidth_batch(BandwidthUpdateBatch {
+                    resource_id: resid.clone(),
+                    server_id: server_id.to_string(),
+                    bytes: actual_bytes,
+                })
+                .await
+            {
+                let server_type = if sub_path.is_some() {
+                    "prefix server"
                 } else {
-                    format!(
-                        "Updated bandwidth stats: actual_bytes={actual_bytes}, full_file_size={full_file_size}, range={range:?}, resource_id={resid}, server_id={server_id}"
-                    )
+                    "server"
                 };
-                debug!("{}", debug_msg);
+                warn!(
+                    "Failed to update daily bandwidth for {} {}: {}",
+                    server_type, server_id, e
+                );
             }
+
+            // 2. 记录分钟级流量（独立于日流量更新结果）
+            ctx.bandwidth_cache_service
+                .record_bandwidth(server_id, actual_bytes)
+                .await;
+
+            let debug_msg = if sub_path.is_some() {
+                format!(
+                    "Updated prefix download bandwidth stats: actual_bytes={actual_bytes}, full_file_size={full_file_size}, range={range:?}, server_id={server_id}, session_id={original_session_id:?}"
+                )
+            } else {
+                format!(
+                    "Updated bandwidth stats: actual_bytes={actual_bytes}, full_file_size={full_file_size}, range={range:?}, resource_id={resid}, server_id={server_id}"
+                )
+            };
+            debug!("{}", debug_msg);
         }
     }
 

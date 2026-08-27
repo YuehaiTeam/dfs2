@@ -165,7 +165,7 @@ mod tests {
     #[tokio::test]
     async fn test_parse_log_file() {
         // Create temporary log file
-        let mut temp_file = NamedTempFile::new().unwrap();
+        let temp_file = NamedTempFile::new().unwrap();
 
         let log_content = r#"{"start":1640995200,"end":1640995320,"type":"session_completed","sid":"test-1","rid":"resource-1","ver":"1.0.0","ua":"TestAgent/1.0","ip":["192.168.1.100",null],"chunks":[{"rng":"0-1023","att":1,"cdns":[{"url":"https://cdn.example.com/test","srv":"cdn-01","wgt":10,"ts":1640995210,"pen":false,"rsn":"flow_selected","ttfb":1234,"time":5678,"size":1024,"err":null,"mode":"http"}]}]}
 {"start":1640995400,"end":1640995500,"type":"direct_download","sid":null,"rid":"resource-2","ver":"1.1.0","ua":"TestAgent/1.0","ip":["10.0.0.1","Shanghai, China"],"chunks":[{"rng":"full_file","att":0,"cdns":[{"url":"https://cdn2.example.com/test","srv":"cdn-02","wgt":8,"ts":1640995410,"pen":null,"rsn":"flow_selected","ttfb":null,"time":null,"size":null,"err":null,"mode":null}]}]}"#;

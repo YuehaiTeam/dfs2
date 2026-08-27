@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::commands::analyze::models::{
     CountAndPercentage, GlobalRetryStats, RetryAnalysis, RetryDistribution, ServerRetryStats,
     SessionLog, TimeImpact,
@@ -99,7 +101,7 @@ fn calculate_retry_distribution(sessions: &[SessionLog]) -> RetryDistribution {
 
         // Find the maximum retry count for this session (retries = attempts - 1)
         for chunk in &session.chunks {
-            let retry_count = if chunk.att > 1 { chunk.att - 1 } else { 0 };
+            let retry_count = chunk.att.saturating_sub(1);
             max_retries = max_retries.max(retry_count);
         }
 
@@ -153,13 +155,13 @@ fn calculate_time_impact(sessions: &[SessionLog]) -> TimeImpact {
 
         // Find the maximum retry count for this session (retries = attempts - 1)
         for chunk in &session.chunks {
-            let retry_count = if chunk.att > 1 { chunk.att - 1 } else { 0 };
+            let retry_count = chunk.att.saturating_sub(1);
             max_retries = max_retries.max(retry_count);
         }
 
         durations_by_retries
             .entry(max_retries)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(duration);
     }
 
@@ -189,10 +191,10 @@ fn calculate_time_impact(sessions: &[SessionLog]) -> TimeImpact {
 }
 
 fn calculate_average_duration(durations_map: &HashMap<u32, Vec<f64>>, retry_count: u32) -> f64 {
-    if let Some(durations) = durations_map.get(&retry_count) {
-        if !durations.is_empty() {
-            return durations.iter().sum::<f64>() / durations.len() as f64;
-        }
+    if let Some(durations) = durations_map.get(&retry_count)
+        && !durations.is_empty()
+    {
+        return durations.iter().sum::<f64>() / durations.len() as f64;
     }
     0.0
 }
@@ -407,6 +409,8 @@ mod tests {
         create_test_session_with_duration(retries, 1000, 1060)
     }
 
+    /// `retries` counts retries, while the log's `att` counts attempts: they differ by the
+    /// first try, and the statistics under test convert between them.
     fn create_test_session_with_duration(retries: u32, start: u64, end: u64) -> SessionLog {
         SessionLog {
             start,
@@ -419,7 +423,7 @@ mod tests {
             ip: ("192.168.1.100".to_string(), None),
             chunks: vec![ChunkLog {
                 rng: "0-1023".to_string(),
-                att: retries,
+                att: retries + 1,
                 cdns: vec![CdnRecordLog {
                     url: "https://cdn.example.com/test".to_string(),
                     srv: Some("cdn-01".to_string()),

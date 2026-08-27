@@ -146,6 +146,7 @@ impl SessionService {
     }
 
     /// 当前 chunk 再要 URL 时，这些节点应被硬剔除。
+    #[allow(dead_code)]
     pub async fn get_penalty_servers(
         &self,
         session_id: &str,
@@ -226,6 +227,7 @@ impl SessionService {
 
     /// Session场景的Flow执行包装函数
     /// 处理CDN记录、惩罚查询等复杂逻辑（调用方需要先获取session）
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_flow_for_session(
         &self,
         session: &Session,
@@ -306,6 +308,7 @@ impl SessionService {
     }
 
     /// Free 下载：文件身份来自请求，惩罚按 sid 跨文件累计。
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_flow_for_sticky_download(
         &self,
         session: &Session,

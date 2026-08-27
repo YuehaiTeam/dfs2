@@ -112,7 +112,7 @@ pub async fn post_batch_cdn(
             // MAX_CHUNK_DOWNLOADS
             return Err(DfsError::invalid_input(
                 "download_count",
-                &format!("Too many download attempts for chunk: {}", chunk),
+                format!("Too many download attempts for chunk: {}", chunk),
             ));
         }
     }
@@ -146,7 +146,7 @@ pub async fn post_batch_cdn(
                     &sessionid,
                     &chunk_range,
                     &resource,
-                    &*batch_data_ref,
+                    &batch_data_ref,
                     client_ip,
                     capabilities.clone(),
                 )
@@ -198,34 +198,34 @@ pub async fn post_batch_cdn(
                     );
                 }
 
-                if let Some(bandwidth_info) = chunk_result.bandwidth_info {
-                    if let Some(server_id) = bandwidth_info.server_id {
-                        *server_bandwidth_map.entry(server_id.clone()).or_default() +=
-                            bandwidth_info.bytes;
-                        total_bandwidth += bandwidth_info.bytes;
+                if let Some(bandwidth_info) = chunk_result.bandwidth_info
+                    && let Some(server_id) = bandwidth_info.server_id
+                {
+                    *server_bandwidth_map.entry(server_id.clone()).or_default() +=
+                        bandwidth_info.bytes;
+                    total_bandwidth += bandwidth_info.bytes;
 
-                        // QPS metrics记录 (纯内存操作)
-                        ctx.metrics
-                            .record_scheduled_request(&resid, &server_id, false);
+                    // QPS metrics记录 (纯内存操作)
+                    ctx.metrics
+                        .record_scheduled_request(&resid, &server_id, false);
 
-                        // 每个chunk的独立调度日志
-                        let chunk_size_mb = bandwidth_info.bytes as f64 / 1024.0 / 1024.0;
+                    // 每个chunk的独立调度日志
+                    let chunk_size_mb = bandwidth_info.bytes as f64 / 1024.0 / 1024.0;
 
-                        info!(
-                            "{}/{} size={:.2}MB -> {} weight={} ip={} geo={}",
-                            if let Some(ref sub_path_val) = session.sub_path {
-                                format!("{resid}/{sub_path_val}")
-                            } else {
-                                resid.clone()
-                            },
-                            chunk_result.chunk_id,
-                            chunk_size_mb,
-                            server_id,
-                            weight,
-                            client_ip_str,
-                            client_geo_str
-                        );
-                    }
+                    info!(
+                        "{}/{} size={:.2}MB -> {} weight={} ip={} geo={}",
+                        if let Some(ref sub_path_val) = session.sub_path {
+                            format!("{resid}/{sub_path_val}")
+                        } else {
+                            resid.clone()
+                        },
+                        chunk_result.chunk_id,
+                        chunk_size_mb,
+                        server_id,
+                        weight,
+                        client_ip_str,
+                        client_geo_str
+                    );
                 }
             }
             Err(e) => {
@@ -300,6 +300,7 @@ pub async fn post_batch_cdn(
 }
 
 // 处理单个chunk（使用预加载的数据）
+#[allow(clippy::too_many_arguments)]
 async fn process_chunk_with_preloaded_data(
     ctx: &AppContext,
     session: &crate::models::Session,
@@ -328,13 +329,13 @@ async fn process_chunk_with_preloaded_data(
         .await?;
 
     // 执行flow（无Redis操作，纯计算）
-    let file_size = Some(calculate_file_size_from_ranges(&ranges));
+    let file_size = calculate_file_size_from_ranges(&ranges);
     let target = crate::models::FlowTarget {
         resource_id: session.resource_id.clone(),
         version: session.version.clone(),
         sub_path: session.sub_path.clone(),
         ranges: Some(ranges),
-        file_size,
+        file_size: Some(file_size),
     };
 
     let context = crate::models::FlowContext {
@@ -368,7 +369,7 @@ async fn process_chunk_with_preloaded_data(
         skip_penalty: false,
         timestamp: chrono::Utc::now().timestamp() as u64,
         weight: flow_result.selected_server_weight.unwrap_or(0),
-        size: file_size,
+        size: Some(file_size),
     };
 
     // 准备带宽信息
@@ -377,7 +378,7 @@ async fn process_chunk_with_preloaded_data(
             .selected_server_id
             .map(|server_id| crate::models::BandwidthInfo {
                 server_id: Some(server_id),
-                bytes: file_size.unwrap_or(0),
+                bytes: file_size,
                 chunk_id: chunk_range.to_string(),
             });
 

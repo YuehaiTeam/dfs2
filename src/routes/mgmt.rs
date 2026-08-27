@@ -24,24 +24,22 @@ pub async fn mgmt_auth_middleware(
     next: Next,
 ) -> Result<impl IntoResponse, StatusCode> {
     // 检查管理API密钥
-    if let Ok(mgmt_token) = std::env::var("MGMT_API_TOKEN") {
-        if !mgmt_token.is_empty() {
-            // 检查Authorization头
-            if let Some(auth_header) = headers.get("Authorization") {
-                if let Ok(auth_str) = auth_header.to_str() {
-                    if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                        if token == mgmt_token {
-                            // 鉴权通过
-                            return Ok(next.run(request).await);
-                        }
-                    }
-                }
-            }
-
-            // 鉴权失败
-            warn!("Unauthorized access attempt to management API");
-            return Err(StatusCode::UNAUTHORIZED);
+    if let Ok(mgmt_token) = std::env::var("MGMT_API_TOKEN")
+        && !mgmt_token.is_empty()
+    {
+        // 检查Authorization头
+        if let Some(auth_header) = headers.get("Authorization")
+            && let Ok(auth_str) = auth_header.to_str()
+            && let Some(token) = auth_str.strip_prefix("Bearer ")
+            && token == mgmt_token
+        {
+            // 鉴权通过
+            return Ok(next.run(request).await);
         }
+
+        // 鉴权失败
+        warn!("Unauthorized access attempt to management API");
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     // 如果没有设置MGMT_API_TOKEN，允许访问（向后兼容）
@@ -321,23 +319,22 @@ async fn validate_refresh_token(
     let config_guard = config.load();
 
     // 方式1: 检查全局管理token
-    if let Ok(mgmt_token) = std::env::var("MGMT_API_TOKEN") {
-        if !mgmt_token.is_empty() && auth_header == mgmt_token {
-            info!("Version refresh authorized with global management token");
-            return Ok(());
-        }
+    if let Ok(mgmt_token) = std::env::var("MGMT_API_TOKEN")
+        && !mgmt_token.is_empty()
+        && auth_header == mgmt_token
+    {
+        info!("Version refresh authorized with global management token");
+        return Ok(());
     }
 
     // 方式2: 检查资源专属webhook token
-    if let Some(resource) = config_guard.get_resource(resource_id) {
-        if let Some(ref version_provider) = resource.version_provider {
-            if let Some(ref webhook_token) = version_provider.webhook_token {
-                if auth_header == webhook_token {
-                    info!("Version refresh authorized with resource-specific webhook token");
-                    return Ok(());
-                }
-            }
-        }
+    if let Some(resource) = config_guard.get_resource(resource_id)
+        && let Some(ref version_provider) = resource.version_provider
+        && let Some(ref webhook_token) = version_provider.webhook_token
+        && auth_header == webhook_token
+    {
+        info!("Version refresh authorized with resource-specific webhook token");
+        return Ok(());
     }
 
     warn!(

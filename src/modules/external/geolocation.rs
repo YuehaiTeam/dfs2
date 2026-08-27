@@ -67,31 +67,29 @@ pub fn is_ipv6(ip: IpAddr) -> bool {
 /// 获取客户端IP地址（从请求中提取）
 pub fn extract_client_ip(headers: &axum::http::HeaderMap) -> Option<IpAddr> {
     // 检查常见的代理头
-    if let Some(forwarded_for) = headers.get("x-forwarded-for") {
-        if let Ok(forwarded_str) = forwarded_for.to_str() {
-            // X-Forwarded-For 可能包含多个IP，取第一个
-            if let Some(first_ip) = forwarded_str.split(',').next() {
-                if let Ok(ip) = first_ip.trim().parse() {
-                    return Some(ip);
-                }
-            }
+    if let Some(forwarded_for) = headers.get("x-forwarded-for")
+        && let Ok(forwarded_str) = forwarded_for.to_str()
+    {
+        // X-Forwarded-For 可能包含多个IP，取第一个
+        if let Some(first_ip) = forwarded_str.split(',').next()
+            && let Ok(ip) = first_ip.trim().parse()
+        {
+            return Some(ip);
         }
     }
 
-    if let Some(real_ip) = headers.get("x-real-ip") {
-        if let Ok(real_ip_str) = real_ip.to_str() {
-            if let Ok(ip) = real_ip_str.parse() {
-                return Some(ip);
-            }
-        }
+    if let Some(real_ip) = headers.get("x-real-ip")
+        && let Ok(real_ip_str) = real_ip.to_str()
+        && let Ok(ip) = real_ip_str.parse()
+    {
+        return Some(ip);
     }
 
-    if let Some(cf_connecting_ip) = headers.get("cf-connecting-ip") {
-        if let Ok(cf_ip_str) = cf_connecting_ip.to_str() {
-            if let Ok(ip) = cf_ip_str.parse() {
-                return Some(ip);
-            }
-        }
+    if let Some(cf_connecting_ip) = headers.get("cf-connecting-ip")
+        && let Ok(cf_ip_str) = cf_connecting_ip.to_str()
+        && let Ok(ip) = cf_ip_str.parse()
+    {
+        return Some(ip);
     }
 
     None
@@ -116,7 +114,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         let result = is_global_ip(ip);
         // 由于测试环境可能没有数据库，我们只确保函数不会panic
-        assert!(result == true || result == false);
+        assert!(result || !result);
     }
 
     #[test]
@@ -126,9 +124,8 @@ mod tests {
         let result = get_ip_location_data(ip);
         // 由于测试环境可能没有数据库，我们只确保函数不会panic
         // 如果有数据库，result应该是Some，如果没有则是None
-        match result {
-            Some(data) => assert!(!data.is_empty()),
-            None => {} // 没有数据库是正常的
+        if let Some(data) = result {
+            assert!(!data.is_empty());
         }
     }
 }

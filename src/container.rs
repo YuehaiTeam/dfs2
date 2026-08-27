@@ -75,6 +75,7 @@ pub struct AppContext {
 }
 
 impl AppContext {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         session_service: SessionService,
         resource_service: ResourceService,

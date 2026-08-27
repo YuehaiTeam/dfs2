@@ -6,9 +6,11 @@ use size::Size;
 // TODO(unconstructed-type): 全仓库只有这一行提到 FlowsList，没有任何构造点；flow 一律以
 // Vec<FlowItem> 的形式在 ResourceConfig 上流转。确认无外部依赖后删除。
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[allow(dead_code)]
 pub struct FlowsList(pub Vec<FlowItem>);
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Default)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum FlowMode {
     #[serde(rename = "and")]
     AND,

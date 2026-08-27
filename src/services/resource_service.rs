@@ -95,6 +95,7 @@ impl ResourceService {
         version_path_for_resource(resource, version, server_id, sub_path)
     }
 
+    #[allow(dead_code)]
     pub fn resolve_version_file_path(
         &self,
         resource_id: &str,
@@ -114,10 +115,9 @@ impl ResourceService {
             .version_cache
             .get_cached_version_info(resource_id)
             .await
+            && let Some(changelog) = version_info.changelog
         {
-            if let Some(changelog) = version_info.changelog {
-                return Some(changelog);
-            }
+            return Some(changelog);
         }
 
         // 回退到静态配置
@@ -211,10 +211,10 @@ pub fn collect_resource_server_ids(resource: &crate::config::ResourceConfig) -> 
     let mut ids = resource.server.clone();
     for item in &resource.flow {
         for flow_use in &item.r#use {
-            if let crate::modules::flow::config::FlowUse::Server { id, .. } = flow_use {
-                if !ids.iter().any(|existing| existing == id) {
-                    ids.push(id.clone());
-                }
+            if let crate::modules::flow::config::FlowUse::Server { id, .. } = flow_use
+                && !ids.iter().any(|existing| existing == id)
+            {
+                ids.push(id.clone());
             }
         }
     }

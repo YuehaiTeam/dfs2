@@ -214,14 +214,14 @@ mod tests {
         let challenge = Challenge::generate_md5("test_data");
 
         assert!(challenge.hash.len() == 32); // MD5哈希长度
-        assert!(challenge.partial_data.len() > 0);
+        assert!(!challenge.partial_data.is_empty());
         assert!(challenge.challenge_type == ChallengeType::Md5);
 
         // 验证部分数据确实缺少1字节（hex编码后的长度应该正确）
         let expected_byte_length = challenge.partial_data.len() / 2; // Convert hex length to byte length
         let _complete_byte_length = expected_byte_length + 1; // Add back the 1 missing byte
         assert_eq!(challenge.missing_bytes, 1);
-        assert!(challenge.partial_data.len() % 2 == 0); // Hex strings should be even length
+        assert!(challenge.partial_data.len().is_multiple_of(2)); // Hex strings should be even length
     }
 
     #[test]
@@ -229,14 +229,14 @@ mod tests {
         let challenge = Challenge::generate_sha256("test_data", 2);
 
         assert!(challenge.hash.len() == 64); // SHA256哈希长度
-        assert!(challenge.partial_data.len() > 0);
+        assert!(!challenge.partial_data.is_empty());
         assert!(challenge.challenge_type == ChallengeType::Sha256);
 
         // 验证部分数据确实缺少指定字节数（hex编码后的长度应该正确）
         let expected_byte_length = challenge.partial_data.len() / 2; // Convert hex length to byte length
         let _complete_byte_length = expected_byte_length + 2; // Add back the 2 missing bytes
         assert_eq!(challenge.missing_bytes, 2);
-        assert!(challenge.partial_data.len() % 2 == 0); // Hex strings should be even length
+        assert!(challenge.partial_data.len().is_multiple_of(2)); // Hex strings should be even length
     }
 
     #[test]
@@ -250,9 +250,9 @@ mod tests {
         assert_eq!(challenge2.missing_bytes, 2);
         assert_eq!(challenge3.missing_bytes, 3);
         // 部分数据应该是hex编码的有效字符串
-        assert!(challenge1.partial_data.len() % 2 == 0);
-        assert!(challenge2.partial_data.len() % 2 == 0);
-        assert!(challenge3.partial_data.len() % 2 == 0);
+        assert!(challenge1.partial_data.len().is_multiple_of(2));
+        assert!(challenge2.partial_data.len().is_multiple_of(2));
+        assert!(challenge3.partial_data.len().is_multiple_of(2));
     }
 
     #[test]

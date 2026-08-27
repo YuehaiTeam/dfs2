@@ -124,10 +124,9 @@ impl FlowService {
         }
 
         // 最终poolize（如果需要）
-        if server_pool.len() > 1
-            || (server_pool.len() == 1 && !server_pool[0].0.starts_with("http"))
-        {
-            if let Some(poolized) = self
+        if (server_pool.len() > 1
+            || (server_pool.len() == 1 && !server_pool[0].0.starts_with("http")))
+            && let Some(poolized) = self
                 .poolize_from_pool(
                     &mut server_pool,
                     target,
@@ -138,9 +137,8 @@ impl FlowService {
                     &tier_mapping,
                 )
                 .await?
-            {
-                selection = Some(poolized);
-            }
+        {
+            selection = Some(poolized);
         }
 
         if server_pool.is_empty() {
@@ -174,6 +172,7 @@ impl FlowService {
     }
 
     /// 执行单个Flow项目
+    #[allow(clippy::too_many_arguments)]
     async fn execute_flow_item(
         &self,
         pool: &mut Vec<(String, u32)>,
@@ -281,6 +280,7 @@ impl FlowService {
     ///
     /// 按层从最优先向下尝试：只有一层内所有节点都不可用（权重全零、健康检查失败）时才降到
     /// 下一层。层内的取舍仍是加权随机，权重因此只表达同层内的流量配比。
+    #[allow(clippy::too_many_arguments)]
     async fn poolize_from_pool(
         &self,
         pool: &mut Vec<(String, u32)>,
@@ -537,18 +537,18 @@ impl FlowService {
                     format!("server_bw_daily:{server_id}:{today}")
                 };
 
-                if let Ok(Some(usage_str)) = self.data_store.get_string(&cache_key).await {
-                    if let Ok(current_usage) = usage_str.parse::<u64>() {
-                        let limit_bytes = limit.bytes() as u64;
-                        return Ok(match comp {
-                            FlowComp::Eq => current_usage == limit_bytes,
-                            FlowComp::Ne => current_usage != limit_bytes,
-                            FlowComp::Gt => current_usage > limit_bytes,
-                            FlowComp::Ge => current_usage >= limit_bytes,
-                            FlowComp::Lt => current_usage < limit_bytes,
-                            FlowComp::Le => current_usage <= limit_bytes,
-                        });
-                    }
+                if let Ok(Some(usage_str)) = self.data_store.get_string(&cache_key).await
+                    && let Ok(current_usage) = usage_str.parse::<u64>()
+                {
+                    let limit_bytes = limit.bytes() as u64;
+                    return Ok(match comp {
+                        FlowComp::Eq => current_usage == limit_bytes,
+                        FlowComp::Ne => current_usage != limit_bytes,
+                        FlowComp::Gt => current_usage > limit_bytes,
+                        FlowComp::Ge => current_usage >= limit_bytes,
+                        FlowComp::Lt => current_usage < limit_bytes,
+                        FlowComp::Le => current_usage <= limit_bytes,
+                    });
                 }
                 // 如果没有使用量数据，假设使用量为0
                 let limit_bytes = limit.bytes() as u64;
@@ -1094,9 +1094,8 @@ mod tests {
             .evaluate_condition(&FlowCond::CnIp(true), &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Without IPDB, all IPs are considered global (non-CN)"
         );
 
@@ -1105,9 +1104,8 @@ mod tests {
             .evaluate_condition(&FlowCond::CnIp(false), &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Without IPDB, cnip false should return true"
         );
 
@@ -1117,9 +1115,8 @@ mod tests {
             .evaluate_condition(&FlowCond::CnIp(false), &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "All IPs should be treated as global without IPDB"
         );
 
@@ -1129,7 +1126,7 @@ mod tests {
             .evaluate_condition(&FlowCond::CnIp(true), &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false, "No IP should return false");
+        assert!(!result.unwrap(), "No IP should return false");
 
         // 测试 IpVersion 条件
         context.client_ip = Some("192.168.1.100".parse().unwrap()); // IPv4
@@ -1137,14 +1134,14 @@ mod tests {
             .evaluate_condition(&FlowCond::IpVersion(4), &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true, "IPv4 address should match version 4");
+        assert!(result.unwrap(), "IPv4 address should match version 4");
 
         context.client_ip = Some("::1".parse().unwrap()); // IPv6
         let result = service
             .evaluate_condition(&FlowCond::IpVersion(6), &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true, "IPv6 address should match version 6");
+        assert!(result.unwrap(), "IPv6 address should match version 6");
 
         // 测试 Size 条件
         let mut sized_target = target.clone();
@@ -1160,9 +1157,8 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "1048576 bytes should be greater than 500KB"
         );
 
@@ -1176,11 +1172,7 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            true,
-            "1048576 bytes should be less than 2MB"
-        );
+        assert!(result.unwrap(), "1048576 bytes should be less than 2MB");
 
         // size >= 1MB - 使用>=比较来避免精度问题
         let size_1mb = Size::from_str("1MB").unwrap();
@@ -1192,19 +1184,19 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true, "1048576 bytes should be >= 1MB");
+        assert!(result.unwrap(), "1048576 bytes should be >= 1MB");
 
         // 测试精确相等 - 使用已知的字节数
         sized_target.file_size = Some(size_1mb.bytes() as u64);
         let result = service
             .evaluate_condition(
-                &FlowCond::Size(FlowComp::Eq, size_1mb.clone()),
+                &FlowCond::Size(FlowComp::Eq, size_1mb),
                 &sized_target,
                 &context,
             )
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true, "Exact bytes should equal");
+        assert!(result.unwrap(), "Exact bytes should equal");
 
         // 无文件大小情况
         sized_target.file_size = None;
@@ -1216,7 +1208,7 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false, "No file size should return false");
+        assert!(!result.unwrap(), "No file size should return false");
 
         // 测试 Extras 条件
         let result = service
@@ -1227,11 +1219,7 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            true,
-            "Existing extra field should return true"
-        );
+        assert!(result.unwrap(), "Existing extra field should return true");
 
         let result = service
             .evaluate_condition(
@@ -1241,9 +1229,8 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Non-existing extra field should return false"
         );
 
@@ -1273,7 +1260,7 @@ mod tests {
             .evaluate_flow_rules(&[], &FlowMode::AND, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true, "Empty rules should return true");
+        assert!(result.unwrap(), "Empty rules should return true");
 
         // 测试AND模式 - 所有条件必须满足
         // 在测试环境中使用cnip false（全球IP）和文件大小条件
@@ -1291,9 +1278,8 @@ mod tests {
             .evaluate_flow_rules(&and_rules, &FlowMode::AND, &sized_target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "AND mode: both conditions true should return true"
         );
 
@@ -1303,9 +1289,8 @@ mod tests {
             .evaluate_flow_rules(&and_rules, &FlowMode::AND, &sized_target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "AND mode: one condition false should return false"
         );
 
@@ -1315,9 +1300,8 @@ mod tests {
             .evaluate_flow_rules(&cn_ip_rules, &FlowMode::AND, &sized_target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "Without IPDB, cnip true should always be false"
         );
 
@@ -1334,9 +1318,8 @@ mod tests {
             .evaluate_flow_rules(&or_rules, &FlowMode::OR, &sized_target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "OR mode: one condition true should return true"
         );
 
@@ -1351,9 +1334,8 @@ mod tests {
             .evaluate_flow_rules(&impossible_or_rules, &FlowMode::OR, &sized_target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "OR mode: all conditions false should return false"
         );
 
@@ -1374,9 +1356,8 @@ mod tests {
             .evaluate_flow_rules(&complex_rules, &FlowMode::AND, &sized_target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Complex AND rules: all conditions true should return true"
         );
 
@@ -1624,14 +1605,14 @@ mod tests {
             server_id.to_string(),
             30, // 30分钟窗口
             FlowComp::Lt,
-            size_1gb.clone(),
+            size_1gb,
         );
 
         let result = service
             .evaluate_condition(&condition, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true, "800MB should be less than 1GB");
+        assert!(result.unwrap(), "800MB should be less than 1GB");
 
         // 测试大于条件：800MB > 500MB -> true
         let size_500mb = Size::from_str("500MB").unwrap();
@@ -1642,7 +1623,7 @@ mod tests {
             .evaluate_condition(&condition, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true, "800MB should be greater than 500MB");
+        assert!(result.unwrap(), "800MB should be greater than 500MB");
 
         // 测试等于条件（使用确切值）
         let size_800mb = Size::from_str("800MB").unwrap();
@@ -1653,7 +1634,7 @@ mod tests {
             .evaluate_condition(&condition, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true, "800MB should equal 800MB");
+        assert!(result.unwrap(), "800MB should equal 800MB");
 
         // 测试不存在的服务器 - 应该返回0流量
         let nonexistent_condition = FlowCond::ServerBwMinutes(
@@ -1667,9 +1648,8 @@ mod tests {
             .evaluate_condition(&nonexistent_condition, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Non-existent server should have 0 bandwidth, thus < 100MB"
         );
 
@@ -1678,16 +1658,15 @@ mod tests {
             server_id.to_string(),
             1, // 1分钟窗口（应该包含所有当前分钟的流量）
             FlowComp::Eq,
-            size_800mb.clone(),
+            size_800mb,
         );
 
         let result = service
             .evaluate_condition(&smaller_window_condition, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Current minute should contain all recorded bandwidth"
         );
 
@@ -1732,9 +1711,8 @@ mod tests {
             .evaluate_flow_rules(&bandwidth_limit_rules, &FlowMode::AND, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
-            result.unwrap(),
-            false,
+        assert!(
+            !result.unwrap(),
             "High traffic server should fail bandwidth limit check"
         );
 
@@ -1753,9 +1731,8 @@ mod tests {
             .evaluate_flow_rules(&low_bandwidth_rules, &FlowMode::AND, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Low traffic server should pass bandwidth limit check"
         );
 
@@ -1779,9 +1756,8 @@ mod tests {
             .evaluate_flow_rules(&or_bandwidth_rules, &FlowMode::OR, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "OR mode should pass when one bandwidth condition is met"
         );
 
@@ -1803,9 +1779,8 @@ mod tests {
             .evaluate_flow_rules(&complex_rules, &FlowMode::AND, &sized_target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Large files should be allowed on low-bandwidth servers"
         );
 
@@ -1841,9 +1816,8 @@ mod tests {
                 .evaluate_condition(&condition, &target, &context)
                 .await;
             assert!(result.is_ok());
-            assert_eq!(
+            assert!(
                 result.unwrap(),
-                true,
                 "All time windows should contain the recorded 400MB"
             );
         }
@@ -1860,9 +1834,8 @@ mod tests {
             .evaluate_condition(&large_window_condition, &target, &context)
             .await;
         assert!(result.is_ok());
-        assert_eq!(
+        assert!(
             result.unwrap(),
-            true,
             "Large time window should still contain recorded data"
         );
 
@@ -2227,10 +2200,10 @@ mod tests {
 
         // Create ServerImpl for new servers
         for id in ["h3_server", "normal_server"] {
-            if let Some(server_config) = config.servers.get(id) {
-                if let Ok(server) = crate::modules::server::ServerImpl::new(server_config) {
-                    config.server_impl.insert(id.to_string(), server);
-                }
+            if let Some(server_config) = config.servers.get(id)
+                && let Ok(server) = crate::modules::server::ServerImpl::new(server_config)
+            {
+                config.server_impl.insert(id.to_string(), server);
             }
         }
 
@@ -3173,10 +3146,10 @@ mod tests {
 
         // Create ServerImpl for new servers
         for id in ["h3_pinned", "h3_valid", "regular_cdn"] {
-            if let Some(sc) = config.servers.get(id) {
-                if let Ok(si) = crate::modules::server::ServerImpl::new(sc) {
-                    config.server_impl.insert(id.to_string(), si);
-                }
+            if let Some(sc) = config.servers.get(id)
+                && let Ok(si) = crate::modules::server::ServerImpl::new(sc)
+            {
+                config.server_impl.insert(id.to_string(), si);
             }
         }
 
@@ -3742,7 +3715,7 @@ mod tests {
     #[test]
     fn test_rewrite_h3_url_invalid_url() {
         let server = make_server_config(true, None);
-        let result = rewrite_url(&"not a valid url".to_string(), &server, None, &h3_caps());
+        let result = rewrite_url("not a valid url", &server, None, &h3_caps());
         assert!(result.is_err(), "Invalid URL should return error");
     }
 

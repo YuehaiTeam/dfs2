@@ -316,12 +316,12 @@ impl ConfigValidator {
                 }
 
                 // 验证webhook token长度
-                if let Some(ref webhook_token) = version_provider.webhook_token {
-                    if webhook_token.len() < 16 {
-                        report.add_warning(format!(
+                if let Some(ref webhook_token) = version_provider.webhook_token
+                    && webhook_token.len() < 16
+                {
+                    report.add_warning(format!(
                             "资源 '{resource_id}' 的webhook token 长度过短，建议至少16个字符以确保安全性"
                         ));
-                    }
                 }
             }
         }

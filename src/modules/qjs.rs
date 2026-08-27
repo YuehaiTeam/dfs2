@@ -292,10 +292,8 @@ impl<'js> rquickjs::FromJs<'js> for JsonValue {
                 let empty = &rquickjs::Array::new(ctx.clone())?;
                 let arr = v.as_array().unwrap_or(empty);
                 let mut values = Vec::new();
-                for item in arr.iter::<Value>() {
-                    if let Ok(val) = item {
-                        values.push(val);
-                    }
+                for val in arr.iter::<Value>().flatten() {
+                    values.push(val);
                 }
                 let mut result = Vec::new();
                 for value in values.iter() {
@@ -311,16 +309,14 @@ impl<'js> rquickjs::FromJs<'js> for JsonValue {
                 let inner = rquickjs::Object::new(ctx.clone())?;
                 let object = v.as_object().unwrap_or(&inner);
                 let mut keys = Vec::new();
-                for key in object.keys::<String>() {
-                    if let Ok(k) = key {
-                        keys.push(k);
-                    }
+                for k in object.keys::<String>().flatten() {
+                    keys.push(k);
                 }
                 for key in keys {
-                    if let Ok(val) = object.get::<String, Value>(key.clone()) {
-                        if let Ok(converted) = JsonValue::from_js(ctx, val) {
-                            value.insert(key, converted.into());
-                        }
+                    if let Ok(val) = object.get::<String, Value>(key.clone())
+                        && let Ok(converted) = JsonValue::from_js(ctx, val)
+                    {
+                        value.insert(key, converted.into());
                     }
                 }
                 serde_json::Value::Object(value)
@@ -359,7 +355,7 @@ fn format_js_exception<'js>(ctx: &rquickjs::Ctx<'js>, exception: Value<'js>) -> 
         }
 
         // 默认Exception错误消息
-        return "Unknown Error".to_string();
+        "Unknown Error".to_string()
     } else {
         // 对于非Exception对象（字符串、数字、对象等），正常序列化
         match String::from_js(ctx, exception.clone()) {

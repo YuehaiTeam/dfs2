@@ -210,14 +210,14 @@ pub(crate) fn percent_decode(input: &str) -> anyhow::Result<String> {
     let src = input.as_bytes();
     let mut i = 0;
     while i < src.len() {
-        if src[i] == b'%' && i + 2 < src.len() {
-            if let Ok(byte) =
+        if src[i] == b'%'
+            && i + 2 < src.len()
+            && let Ok(byte) =
                 u8::from_str_radix(std::str::from_utf8(&src[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                bytes.push(byte);
-                i += 3;
-                continue;
-            }
+        {
+            bytes.push(byte);
+            i += 3;
+            continue;
         }
         bytes.push(src[i]);
         i += 1;
@@ -729,8 +729,7 @@ impl SshMiddleware {
         &self,
         req: reqwest::Request,
     ) -> Result<reqwest::Response, reqwest_middleware::Error> {
-        let parts =
-            parse_ssh_url(req.url()).map_err(|e| reqwest_middleware::Error::Middleware(e))?;
+        let parts = parse_ssh_url(req.url()).map_err(reqwest_middleware::Error::Middleware)?;
         let method = req.method().clone();
         let req_headers = req.headers().clone();
 
@@ -847,11 +846,10 @@ impl SshMiddleware {
                 loop {
                     match tokio::time::timeout(BODY_READ_TIMEOUT, body.frame()).await {
                         Ok(Some(Ok(frame))) => {
-                            if let Ok(data) = frame.into_data() {
-                                if !data.is_empty() {
+                            if let Ok(data) = frame.into_data()
+                                && !data.is_empty() {
                                     yield data;
                                 }
-                            }
                         }
                         Ok(Some(Err(error))) => {
                             pool.evict_connection(&stream_key, connection_id).await;

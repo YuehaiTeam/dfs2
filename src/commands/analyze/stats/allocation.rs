@@ -93,10 +93,10 @@ fn collect_chunk_data(sessions: &[SessionLog]) -> Vec<ChunkData> {
 
 pub fn parse_chunk_size(range: &str) -> f64 {
     // Parse range format like "117607337-152236120" to get size in MB
-    if let Some((start_str, end_str)) = range.split_once('-') {
-        if let (Ok(start), Ok(end)) = (start_str.parse::<u64>(), end_str.parse::<u64>()) {
-            return (end - start + 1) as f64 / 1024.0 / 1024.0; // Convert to MB
-        }
+    if let Some((start_str, end_str)) = range.split_once('-')
+        && let (Ok(start), Ok(end)) = (start_str.parse::<u64>(), end_str.parse::<u64>())
+    {
+        return (end - start + 1) as f64 / 1024.0 / 1024.0; // Convert to MB
     }
     0.0 // Return 0 if parsing fails
 }
@@ -107,7 +107,7 @@ fn calculate_server_speeds(chunk_data: &[ChunkData]) -> HashMap<String, f64> {
     for chunk in chunk_data {
         server_speeds
             .entry(chunk.server_id.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(chunk.download_speed_mbps);
     }
 
@@ -126,7 +126,7 @@ fn build_server_chunk_distribution(chunk_data: &[ChunkData]) -> HashMap<String, 
     for chunk in chunk_data {
         distribution
             .entry(chunk.server_id.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(chunk);
     }
 
@@ -176,14 +176,12 @@ fn detect_misallocated_chunks(
         // Check multiple misallocation conditions:
 
         // 1. Large chunks assigned to slow servers (existing logic with updated thresholds)
-        if chunk.chunk_size_mb >= LARGE_CHUNK_THRESHOLD_MB {
-            if let Some(&server_speed) = server_speeds.get(&chunk.server_id) {
-                if server_speed < SLOW_SERVER_THRESHOLD_MBPS
-                    && time_penalty >= MIN_TIME_PENALTY_SECONDS
-                {
-                    should_flag = true;
-                }
-            }
+        if chunk.chunk_size_mb >= LARGE_CHUNK_THRESHOLD_MB
+            && let Some(&server_speed) = server_speeds.get(&chunk.server_id)
+            && server_speed < SLOW_SERVER_THRESHOLD_MBPS
+            && time_penalty >= MIN_TIME_PENALTY_SECONDS
+        {
+            should_flag = true;
         }
 
         // 2. Any download taking longer than 30 seconds (regardless of file size)

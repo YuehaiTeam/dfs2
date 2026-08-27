@@ -49,7 +49,7 @@ fn calculate_duration_statistics(durations: &[f64]) -> DurationStatistics {
     let sum: f64 = durations.iter().sum();
     let average = sum / len as f64;
 
-    let median = if len % 2 == 0 {
+    let median = if len.is_multiple_of(2) {
         (durations[len / 2 - 1] + durations[len / 2]) / 2.0
     } else {
         durations[len / 2]
@@ -120,7 +120,7 @@ fn analyze_duration_by_type(sessions: &[SessionLog]) -> HashMap<String, Duration
         let duration = (session.end - session.start) as f64;
         by_type
             .entry(session.log_type.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(duration);
     }
 
@@ -140,7 +140,7 @@ fn analyze_duration_by_resource(sessions: &[SessionLog]) -> HashMap<String, Dura
         let duration = (session.end - session.start) as f64;
         by_resource
             .entry(session.rid.clone())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(duration);
     }
 

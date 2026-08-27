@@ -157,16 +157,16 @@ pub async fn get_cdn(
     } else {
         resid.clone()
     };
-    if flow_result.is_err() {
-        let e = flow_result.unwrap_err();
-        error!(
-            "SESSION-ERROR {} size={:.2}MB {}",
-            resource_path, file_size_mb, e
-        );
-        return Err(e);
-    }
-
-    let flow_result = flow_result.unwrap();
+    let flow_result = match flow_result {
+        Ok(result) => result,
+        Err(e) => {
+            error!(
+                "SESSION-ERROR {} size={:.2}MB {}",
+                resource_path, file_size_mb, e
+            );
+            return Err(e);
+        }
+    };
     let cdn_url = flow_result.url;
 
     // 记录调度结果日志

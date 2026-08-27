@@ -579,7 +579,7 @@ fn format_chunk_allocation_analysis(output: &mut String, analysis: &ChunkAllocat
         for chunk in &analysis.misallocated_chunks {
             server_misallocations
                 .entry(chunk.server_id.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(chunk);
         }
 
@@ -991,30 +991,30 @@ fn format_tiny_files_table(output: &mut String, servers: &[&ServerDetailedStats]
     let mut rows: Vec<TinyFileTableRow> = Vec::new();
 
     for stats in servers {
-        if let Some(ref file_stats) = stats.file_size_stats {
-            if file_stats.tiny_files.count > 0 {
-                let ttfb_stats = &file_stats.tiny_files.ttfb_stats;
-                rows.push(TinyFileTableRow {
-                    server_id: stats.server_id.clone(),
-                    count: file_stats.tiny_files.count.to_string(),
-                    p50_ttfb: ttfb_stats
-                        .as_ref()
-                        .map(|s| format!("{:.0}", s.median))
-                        .unwrap_or("-".to_string()),
-                    p95_ttfb: ttfb_stats
-                        .as_ref()
-                        .map(|s| format!("{:.0}", s.p95))
-                        .unwrap_or("-".to_string()),
-                    p99_ttfb: ttfb_stats
-                        .as_ref()
-                        .map(|s| format!("{:.0}", s.p99))
-                        .unwrap_or("-".to_string()),
-                    max_ttfb: ttfb_stats
-                        .as_ref()
-                        .map(|s| format!("{:.0}", s.max))
-                        .unwrap_or("-".to_string()),
-                });
-            }
+        if let Some(ref file_stats) = stats.file_size_stats
+            && file_stats.tiny_files.count > 0
+        {
+            let ttfb_stats = &file_stats.tiny_files.ttfb_stats;
+            rows.push(TinyFileTableRow {
+                server_id: stats.server_id.clone(),
+                count: file_stats.tiny_files.count.to_string(),
+                p50_ttfb: ttfb_stats
+                    .as_ref()
+                    .map(|s| format!("{:.0}", s.median))
+                    .unwrap_or("-".to_string()),
+                p95_ttfb: ttfb_stats
+                    .as_ref()
+                    .map(|s| format!("{:.0}", s.p95))
+                    .unwrap_or("-".to_string()),
+                p99_ttfb: ttfb_stats
+                    .as_ref()
+                    .map(|s| format!("{:.0}", s.p99))
+                    .unwrap_or("-".to_string()),
+                max_ttfb: ttfb_stats
+                    .as_ref()
+                    .map(|s| format!("{:.0}", s.max))
+                    .unwrap_or("-".to_string()),
+            });
         }
     }
 
@@ -1039,26 +1039,26 @@ fn format_small_files_table(output: &mut String, servers: &[&ServerDetailedStats
     let mut rows: Vec<SmallFileTableRow> = Vec::new();
 
     for stats in servers {
-        if let Some(ref file_stats) = stats.file_size_stats {
-            if file_stats.small_files.count > 0 {
-                rows.push(SmallFileTableRow {
-                    server_id: stats.server_id.clone(),
-                    count: file_stats.small_files.count.to_string(),
-                    ttfb_p50: file_stats
-                        .small_files
-                        .ttfb_stats
-                        .as_ref()
-                        .map(|s| format!("{:.0}ms", s.median))
-                        .unwrap_or("-".to_string()),
-                    speed_p50: file_stats
-                        .small_files
-                        .speed_stats
-                        .as_ref()
-                        .map(|s| format!("{:.2}MB/s", s.median))
-                        .unwrap_or("-".to_string()),
-                    duration_p95: format!("{:.1}s", file_stats.small_files.duration_stats.p95),
-                });
-            }
+        if let Some(ref file_stats) = stats.file_size_stats
+            && file_stats.small_files.count > 0
+        {
+            rows.push(SmallFileTableRow {
+                server_id: stats.server_id.clone(),
+                count: file_stats.small_files.count.to_string(),
+                ttfb_p50: file_stats
+                    .small_files
+                    .ttfb_stats
+                    .as_ref()
+                    .map(|s| format!("{:.0}ms", s.median))
+                    .unwrap_or("-".to_string()),
+                speed_p50: file_stats
+                    .small_files
+                    .speed_stats
+                    .as_ref()
+                    .map(|s| format!("{:.2}MB/s", s.median))
+                    .unwrap_or("-".to_string()),
+                duration_p95: format!("{:.1}s", file_stats.small_files.duration_stats.p95),
+            });
         }
     }
 

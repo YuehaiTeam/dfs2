@@ -116,7 +116,7 @@ impl DfsSftpSigner {
             "user={}&pass={}&fingerprint={}",
             percent_encode(&ssh_user),
             percent_encode(sig),
-            &self.fingerprint,
+            self.fingerprint,
         );
 
         let host_str = format_host_for_url(&self.sftp_host);
@@ -130,6 +130,7 @@ impl DfsSftpSigner {
     ///
     /// Returns an sftp:// URL that can be used with FETCH_CLIENT
     /// (which has SftpMiddleware mounted).
+    #[allow(dead_code)]
     pub fn generate_probe_url(&self, path: &str, uuid: &str) -> String {
         // For health check, generate a signed sftp URL
         self.generate_presigned_url(path, uuid, None)

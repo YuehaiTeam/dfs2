@@ -202,10 +202,10 @@ impl GitLfsSigner {
                 version = line.split_whitespace().nth(1).unwrap_or("").to_string();
             } else if line.starts_with("oid ") {
                 oid = line.split_whitespace().nth(1).unwrap_or("").to_string();
-            } else if line.starts_with("size ") {
-                if let Some(size_str) = line.split_whitespace().nth(1) {
-                    size = size_str.parse().unwrap_or(0);
-                }
+            } else if line.starts_with("size ")
+                && let Some(size_str) = line.split_whitespace().nth(1)
+            {
+                size = size_str.parse().unwrap_or(0);
             }
         }
 
@@ -249,13 +249,12 @@ impl GitLfsSigner {
 
         let batch_response: LfsBatchResponse = response.json().await?;
 
-        if let Some(object) = batch_response.objects.first() {
-            if let Some(actions) = &object.actions {
-                if let Some(download_action) = actions.get("download") {
-                    debug!("Resolved LFS download URL: {}", download_action.href);
-                    return Ok(download_action.href.clone());
-                }
-            }
+        if let Some(object) = batch_response.objects.first()
+            && let Some(actions) = &object.actions
+            && let Some(download_action) = actions.get("download")
+        {
+            debug!("Resolved LFS download URL: {}", download_action.href);
+            return Ok(download_action.href.clone());
         }
 
         Err(anyhow::anyhow!("No download URL found in LFS response"))

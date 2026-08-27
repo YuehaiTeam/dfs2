@@ -225,6 +225,7 @@ impl RingBufferMeta {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SessionStats {
     pub resource_id: String,
     pub version: String,
@@ -345,10 +346,10 @@ impl FileDataStore {
         let file_path = self.key_to_file_path(key);
 
         // 确保父目录存在
-        if let Some(parent) = file_path.parent() {
-            if let Err(e) = fs::create_dir_all(parent).await {
-                return Err(format!("Failed to create directory: {e}"));
-            }
+        if let Some(parent) = file_path.parent()
+            && let Err(e) = fs::create_dir_all(parent).await
+        {
+            return Err(format!("Failed to create directory: {e}"));
         }
 
         let json =
@@ -852,10 +853,10 @@ impl DataStoreBackend for FileDataStore {
                 false
             };
 
-            if is_expired {
-                if let Ok(Some(session_info)) = self.get_file_session_info(file_name).await {
-                    expired_sessions.push(session_info);
-                }
+            if is_expired
+                && let Ok(Some(session_info)) = self.get_file_session_info(file_name).await
+            {
+                expired_sessions.push(session_info);
             }
         }
 
@@ -926,16 +927,15 @@ impl FileDataStore {
         // 读取会话文件
         if let Ok(Some(session)) = self.get_session(session_id).await {
             // 从 extras 中提取 client_ip
-            if let Some(client_ip_value) = session.extras.get("client_ip") {
-                if let Some(client_ip_str) = client_ip_value.as_str() {
-                    if let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>() {
-                        return Ok(Some((
-                            session_id.to_string(),
-                            session.resource_id,
-                            client_ip,
-                        )));
-                    }
-                }
+            if let Some(client_ip_value) = session.extras.get("client_ip")
+                && let Some(client_ip_str) = client_ip_value.as_str()
+                && let Ok(client_ip) = client_ip_str.parse::<std::net::IpAddr>()
+            {
+                return Ok(Some((
+                    session_id.to_string(),
+                    session.resource_id,
+                    client_ip,
+                )));
             }
         }
 
@@ -963,7 +963,7 @@ pub async fn create_data_store() -> Result<DataStore, String> {
                 crate::modules::storage::redis_data_store::RedisDataStore::new(client);
             Ok(Arc::new(redis_store))
         }
-        "file" | _ => {
+        _ => {
             let file_store = FileDataStore::new().await?;
             Ok(Arc::new(file_store))
         }
