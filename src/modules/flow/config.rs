@@ -551,9 +551,9 @@ mod tests {
     fn test_flow_item_default() {
         let item = FlowItem::default();
         assert_eq!(item.mode, FlowMode::OR);
-        assert_eq!(item.r#break, false);
         assert!(item.r#use.is_empty());
         assert!(item.rules.is_empty());
+        assert_eq!(item.tier, 0);
     }
 }
 
@@ -570,8 +570,6 @@ impl Serialize for FlowCond {
 pub struct FlowItem {
     #[serde(default)]
     pub mode: FlowMode,
-    #[serde(default)]
-    pub r#break: bool,
     #[serde(default)]
     pub r#use: Vec<FlowUse>,
     #[serde(default)]

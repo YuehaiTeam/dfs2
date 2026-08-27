@@ -853,7 +853,6 @@ pub fn create_default_test_config() -> AppConfig {
                 id: "test_server_1".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         }],
         challenge: None,
@@ -893,7 +892,6 @@ pub fn create_default_test_config() -> AppConfig {
                 id: "test_server_1".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         }],
         challenge: None,
@@ -939,7 +937,6 @@ pub fn create_default_test_config() -> AppConfig {
                     weight: 10,
                 },
             ],
-            r#break: false,
             tier: 0,
         }],
         challenge: None,
@@ -976,7 +973,6 @@ pub fn create_default_test_config() -> AppConfig {
                 id: "test_server_1".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         }],
         challenge: None,
@@ -1014,7 +1010,6 @@ pub fn create_default_test_config() -> AppConfig {
                 id: "test_server_1".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         }],
         challenge: Some(crate::config::ChallengeConfig {
@@ -1058,7 +1053,6 @@ pub fn create_default_test_config() -> AppConfig {
                 id: "test_server_1".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         }],
         challenge: Some(crate::config::ChallengeConfig {
@@ -1102,7 +1096,6 @@ pub fn create_default_test_config() -> AppConfig {
                 id: "test_server_1".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         }],
         challenge: Some(crate::config::ChallengeConfig {
@@ -1146,7 +1139,6 @@ pub fn create_default_test_config() -> AppConfig {
                 id: "test_server_1".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         }],
         challenge: Some(crate::config::ChallengeConfig {

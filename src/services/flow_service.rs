@@ -175,20 +175,17 @@ impl FlowService {
             true
         };
 
-        // `break` / `continue` 命令的效果。None 表示本项没给出显式处置。
-        let mut explicit_control: Option<bool> = None;
+        // 规则不命中的项不执行任何命令，也就无从截断——后续各项照常参与选点。
+        let mut stop_flow = false;
 
         if should_exec {
             for operation in &item.r#use {
                 match operation {
                     FlowUse::Break => {
-                        explicit_control = Some(true);
+                        stop_flow = true;
                         break;
                     }
-                    FlowUse::Continue => {
-                        explicit_control = Some(false);
-                        break;
-                    }
+                    FlowUse::Continue => break,
                     FlowUse::Clear => pool.clear(),
                     FlowUse::Server { id, weight } => {
                         if penalties.banned.iter().any(|server_id| server_id == id) {
@@ -254,10 +251,7 @@ impl FlowService {
             }
         }
 
-        // 旧的 `break: true` 字段等价于在 `use` 末尾放一条 `break` 命令，因此同样只在规则命中时
-        // 生效。此前它写在规则判定之外，规则不命中时也会截断整条 flow——后续各层被静默跳过，
-        // 表现为节点池比配置写的少。
-        Ok(explicit_control.unwrap_or(should_exec && item.r#break))
+        Ok(stop_flow)
     }
 
     /// 从pool中选择服务器并生成URL（不涉及CDN记录）
@@ -2250,7 +2244,6 @@ mod tests {
                 id: "h3_server".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         };
 
@@ -2328,7 +2321,6 @@ mod tests {
                 id: "h3_server".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         };
 
@@ -2375,7 +2367,6 @@ mod tests {
                 id: "h3_server".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         };
 
@@ -2425,7 +2416,6 @@ mod tests {
                 id: "normal_server".to_string(),
                 weight: 5,
             }],
-            r#break: false,
             tier: 0,
         };
 
@@ -2481,7 +2471,6 @@ mod tests {
                     weight: 5,
                 },
             ],
-            r#break: false,
             tier: 0,
         };
 
@@ -2571,7 +2560,6 @@ mod tests {
                     weight: 5,
                 },
             ],
-            r#break: false,
             tier: 0,
         };
 
@@ -2619,7 +2607,6 @@ mod tests {
                 id: "unknown_server".to_string(),
                 weight: 7,
             }],
-            r#break: false,
             tier: 0,
         };
 
@@ -2649,109 +2636,6 @@ mod tests {
         println!("✅ Unknown server not filtered by h3_only gate");
     }
 
-    /// 一个规则不命中的项不该截断整条 flow。旧的 `break` 字段写在规则判定之外，
-    /// 结果是"这层不适用于你"变成了"到此为止"，后续各层被静默跳过。
-    #[tokio::test]
-    async fn break_field_only_applies_when_the_rules_match() {
-        let service = create_test_flow_service().await;
-        let (target, mut context, options) = create_test_context();
-        context.client_ip = Some("8.8.8.8".parse().unwrap());
-
-        // 无 IPDB 时 cnip true 恒为假，因此这一项的规则不命中
-        let unmatched_breaking_item = FlowItem {
-            rules: vec![FlowCond::CnIp(true)],
-            mode: FlowMode::AND,
-            r#use: vec![FlowUse::Server {
-                id: "cn_only".to_string(),
-                weight: 10,
-            }],
-            r#break: true,
-            tier: 0,
-        };
-        let fallback_item = FlowItem {
-            rules: vec![],
-            mode: FlowMode::AND,
-            r#use: vec![FlowUse::Server {
-                id: "test_server_1".to_string(),
-                weight: 5,
-            }],
-            r#break: false,
-            tier: 0,
-        };
-
-        let mut pool = Vec::new();
-        let mut plugin_server_mapping = HashMap::new();
-        let mut selection: Option<Poolized> = None;
-        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
-
-        let should_break = service
-            .execute_flow_item(
-                &mut pool,
-                &unmatched_breaking_item,
-                &target,
-                &context,
-                &options,
-                None,
-                &mut plugin_server_mapping,
-                &FlowPenalties::default(),
-                &mut selection,
-                &mut tier_mapping,
-            )
-            .await
-            .expect("flow item executes");
-
-        assert!(
-            !should_break,
-            "an item whose rules did not match must not cut the flow short"
-        );
-        assert!(pool.is_empty(), "unmatched item contributes no servers");
-
-        // 规则命中时 break 字段照常生效
-        let matched_breaking_item = FlowItem {
-            rules: vec![FlowCond::CnIp(false)],
-            ..unmatched_breaking_item.clone()
-        };
-        let should_break = service
-            .execute_flow_item(
-                &mut pool,
-                &matched_breaking_item,
-                &target,
-                &context,
-                &options,
-                None,
-                &mut plugin_server_mapping,
-                &FlowPenalties::default(),
-                &mut selection,
-                &mut tier_mapping,
-            )
-            .await
-            .expect("flow item executes");
-        assert!(
-            should_break,
-            "a matched item with break: true cuts the flow"
-        );
-
-        // 后续项在未被截断时仍然贡献节点
-        let mut pool = Vec::new();
-        let should_break = service
-            .execute_flow_item(
-                &mut pool,
-                &fallback_item,
-                &target,
-                &context,
-                &options,
-                None,
-                &mut plugin_server_mapping,
-                &FlowPenalties::default(),
-                &mut selection,
-                &mut tier_mapping,
-            )
-            .await
-            .expect("flow item executes");
-        assert!(!should_break);
-        assert_eq!(pool, vec![("test_server_1".to_string(), 5)]);
-    }
-
     /// 同层内权重仍然只表达流量配比，不表达优先级。
     #[tokio::test]
     async fn weights_within_a_tier_still_split_traffic() {
@@ -2777,7 +2661,6 @@ mod tests {
                     weight: 7,
                 },
             ],
-            r#break: false,
             tier: 2,
         };
 
@@ -2829,7 +2712,6 @@ mod tests {
                     id: "normal_server".to_string(),
                     weight: 5,
                 }],
-                r#break: false,
                 tier,
             };
             service
@@ -2878,7 +2760,6 @@ mod tests {
                         weight: 4,
                     },
                 ],
-                r#break: false,
                 tier: 0,
             };
 
@@ -2923,7 +2804,6 @@ mod tests {
             rules: vec![FlowCond::CnIp(true)],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Break],
-            r#break: false,
             tier: 0,
         };
 
@@ -2981,7 +2861,6 @@ mod tests {
                     weight: 6,
                 },
             ],
-            r#break: false,
             tier: 0,
         };
 
@@ -3290,7 +3169,6 @@ mod tests {
                     id: "h3_pinned".to_string(),
                     weight: 10,
                 }],
-                r#break: false,
                 tier: 0,
             }],
             challenge: None,
@@ -3331,7 +3209,6 @@ mod tests {
                         weight: 10,
                     },
                 ],
-                r#break: false,
                 tier: 0,
             }],
             challenge: None,
@@ -3447,7 +3324,6 @@ mod tests {
                     id: "tier_primary".to_string(),
                     weight: 5,
                 }],
-                r#break: false,
                 tier: 0,
             },
             FlowItem {
@@ -3457,7 +3333,6 @@ mod tests {
                     id: "tier_backup".to_string(),
                     weight: 100,
                 }],
-                r#break: false,
                 tier: 1,
             },
         ]
@@ -3638,7 +3513,6 @@ mod tests {
                 id: "h3_pinned".to_string(),
                 weight: 10,
             }],
-            r#break: false,
             tier: 0,
         }];
         let result = service
@@ -3711,7 +3585,6 @@ mod tests {
                     weight: 10,
                 },
             ],
-            r#break: false,
             tier: 0,
         }];
         let result = service
