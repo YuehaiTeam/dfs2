@@ -1,9 +1,9 @@
 use crate::{
-    config::SharedConfig,
+    config::{AppConfig, SharedConfig},
     error::{DfsError, DfsResult},
     models::{
-        FlowContext, FlowJsContext, FlowOptions, FlowPenalties, FlowResult, FlowTarget,
-        PluginMetadata,
+        ClientCapabilities, FlowContext, FlowJsContext, FlowOptions, FlowPenalties, FlowResult,
+        FlowTarget, PluginMetadata,
     },
     modules::{
         external::geolocation,
@@ -195,49 +195,18 @@ impl FlowService {
                             continue;
                         }
 
-                        // Transport capability gates: skip servers when client lacks capability
                         let config = self.shared_config.load();
-                        if let Some(server_config) = config.servers.get(id) {
-                            // SSH-only gate: skip if client doesn't support SSH tunnel
-                            if server_config.ssh_only && !context.capabilities.ssh {
-                                debug!(
-                                    server = %id,
-                                    "Skipping ssh_only server: client is not ssh-capable"
-                                );
-                                continue;
-                            }
-                            // dfs_sftp gate: skip if client doesn't support SFTP
-                            let is_sftp = server_config.r#type == "dfs_sftp";
-                            if is_sftp && !context.capabilities.sftp {
-                                debug!(
-                                    server = %id,
-                                    "Skipping dfs_sftp server: client is not sftp-capable"
-                                );
-                                continue;
-                            }
-                            let is_wt = server_config.r#type == "dfs_webtransport";
-                            if server_config.h3_only && is_wt {
-                                // Dual mode: need at least one of h3 or wt
-                                if !context.capabilities.h3 && !context.capabilities.wt {
-                                    debug!(
-                                        server = %id,
-                                        "Skipping h3_only+wt server: client supports neither h3 nor wt"
-                                    );
-                                    continue;
-                                }
-                            } else if server_config.h3_only && !context.capabilities.h3 {
-                                debug!(
-                                    server = %id,
-                                    "Skipping h3_only server: client is not h3-capable"
-                                );
-                                continue;
-                            } else if is_wt && !context.capabilities.wt {
-                                debug!(
-                                    server = %id,
-                                    "Skipping dfs_webtransport server: client is not wt-capable"
-                                );
-                                continue;
-                            }
+                        if let Some(server_config) = config.servers.get(id)
+                            && !capabilities::server_transport_is_usable(
+                                server_config,
+                                &context.capabilities,
+                            )
+                        {
+                            debug!(
+                                server = %id,
+                                "Skipping server: client cannot speak the transport it requires"
+                            );
+                            continue;
                         }
 
                         Self::record_pool_entry_tier(tier_mapping, id, item.tier);
@@ -253,63 +222,12 @@ impl FlowService {
                         let result = self
                             .execute_plugin(id, indirect, pool.clone(), &flow_context)
                             .await?;
-                        self.process_plugin_result(result, pool, plugin_server_mapping)?;
-
-                        // Transport capability gates for plugin-returned entries
-                        {
-                            let config = self.shared_config.load();
-                            pool.retain(|(url, _weight)| {
-                                if let Some((Some(server_id), _)) = plugin_server_mapping.get(url)
-                                    && let Some(server_config) = config.servers.get(server_id)
-                                {
-                                    // SSH-only gate
-                                    if server_config.ssh_only && !context.capabilities.ssh {
-                                        debug!(
-                                            server = %server_id,
-                                            url = %url,
-                                            "Skipping ssh_only plugin server: client is not ssh-capable"
-                                        );
-                                        return false;
-                                    }
-                                    // dfs_sftp gate
-                                    let is_sftp = server_config.r#type == "dfs_sftp";
-                                    if is_sftp && !context.capabilities.sftp {
-                                        debug!(
-                                            server = %server_id,
-                                            url = %url,
-                                            "Skipping dfs_sftp plugin server: client is not sftp-capable"
-                                        );
-                                        return false;
-                                    }
-                                    let is_wt = server_config.r#type == "dfs_webtransport";
-                                    if server_config.h3_only && is_wt {
-                                        if !context.capabilities.h3 && !context.capabilities.wt {
-                                            debug!(
-                                                server = %server_id,
-                                                url = %url,
-                                                "Skipping h3_only+wt plugin server: client supports neither"
-                                            );
-                                            return false;
-                                        }
-                                    } else if server_config.h3_only && !context.capabilities.h3 {
-                                        debug!(
-                                            server = %server_id,
-                                            url = %url,
-                                            "Skipping h3_only plugin server: client is not h3-capable"
-                                        );
-                                        return false;
-                                    } else if is_wt && !context.capabilities.wt {
-                                        debug!(
-                                            server = %server_id,
-                                            url = %url,
-                                            "Skipping dfs_webtransport plugin server: client is not wt-capable"
-                                        );
-                                        return false;
-                                    }
-                                }
-                                true
-                            });
-                        }
+                        self.process_plugin_result(
+                            result,
+                            pool,
+                            plugin_server_mapping,
+                            &context.capabilities,
+                        )?;
 
                         // 插件可以整体替换池子，因此按"尚未归属"补记而不是记录新增项
                         for (name, _) in pool.iter() {
@@ -707,12 +625,18 @@ impl FlowService {
     }
 
     /// 处理插件结果
+    ///
+    /// 条目在压入池子之前逐条过门禁：客户端用不了的传输、指向未定义节点的归属声明都在这里丢弃，
+    /// 池里剩下的因此都是可交付的，加权随机的分母也才是对的。
     fn process_plugin_result(
         &self,
         result: serde_json::Value,
         pool: &mut Vec<(String, u32)>,
         plugin_server_mapping: &mut HashMap<String, (Option<String>, bool)>,
+        capabilities: &ClientCapabilities,
     ) -> DfsResult<()> {
+        let config = self.shared_config.load();
+
         // 尝试解析增强格式
         if let Ok((_should_break, enhanced_pool)) = serde_json::from_value::<(
             bool,
@@ -721,6 +645,13 @@ impl FlowService {
         {
             pool.clear();
             for (url, weight, metadata) in enhanced_pool {
+                let server_id = metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.server_id.as_deref());
+                if !Self::plugin_entry_is_usable(&config, &url, server_id, capabilities) {
+                    continue;
+                }
+
                 pool.push((url.clone(), weight));
 
                 if let Some(metadata) = metadata {
@@ -731,15 +662,59 @@ impl FlowService {
                 }
             }
         } else {
-            // 兼容旧格式
+            // 兼容旧格式：没有 metadata 层，归属无从得知，只能按 URL 自身的 scheme 判定
             let (_should_break, basic_pool): (bool, Vec<(String, u32)>) =
                 serde_json::from_value(result).map_err(|e| {
                     DfsError::internal_error(format!("Failed to parse plugin result: {e}"))
                 })?;
             pool.clear();
-            pool.extend(basic_pool);
+            pool.extend(basic_pool.into_iter().filter(|(url, _weight)| {
+                Self::plugin_entry_is_usable(&config, url, None, capabilities)
+            }));
         }
         Ok(())
+    }
+
+    /// 插件返回的一条池条目能否交给这个客户端。
+    ///
+    /// 声明了归属时以节点配置为准：插件用内置签名函数生成的 URL 是 `http(s)://`，scheme 上看不
+    /// 出传输要求，节点配置是更精确的判据。声明的节点不存在则丢弃——它解析不成任何真实节点，留在
+    /// 池里只会占着权重份额等健康检查剔除。未声明归属的条目只剩 scheme 可依据。
+    fn plugin_entry_is_usable(
+        config: &AppConfig,
+        url: &str,
+        server_id: Option<&str>,
+        capabilities: &ClientCapabilities,
+    ) -> bool {
+        if let Some(server_id) = server_id {
+            let Some(server_config) = config.servers.get(server_id) else {
+                debug!(
+                    server = %server_id,
+                    url = %url,
+                    "Dropping plugin entry: it claims a server that is not defined"
+                );
+                return false;
+            };
+
+            if !capabilities::server_transport_is_usable(server_config, capabilities) {
+                debug!(
+                    server = %server_id,
+                    url = %url,
+                    "Dropping plugin entry: client cannot speak the transport its server requires"
+                );
+                return false;
+            }
+        }
+
+        if !capabilities::url_transport_is_usable(url, capabilities) {
+            debug!(
+                url = %url,
+                "Dropping plugin entry: client cannot speak the transport its scheme requires"
+            );
+            return false;
+        }
+
+        true
     }
 
     fn pool_entry_server_id<'a>(
@@ -1886,11 +1861,11 @@ mod tests {
             false, // should_break
             [
                 ["http://server1.example.com/file", 10, {
-                    "server_id": "srv1",
+                    "server_id": "test_server_1",
                     "skip_penalty": true
                 }],
                 ["http://server2.example.com/file", 5, {
-                    "server_id": "srv2",
+                    "server_id": "test_server_2",
                     "skip_penalty": false
                 }],
                 ["http://server3.example.com/file", 8, null]
@@ -1900,8 +1875,12 @@ mod tests {
         let mut pool = vec![];
         let mut plugin_server_mapping = HashMap::new();
 
-        let result =
-            service.process_plugin_result(enhanced_result, &mut pool, &mut plugin_server_mapping);
+        let result = service.process_plugin_result(
+            enhanced_result,
+            &mut pool,
+            &mut plugin_server_mapping,
+            &ClientCapabilities::default(),
+        );
         assert!(
             result.is_ok(),
             "Enhanced format should be parsed successfully"
@@ -1921,11 +1900,11 @@ mod tests {
         );
         assert_eq!(
             plugin_server_mapping.get("http://server1.example.com/file"),
-            Some(&(Some("srv1".to_string()), true))
+            Some(&(Some("test_server_1".to_string()), true))
         );
         assert_eq!(
             plugin_server_mapping.get("http://server2.example.com/file"),
-            Some(&(Some("srv2".to_string()), false))
+            Some(&(Some("test_server_2".to_string()), false))
         );
         assert!(
             !plugin_server_mapping.contains_key("http://server3.example.com/file"),
@@ -1944,8 +1923,12 @@ mod tests {
         let mut pool = vec![];
         let mut plugin_server_mapping = HashMap::new();
 
-        let result =
-            service.process_plugin_result(compatible_result, &mut pool, &mut plugin_server_mapping);
+        let result = service.process_plugin_result(
+            compatible_result,
+            &mut pool,
+            &mut plugin_server_mapping,
+            &ClientCapabilities::default(),
+        );
         assert!(
             result.is_ok(),
             "Compatible format should be parsed successfully"
@@ -1968,8 +1951,12 @@ mod tests {
         let mut pool = vec![];
         let mut plugin_server_mapping = HashMap::new();
 
-        let result =
-            service.process_plugin_result(invalid_result, &mut pool, &mut plugin_server_mapping);
+        let result = service.process_plugin_result(
+            invalid_result,
+            &mut pool,
+            &mut plugin_server_mapping,
+            &ClientCapabilities::default(),
+        );
         assert!(result.is_err(), "Invalid format should return error");
 
         // 测试部分无效数据 - 缺少必要字段
@@ -1987,6 +1974,7 @@ mod tests {
             partial_invalid_result,
             &mut pool,
             &mut plugin_server_mapping,
+            &ClientCapabilities::default(),
         );
         assert!(
             result.is_err(),
@@ -1998,8 +1986,12 @@ mod tests {
         let mut pool = vec![("existing".to_string(), 1)]; // 预存在的数据
         let mut plugin_server_mapping = HashMap::new();
 
-        let result =
-            service.process_plugin_result(empty_result, &mut pool, &mut plugin_server_mapping);
+        let result = service.process_plugin_result(
+            empty_result,
+            &mut pool,
+            &mut plugin_server_mapping,
+            &ClientCapabilities::default(),
+        );
         assert!(result.is_ok(), "Empty result should be valid");
         assert_eq!(
             pool.len(),
@@ -2012,11 +2004,11 @@ mod tests {
             false,
             [
                 ["http://penalty-skip.example.com/file", 10, {
-                    "server_id": "penalty-skip",
+                    "server_id": "test_server_1",
                     "skip_penalty": true
                 }],
                 ["http://penalty-normal.example.com/file", 10, {
-                    "server_id": "penalty-normal"
+                    "server_id": "test_server_2"
                     // skip_penalty 省略，应该默认为false
                 }]
             ]
@@ -2029,22 +2021,159 @@ mod tests {
             skip_penalty_result,
             &mut pool,
             &mut plugin_server_mapping,
+            &ClientCapabilities::default(),
         );
         assert!(result.is_ok(), "Skip penalty result should be valid");
 
         // 验证skip_penalty处理
         assert_eq!(
             plugin_server_mapping.get("http://penalty-skip.example.com/file"),
-            Some(&(Some("penalty-skip".to_string()), true)),
+            Some(&(Some("test_server_1".to_string()), true)),
             "skip_penalty: true should be preserved"
         );
         assert_eq!(
             plugin_server_mapping.get("http://penalty-normal.example.com/file"),
-            Some(&(Some("penalty-normal".to_string()), false)),
+            Some(&(Some("test_server_2".to_string()), false)),
             "missing skip_penalty should default to false"
         );
 
         println!("✅ All plugin result processing tests passed");
+    }
+
+    /// 带 `h3_server`（h3_only）与 `test_server_1`（direct）的服务，用来分别观察两条门禁判据。
+    async fn plugin_gate_service() -> FlowService {
+        let env = TestEnvironment::with_config(create_h3_test_config()).await;
+        env.services.flow_service
+    }
+
+    fn gate_plugin_result(entries: serde_json::Value) -> serde_json::Value {
+        json!([false, entries])
+    }
+
+    async fn pool_after_plugin(
+        service: &FlowService,
+        entries: serde_json::Value,
+        capabilities: &ClientCapabilities,
+    ) -> Vec<(String, u32)> {
+        let mut pool = vec![];
+        let mut plugin_server_mapping = HashMap::new();
+        service
+            .process_plugin_result(
+                gate_plugin_result(entries),
+                &mut pool,
+                &mut plugin_server_mapping,
+                capabilities,
+            )
+            .expect("plugin result should parse");
+        pool
+    }
+
+    #[tokio::test]
+    async fn a_plugin_entry_claiming_an_undefined_server_is_dropped() {
+        let service = plugin_gate_service().await;
+
+        let pool = pool_after_plugin(
+            &service,
+            json!([
+                ["https://ghost.example.com/f", 10, {"server_id": "ghost"}],
+                ["https://real.example.com/f", 7, {"server_id": "test_server_1"}]
+            ]),
+            &ClientCapabilities::default(),
+        )
+        .await;
+
+        assert_eq!(pool, vec![("https://real.example.com/f".to_string(), 7)]);
+    }
+
+    /// 归属声明比 scheme 更精确：URL 是 `https://`，只有节点配置能说出它要 HTTP/3。
+    #[tokio::test]
+    async fn a_plugin_entry_is_gated_by_the_server_it_claims() {
+        let service = plugin_gate_service().await;
+        let entries = json!([["https://h3.example.com/f", 10, {"server_id": "h3_server"}]]);
+
+        let without_h3 =
+            pool_after_plugin(&service, entries.clone(), &ClientCapabilities::default()).await;
+        assert!(without_h3.is_empty());
+
+        let with_h3 = pool_after_plugin(
+            &service,
+            entries,
+            &ClientCapabilities {
+                h3: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(with_h3.len(), 1);
+    }
+
+    /// 没有归属声明时只剩 scheme 可依据。
+    #[tokio::test]
+    async fn a_plugin_entry_is_gated_by_its_own_scheme() {
+        let service = plugin_gate_service().await;
+        let entries = json!([
+            ["http3://cdn.example.com/f", 10, null],
+            ["https://plain.example.com/f", 5, null]
+        ]);
+
+        let without_h3 =
+            pool_after_plugin(&service, entries.clone(), &ClientCapabilities::default()).await;
+        assert_eq!(
+            without_h3,
+            vec![("https://plain.example.com/f".to_string(), 5)]
+        );
+
+        let with_h3 = pool_after_plugin(
+            &service,
+            entries,
+            &ClientCapabilities {
+                h3: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(with_h3.len(), 2);
+    }
+
+    /// 旧格式没有 metadata 层，若不逐条过 scheme 门禁就会整批绕过。
+    #[tokio::test]
+    async fn legacy_format_entries_are_gated_by_scheme_too() {
+        let service = plugin_gate_service().await;
+
+        let pool = pool_after_plugin(
+            &service,
+            json!([
+                ["sftp://node.example.com:22/f", 10],
+                ["https://plain.example.com/f", 5]
+            ]),
+            &ClientCapabilities::default(),
+        )
+        .await;
+
+        assert_eq!(pool, vec![("https://plain.example.com/f".to_string(), 5)]);
+    }
+
+    /// 门禁丢弃的条目不进 `plugin_server_mapping`，否则惩罚与层归属会挂在不存在的池条目上。
+    #[tokio::test]
+    async fn dropped_entries_leave_no_mapping_behind() {
+        let service = plugin_gate_service().await;
+        let mut pool = vec![];
+        let mut plugin_server_mapping = HashMap::new();
+
+        service
+            .process_plugin_result(
+                gate_plugin_result(json!([
+                    ["https://h3.example.com/f", 10, {"server_id": "h3_server"}],
+                    ["https://ghost.example.com/f", 10, {"server_id": "ghost"}]
+                ])),
+                &mut pool,
+                &mut plugin_server_mapping,
+                &ClientCapabilities::default(),
+            )
+            .expect("plugin result should parse");
+
+        assert!(pool.is_empty());
+        assert!(plugin_server_mapping.is_empty());
     }
 
     /// Helper: create test config with h3_only servers for h3 gate tests

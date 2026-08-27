@@ -192,6 +192,67 @@ pub fn compute_capabilities(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Transport gates
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether the client can use the transport this server requires.
+///
+/// The dispatch order mirrors [`rewrite_url`]: only servers this gate admits get rewritten, so
+/// both must resolve the same `ServerConfig` to the same transport. A server whose transport the
+/// client cannot speak must never enter the pool — the rewrite would hand back a scheme the
+/// client cannot open.
+pub fn server_transport_is_usable(
+    server_config: &ServerConfig,
+    capabilities: &ClientCapabilities,
+) -> bool {
+    if server_config.ssh_only {
+        return capabilities.ssh;
+    }
+
+    if server_config.r#type == "dfs_sftp" {
+        return capabilities.sftp;
+    }
+
+    // Dual mode: rewrite_url picks h3 or wt from whatever the client has, so either one admits it.
+    let is_wt = server_config.r#type == "dfs_webtransport";
+    if server_config.h3_only && is_wt {
+        return capabilities.h3 || capabilities.wt;
+    }
+
+    if server_config.h3_only {
+        return capabilities.h3;
+    }
+
+    match server_config.r#type.as_str() {
+        "dfs_rtc" => capabilities.wrtc,
+        "dfs_webtransport" => capabilities.wt,
+        _ => true,
+    }
+}
+
+/// Whether the client can use the transport this URL's scheme asks for.
+///
+/// The schemes are the ones [`rewrite_url`] and `DfsSftpSigner` produce: a URL carrying
+/// `http3://` is a statement that it needs HTTP/3. Anything else, `http://` and `https://`
+/// included, is admitted — a plugin returning a third-party URL that belongs to no configured
+/// server is legitimate, and rejecting unknown schemes would drop it.
+pub fn url_transport_is_usable(url: &str, capabilities: &ClientCapabilities) -> bool {
+    if url.starts_with("http3://") {
+        capabilities.h3
+    } else if url.starts_with("h3wt://") {
+        capabilities.wt
+    } else if url.starts_with("wrtc://") {
+        capabilities.wrtc
+    } else if url.starts_with("ssh+http://") {
+        capabilities.ssh
+    } else if url.starts_with("sftp://") {
+        capabilities.sftp
+    } else {
+        true
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // URL rewriting
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -666,6 +727,123 @@ mod tests {
         ClientCapabilities {
             wt: true,
             ..Default::default()
+        }
+    }
+
+    fn server_of_type(r#type: &str) -> ServerConfig {
+        ServerConfig {
+            id: "test".into(),
+            url: "https://example.com".into(),
+            r#type: r#type.into(),
+            ..Default::default()
+        }
+    }
+
+    fn caps_with(field: fn(&mut ClientCapabilities)) -> ClientCapabilities {
+        let mut caps = ClientCapabilities::default();
+        field(&mut caps);
+        caps
+    }
+
+    #[test]
+    fn each_restricted_transport_admits_only_its_own_capability() {
+        let none = ClientCapabilities::default();
+
+        let ssh = ServerConfig {
+            ssh_only: true,
+            ..server_of_type("dfs_node")
+        };
+        assert!(server_transport_is_usable(
+            &ssh,
+            &caps_with(|c| c.ssh = true)
+        ));
+        assert!(!server_transport_is_usable(&ssh, &none));
+
+        let sftp = server_of_type("dfs_sftp");
+        assert!(server_transport_is_usable(
+            &sftp,
+            &caps_with(|c| c.sftp = true)
+        ));
+        assert!(!server_transport_is_usable(&sftp, &none));
+
+        let h3 = ServerConfig {
+            h3_only: true,
+            ..server_of_type("direct")
+        };
+        assert!(server_transport_is_usable(&h3, &caps_h3()));
+        assert!(!server_transport_is_usable(&h3, &none));
+
+        let wt = server_of_type("dfs_webtransport");
+        assert!(server_transport_is_usable(&wt, &caps_wt()));
+        assert!(!server_transport_is_usable(&wt, &none));
+
+        // rewrite_url 把 dfs_rtc 改写成 wrtc://，门禁必须同样要求 wrtc，否则不支持的客户端
+        // 会拿到一个打不开的 scheme。
+        let rtc = server_of_type("dfs_rtc");
+        assert!(server_transport_is_usable(
+            &rtc,
+            &caps_with(|c| c.wrtc = true)
+        ));
+        assert!(!server_transport_is_usable(&rtc, &none));
+    }
+
+    #[test]
+    fn a_dual_mode_server_needs_either_h3_or_wt() {
+        let dual = ServerConfig {
+            h3_only: true,
+            ..server_of_type("dfs_webtransport")
+        };
+
+        assert!(server_transport_is_usable(&dual, &caps_h3()));
+        assert!(server_transport_is_usable(&dual, &caps_wt()));
+        assert!(!server_transport_is_usable(
+            &dual,
+            &ClientCapabilities::default()
+        ));
+    }
+
+    #[test]
+    fn an_unrestricted_server_is_usable_without_any_capability() {
+        assert!(server_transport_is_usable(
+            &server_of_type("direct"),
+            &ClientCapabilities::default()
+        ));
+    }
+
+    #[test]
+    fn each_custom_scheme_admits_only_its_own_capability() {
+        let none = ClientCapabilities::default();
+        let cases = [
+            ("http3://example.com/f", caps_with(|c| c.h3 = true)),
+            ("h3wt://example.com/f", caps_with(|c| c.wt = true)),
+            ("wrtc://example.com/f", caps_with(|c| c.wrtc = true)),
+            ("ssh+http://example.com:22/f", caps_with(|c| c.ssh = true)),
+            ("sftp://example.com:22/f", caps_with(|c| c.sftp = true)),
+        ];
+
+        for (url, granted) in cases {
+            assert!(
+                url_transport_is_usable(url, &granted),
+                "{url} should be usable by a client that has its capability"
+            );
+            assert!(
+                !url_transport_is_usable(url, &none),
+                "{url} should be rejected for a client with no capabilities"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_and_unknown_schemes_are_admitted() {
+        // 插件返回不属于任何已配置节点的第三方 URL 是合法用法，拒绝未知 scheme 就成了误杀。
+        let none = ClientCapabilities::default();
+        for url in [
+            "http://example.com/f",
+            "https://example.com/f",
+            "ftp://example.com/f",
+            "not-a-url",
+        ] {
+            assert!(url_transport_is_usable(url, &none), "{url} should pass");
         }
     }
 

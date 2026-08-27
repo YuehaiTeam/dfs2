@@ -24,7 +24,7 @@ flow 里 `use` 下的 `server <名字>` 引用不受任何检查。名字没有�
 
 摘除本身不打日志。报告职责归 `dfs2 validate`，而配置加载在每次热重载时都会发生，在那里打 warn 只会重复同一条已经被报告过的事实。
 
-插件在运行时返回未定义 `server_id` 的同类问题不在本篇范围内——那是运行时产物，静态检查覆盖不到，见[插件返回条目的能力门禁](../proposed/2026-08-27-plugin-url-capability-gate.md)。
+插件在运行时返回未定义 `server_id` 的同类问题不在本篇范围内——那是运行时产物，静态检查覆盖不到，见[插件返回条目的能力门禁](2026-08-27-plugin-url-capability-gate.md)。
 
 ## Alternatives considered
 
