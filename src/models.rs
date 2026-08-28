@@ -146,10 +146,13 @@ pub struct FlowContext {
 }
 
 impl FlowContext {
-    /// 调度器自身发起的取件：没有客户端，能力取本进程 fetch 客户端的实际支持面。
-    pub fn internal() -> Self {
+    /// 调度器自身发起的取件：能力取本进程 fetch 客户端的实际支持面。
+    ///
+    /// `egress_ip` 取自配置的调度器出口 IP（`InternalConfig::egress_ip`），让内部取件被
+    /// `cnip`/`geoip`/`cidr` 按调度器自身的位置调度；不配置时为 `None`，地理条件全不命中。
+    pub fn internal(egress_ip: Option<IpAddr>) -> Self {
         Self {
-            client_ip: None,
+            client_ip: egress_ip,
             session_id: None,
             extras: serde_json::json!({}),
             capabilities: ClientCapabilities::internal_fetcher(),

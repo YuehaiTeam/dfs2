@@ -2228,7 +2228,7 @@ mod tests {
         let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let (target, _client_context, options) = create_test_context();
-        let context = FlowContext::internal();
+        let context = FlowContext::internal(None);
         assert!(context.internal);
         assert!(context.capabilities.h3, "内部取件走 H3 middleware");
         assert!(!context.capabilities.wt, "本进程不做 WebTransport 客户端");
@@ -2272,7 +2272,7 @@ mod tests {
         let service = create_test_flow_service().await;
         let (target, mut client_context, _options) = create_test_context();
 
-        let internal_context = FlowContext::internal();
+        let internal_context = FlowContext::internal(None);
         assert!(
             service
                 .evaluate_condition(&FlowCond::Internal(true), &target, &internal_context)
@@ -2295,6 +2295,51 @@ mod tests {
                 .await
                 .expect("internal condition evaluates")
         );
+    }
+
+    /// 配置了出口 IP 的内部上下文按该 IP 参与地理条件求值；`internal` 条件只看标志、与 IP 无关。
+    #[tokio::test]
+    async fn an_egress_ip_lets_geo_conditions_route_internal_fetches() {
+        let service = create_test_flow_service().await;
+        let (target, _client_context, _options) = create_test_context();
+
+        // 无 IP 时 cnip 两个方向都不命中，带 IP 后（测试环境无 IPDB，一律判全球）cnip false 命中
+        let without_ip = FlowContext::internal(None);
+        assert!(
+            !service
+                .evaluate_condition(&FlowCond::CnIp(false), &target, &without_ip)
+                .await
+                .expect("cnip evaluates")
+        );
+
+        let with_ip = FlowContext::internal(Some("203.0.113.0".parse().unwrap()));
+        assert!(
+            service
+                .evaluate_condition(&FlowCond::CnIp(false), &target, &with_ip)
+                .await
+                .expect("cnip evaluates"),
+            "an internal context carrying an egress IP must be routable by geo conditions"
+        );
+
+        // cidr 同样按出口 IP 判定
+        let cidr: FlowCond = serde_yaml::from_str("cidr 203.0.113.0/24").expect("cidr parses");
+        assert!(
+            service
+                .evaluate_condition(&cidr, &target, &with_ip)
+                .await
+                .expect("cidr evaluates")
+        );
+
+        // internal 条件的判定与 IP 无关
+        for context in [&without_ip, &with_ip] {
+            assert!(
+                service
+                    .evaluate_condition(&FlowCond::Internal(true), &target, context)
+                    .await
+                    .expect("internal condition evaluates"),
+                "the internal flag must not depend on the egress IP"
+            );
+        }
     }
 
     #[tokio::test]

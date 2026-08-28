@@ -387,6 +387,7 @@ mod tests {
             server_impl: HashMap::new(),
             challenge: crate::config::ChallengeConfig::default(),
             pruned_flow_server_refs: Vec::new(),
+            internal: crate::config::InternalConfig::default(),
         };
 
         let config = crate::config::SharedConfig::new(app_config);

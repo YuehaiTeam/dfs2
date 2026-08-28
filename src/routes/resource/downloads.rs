@@ -121,7 +121,7 @@ async fn fill_cache_via_internal_fetch(
         ranges: None,
         file_size,
     };
-    let context = crate::models::FlowContext::internal();
+    let context = crate::models::FlowContext::internal(config.internal.egress_ip());
     let options = crate::models::FlowOptions {
         cdn_full_range: false,
     };

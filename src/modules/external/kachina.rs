@@ -184,7 +184,7 @@ pub async fn fetch_file_range(
     };
 
     // 元数据解析由服务端自己取件，不代表任何客户端
-    let context = FlowContext::internal();
+    let context = FlowContext::internal(config_guard.internal.egress_ip());
 
     let options = FlowOptions {
         cdn_full_range: false, // Kachina解析不使用全范围模式

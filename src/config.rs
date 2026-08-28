@@ -589,6 +589,27 @@ impl<'js> IntoJs<'js> for ResourceConfig {
     }
 }
 
+/// 调度器自身的网络身份，供内部取件参与地理调度。
+///
+/// 由运维写入出口 IP，按惯例抹掉末段作脱敏（v4 抹末字节、v6 抹接口段），程序不做二次处理；
+/// geoip 库的粒度在 /24 及以上，抹零不影响国家、ISP 判定。不配置时内部取件没有网络位置，
+/// 所有地理条件不命中。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct InternalConfig {
+    pub ip4: Option<std::net::Ipv4Addr>,
+    pub ip6: Option<std::net::Ipv6Addr>,
+}
+
+impl InternalConfig {
+    /// 内部取件求值用的出口 IP。条件求值只有一个 `client_ip` 位，双栈时取 ip4：
+    /// `cnip`、`geoip` 都是 v4 语义为主，v6 仅在 ip4 缺失时兜底。
+    pub fn egress_ip(&self) -> Option<std::net::IpAddr> {
+        self.ip4
+            .map(std::net::IpAddr::V4)
+            .or(self.ip6.map(std::net::IpAddr::V6))
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AppConfig {
     pub servers: HashMap<String, ServerConfig>,
@@ -599,6 +620,9 @@ pub struct AppConfig {
     /// Global challenge configuration (can be overridden per resource)
     #[serde(default)]
     pub challenge: ChallengeConfig,
+    /// 调度器自身的网络身份，见 [`InternalConfig`]
+    #[serde(default)]
+    pub internal: InternalConfig,
     #[serde(default, skip)]
     pub plugin_code: HashMap<String, String>,
     #[serde(default, skip)]
@@ -851,6 +875,60 @@ resources:
 
     fn use_list(config: &AppConfig, item: usize) -> Vec<FlowUse> {
         config.resources["app"].flow[item].r#use.clone()
+    }
+
+    #[test]
+    fn egress_ip_prefers_ip4_and_falls_back_to_ip6() {
+        let both = InternalConfig {
+            ip4: Some("203.0.113.0".parse().unwrap()),
+            ip6: Some("2001:db8::".parse().unwrap()),
+        };
+        assert_eq!(both.egress_ip(), Some("203.0.113.0".parse().unwrap()));
+
+        let v6_only = InternalConfig {
+            ip4: None,
+            ip6: Some("2001:db8::".parse().unwrap()),
+        };
+        assert_eq!(v6_only.egress_ip(), Some("2001:db8::".parse().unwrap()));
+
+        assert_eq!(InternalConfig::default().egress_ip(), None);
+    }
+
+    #[test]
+    fn an_invalid_egress_ip_fails_at_config_parse() {
+        // 解析失败即配置加载失败，dfs2 validate 因此能在部署前拦下写错的出口 IP
+        let yaml = r#"
+servers: {}
+plugins: {}
+resources: {}
+internal:
+  ip4: "not-an-ip"
+"#;
+        assert!(serde_yaml::from_str::<AppConfig>(yaml).is_err());
+
+        // 只配 ip6、不配 ip4 是合法形态
+        let yaml_v6 = r#"
+servers: {}
+plugins: {}
+resources: {}
+internal:
+  ip6: "2001:db8:1234::"
+"#;
+        let config: AppConfig = serde_yaml::from_str(yaml_v6).expect("v6-only internal parses");
+        assert_eq!(
+            config.internal.egress_ip(),
+            Some("2001:db8:1234::".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_config_without_an_internal_section_has_no_egress_ip() {
+        let config = config_with_flow(
+            r#"      - use:
+          - "server real 10"
+"#,
+        );
+        assert_eq!(config.internal.egress_ip(), None);
     }
 
     #[test]
@@ -1209,6 +1287,7 @@ cert_hash: "trust"
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
             pruned_flow_server_refs: Vec::new(),
+            internal: InternalConfig::default(),
         };
         let (errors, _warnings) = config.validate_servers_transport();
         assert!(!errors.is_empty());
@@ -1320,6 +1399,7 @@ cert_hash: "trust"
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
             pruned_flow_server_refs: Vec::new(),
+            internal: InternalConfig::default(),
         };
 
         // 测试有资源特定配置的情况 - 应该使用资源配置

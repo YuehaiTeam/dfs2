@@ -771,6 +771,7 @@ pub fn create_default_test_config() -> AppConfig {
         plugin_code: HashMap::new(),
         server_impl: HashMap::new(),
         pruned_flow_server_refs: Vec::new(),
+        internal: crate::config::InternalConfig::default(),
     };
 
     // 添加测试用web challenge插件
