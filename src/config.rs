@@ -601,8 +601,11 @@ pub struct InternalConfig {
 }
 
 impl InternalConfig {
-    /// 内部取件求值用的出口 IP。条件求值只有一个 `client_ip` 位，双栈时取 ip4：
+    /// 内部取件做地理求值用的出口 IP。条件求值只有一个 `client_ip` 位，双栈时取 ip4：
     /// `cnip`、`geoip` 都是 v4 语义为主，v6 仅在 ip4 缺失时兜底。
+    ///
+    /// `ipversion` 条件不经过这个单选：它对内部取件直接按 `ip4`/`ip6` 是否配置判定，
+    /// 双栈调度器因此两个版本的层都可达。
     pub fn egress_ip(&self) -> Option<std::net::IpAddr> {
         self.ip4
             .map(std::net::IpAddr::V4)

@@ -22,6 +22,8 @@ internal:
 
 `FlowContext::internal()` 接收 `InternalConfig::egress_ip()` 给出的 IP 填入 `client_ip`，优先 ip4，ip4 缺失时用 ip6。此后 `cnip`、`geoip`、`cidr` 对内部取件按调度器自身的位置求值，现有 flow 的地理分层自动对内部调度生效，缓存回填与 KachinaInstaller 两条内部路径同时受益。
 
+**`ipversion` 按配置的出口栈判定，不经过单 IP 挑选。** 它问的是"调度器有没有这个栈的出口"：`ipversion 4` 看 `ip4` 是否配置，`ipversion 6` 看 `ip6`。双栈调度器因此两个版本的层都可达——若拿 `client_ip` 里为地理求值挑出的 v4 去判，v6-only 层会对双栈调度器也关掉，而从 v6 节点取缓存本是可行的。
+
 其余语义不动：`internal` 标志仍为 true，`internal true/false` 条件继续按标志判定，与 IP 无关——要把某一层挡在内部取件之外（例如省 CDN 配额），在该层加 `internal false` 规则，机制已经存在。能力面仍取 `ClientCapabilities::internal_fetcher()`。
 
 不配置该段时 `client_ip` 保持为空，行为与配置引入前完全一致；现有配置不需要任何改动。IP 由 serde 直接解析为 `Ipv4Addr`/`Ipv6Addr`，写错即配置加载失败，`dfs2 validate` 在部署前就能拦下。
@@ -34,7 +36,7 @@ internal:
 
 **只加一个"内部视为国内/海外"的布尔配置。** 落选：表达力不够，丢掉 `cidr`、省份、ISP 级的匹配；而这些条件在 flow 里已经写好，给个 IP 就能全部复用。
 
-**ip4 与 ip6 任一命中即算命中。** 暂缓：`FlowContext.client_ip` 是单个 `IpAddr`，双 IP 求值要改动条件求值器的形状。先按单 IP 落地，v6-only 条件层（如教育网 cidr）对内部取件的可达性留给后续评估。
+**地理条件对 ip4 与 ip6 任一命中即算命中。** 暂缓：`FlowContext.client_ip` 是单个 `IpAddr`，双 IP 求值要改动条件求值器的形状。`ipversion` 已按配置栈单独判定；`cidr`、`cnip`、`geoip` 仍按单 IP 求值，v6-only 的 cidr 层（如教育网段）对内部取件的可达性留给后续评估。
 
 ## Verification
 
@@ -46,6 +48,7 @@ internal:
 | `internal` 条件只看标志、与 IP 无关 | PASS：`an_egress_ip_lets_geo_conditions_route_internal_fetches` 对带 IP 与不带 IP 两个上下文同断言 |
 | 两条内部路径都携带配置的 IP | PASS（结构性）：缓存回填与 KachinaInstaller 的 `FlowContext::internal` 调用都传 `config.internal.egress_ip()` |
 | 非法 IP 在配置加载期报错 | PASS：`an_invalid_egress_ip_fails_at_config_parse` |
+| `ipversion` 按出口栈判定：双栈两个版本都命中，仅 v4 不命中 `ipversion 6`，未配置全不命中 | PASS：`internal_ipversion_follows_the_configured_egress_stacks` |
 
 ## Consequences
 
@@ -55,6 +58,6 @@ internal:
 
 末段抹零在少数细于 /24 的分配上可能改变 ISP 判定，概率低，后果限于选向次优。
 
-单 IP 求值下，若配了 ip4，v6-only 的条件层对内部取件仍不可达。
+地理条件按单 IP 求值：配了 ip4 时，v6-only 的 `cidr` 层对内部取件不可达；`ipversion 6` 的层不受此限，按 `ip6` 是否配置判定。
 
 线上要享受此能力需在配置写入 `internal` 段，迁移在部署侧进行；写入前内部调度行为与配置引入前一致。

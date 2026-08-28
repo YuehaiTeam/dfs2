@@ -150,6 +150,7 @@ impl FlowContext {
     ///
     /// `egress_ip` 取自配置的调度器出口 IP（`InternalConfig::egress_ip`），让内部取件被
     /// `cnip`/`geoip`/`cidr` 按调度器自身的位置调度；不配置时为 `None`，地理条件全不命中。
+    /// `ipversion` 条件不看这个字段，而是按 `ip4`/`ip6` 各自是否配置判定。
     pub fn internal(egress_ip: Option<IpAddr>) -> Self {
         Self {
             client_ip: egress_ip,

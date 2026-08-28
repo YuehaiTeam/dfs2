@@ -436,6 +436,17 @@ impl FlowService {
                 }
             }
             FlowCond::IpVersion(expected_version) => {
+                // 内部取件按配置的出口栈判定：调度器配了哪个栈的出口，就能从那个栈的节点取件。
+                // context.client_ip 里只有为地理求值挑出的那一个（双栈时取 v4），拿它判 ipversion
+                // 会把 v6-only 层对双栈调度器也关掉。
+                if context.internal {
+                    let config = self.shared_config.load();
+                    return Ok(match expected_version {
+                        4 => config.internal.ip4.is_some(),
+                        6 => config.internal.ip6.is_some(),
+                        _ => false,
+                    });
+                }
                 if let Some(client_ip) = context.client_ip {
                     let actual_version = if geolocation::is_ipv6(client_ip) {
                         6
@@ -2338,6 +2349,65 @@ mod tests {
                     .await
                     .expect("internal condition evaluates"),
                 "the internal flag must not depend on the egress IP"
+            );
+        }
+    }
+
+    /// `ipversion` 对内部取件按配置的出口栈判定，不看 `client_ip` 里为地理求值挑出的那一个：
+    /// 双栈调度器的 v6-only 层必须可达，尽管地理求值用的是 v4。
+    #[tokio::test]
+    async fn internal_ipversion_follows_the_configured_egress_stacks() {
+        let mut config = crate::tests::mocks::create_default_test_config();
+        config.internal = crate::config::InternalConfig {
+            ip4: Some("203.0.113.0".parse().unwrap()),
+            ip6: Some("2001:db8:1234::".parse().unwrap()),
+        };
+        let env = TestEnvironment::with_config(config).await;
+        let service = env.services.flow_service.clone();
+        let (target, _client_context, _options) = create_test_context();
+
+        let internal_context = FlowContext::internal(Some("203.0.113.0".parse().unwrap()));
+        for version in [4, 6] {
+            assert!(
+                service
+                    .evaluate_condition(&FlowCond::IpVersion(version), &target, &internal_context)
+                    .await
+                    .expect("ipversion evaluates"),
+                "a dual-stack scheduler must match ipversion {version}"
+            );
+        }
+
+        // 只配 v4 的调度器够不到 v6-only 层
+        let mut v4_only = crate::tests::mocks::create_default_test_config();
+        v4_only.internal = crate::config::InternalConfig {
+            ip4: Some("203.0.113.0".parse().unwrap()),
+            ip6: None,
+        };
+        let env = TestEnvironment::with_config(v4_only).await;
+        let service = env.services.flow_service.clone();
+        assert!(
+            !service
+                .evaluate_condition(&FlowCond::IpVersion(6), &target, &internal_context)
+                .await
+                .expect("ipversion evaluates"),
+            "a v4-only scheduler must not match ipversion 6"
+        );
+
+        // 未配置 internal 段时行为与配置引入前一致：两个版本都不命中
+        let env = TestEnvironment::new().await;
+        let service = env.services.flow_service.clone();
+        let unconfigured_context = FlowContext::internal(None);
+        for version in [4, 6] {
+            assert!(
+                !service
+                    .evaluate_condition(
+                        &FlowCond::IpVersion(version),
+                        &target,
+                        &unconfigured_context
+                    )
+                    .await
+                    .expect("ipversion evaluates"),
+                "an unconfigured scheduler matches no ipversion"
             );
         }
     }
