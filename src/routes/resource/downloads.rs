@@ -95,7 +95,8 @@ const CACHE_MAX_BYTES: u64 = 256 * 1024;
 /// 国内节点对海外的服务端也是反向绕行。回填内容会分发给此后所有客户端，取件方向应当由服务端
 /// 自身的位置决定。
 ///
-/// 回填失败不影响本次请求：客户端已经拿到了自己的 URL，这里只是没写进缓存。
+/// 回填在为客户端选点之前尝试：成功则本请求直接由缓存供给，客户端那轮选点从不发生；
+/// 失败则照常为客户端选点并重定向，只是这次没写进缓存。
 #[allow(clippy::too_many_arguments)]
 async fn fill_cache_via_internal_fetch(
     ctx: &AppContext,
@@ -496,6 +497,70 @@ pub async fn handle_download_request_unified(
         size_candidate
     };
 
+    // 缓存未命中时先尝试内部回填。成功则本请求由缓存供给，与命中同待遇，不再为客户端选点——
+    // 否则那轮选点的结果只剩记账和日志，字节会被记在一个实际没出流量的节点头上。
+    if !is_version_file
+        && let Some((metadata, content)) = fill_cache_via_internal_fetch(
+            ctx,
+            &config_guard,
+            &resid,
+            &version,
+            &path,
+            sub_path.as_deref(),
+            file_size,
+            &resource_config.flow,
+        )
+        .await
+    {
+        // 取件字节真实出自回填源节点，日/分钟流量都记给它
+        let source_server = metadata.src.as_deref().unwrap_or("cache").to_string();
+        let bytes = metadata.content_length;
+
+        if let Err(e) = ctx
+            .data_store
+            .update_bandwidth_batch(BandwidthUpdateBatch {
+                resource_id: resid.clone(),
+                server_id: source_server.clone(),
+                bytes,
+            })
+            .await
+        {
+            warn!("Failed to update bandwidth for cache fill: {}", e);
+        }
+        ctx.bandwidth_cache_service
+            .record_bandwidth(&source_server, bytes)
+            .await;
+        ctx.metrics
+            .record_scheduled_request(&resid, &source_server, false);
+
+        if let Some(ip) = client_ip {
+            let session_logger = crate::modules::analytics::SessionLogger::new(
+                ctx.shared_config.clone(),
+                ctx.data_store.clone(),
+            );
+            if let Err(e) = session_logger
+                .log_cached_download(
+                    &resid,
+                    &version,
+                    ip,
+                    user_agent.clone(),
+                    original_session_id.clone(),
+                    bytes,
+                    metadata.src.as_deref(),
+                )
+                .await
+            {
+                error!("Failed to log cache fill download: {}", e);
+            }
+        }
+
+        return Ok(DownloadResponse::Cached {
+            content,
+            metadata,
+            status: CacheStatus::Miss,
+        });
+    }
+
     // 解析range参数（保持原有逻辑，让flow规则正常工作）
     let parsed_ranges = range.as_ref().and_then(|r| parse_range_for_flow(r));
 
@@ -646,22 +711,6 @@ pub async fn handle_download_request_unified(
         }
     );
 
-    let cached_result = if is_version_file {
-        None
-    } else {
-        fill_cache_via_internal_fetch(
-            ctx,
-            &config_guard,
-            &resid,
-            &version,
-            &path,
-            sub_path.as_deref(),
-            file_size,
-            flow_list,
-        )
-        .await
-    };
-
     // 如果是 Free 模式，记录直接下载日志
     if matches!(resource_config.download, DownloadPolicy::Free)
         && let Some(ip) = client_ip
@@ -787,15 +836,6 @@ pub async fn handle_download_request_unified(
             };
             debug!("{}", debug_msg);
         }
-    }
-
-    // 刚回填的内容直接回给客户端，对本次请求而言并不是命中
-    if let Some((metadata, content)) = cached_result {
-        return Ok(DownloadResponse::Cached {
-            content,
-            metadata,
-            status: CacheStatus::Miss,
-        });
     }
 
     Ok(DownloadResponse::Redirect(cdn_url))
