@@ -14,7 +14,7 @@ Status: implemented
 
 **`ClientCapabilities::internal_fetcher()` 声明本进程 fetch 客户端的能力面**：h3、ssh、sftp 为真，wt、wrtc 为假。取值依据是 `FETCH_CLIENT` 实际挂载的 middleware 栈；WebTransport 与 WebRTC 是浏览器侧协议，本进程作为客户端不具备。它与 `Default` 的区别是语义上的：`Default` 表示"未从请求中识别出任何能力"，这个构造表示"已知支持这些"。
 
-**`FlowContext.internal: bool` 单独标记发起方**，而不从 `client_ip` 推断。`FlowContext::internal()` 一次性组装内部取件的上下文，内部调用方不再手工拼字段——手工拼是上一处错误的来源。该字段随 `FlowContext` 一并序列化进插件上下文，插件也能据此分支。
+**`FlowContext.internal: bool` 单独标记发起方**，而不从 `client_ip` 推断。`FlowContext::internal()` 一次性组装内部取件的上下文，内部调用方不再手工拼字段——手工拼是上一处错误的来源。该字段随 `FlowContext` 一并序列化进插件上下文，插件也能据此分支。上下文中的 `client_ip` 取配置的调度器出口 IP，让地理条件按服务端自身位置对内部取件求值，见[内部取件携带调度器出口 IP](2026-08-28-internal-egress-ip.md)。
 
 **新增条件 `internal {true|false}`**，使调度规则能显式区分两类取件。它与 `not` 组合可写 `not internal true`。
 
