@@ -966,6 +966,7 @@ dependencies = [
  "uuid",
  "webpki-roots 0.26.11",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

@@ -2,6 +2,8 @@ use anyhow::Result;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::error;
 use url::Url;
 
@@ -44,10 +46,50 @@ impl S3Signer {
         key: &str,
         headers: Option<BTreeMap<String, String>>,
     ) -> Result<String> {
-        let now = chrono::Utc::now();
-        // yyyyMMdd
+        self.presign("GET", key, headers, chrono::Utc::now(), self.expires)
+    }
+
+    /// Presigned PUT. `UNSIGNED-PAYLOAD` matches the existing GET signer.
+    pub fn generate_presigned_put_url(&self, key: &str) -> Result<String> {
+        self.presign_put_at(key, chrono::Utc::now())
+    }
+
+    fn presign_put_at(&self, key: &str, now: chrono::DateTime<chrono::Utc>) -> Result<String> {
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "x-amz-content-sha256".to_string(),
+            "UNSIGNED-PAYLOAD".to_string(),
+        );
+        self.presign("PUT", key, Some(headers), now, 3600)
+    }
+
+    /// Upload `body` with a presigned PUT. Errors do not include the signed URL.
+    pub async fn put_object(&self, key: &str, body: &[u8]) -> Result<()> {
+        let url = self.generate_presigned_put_url(key)?;
+        let response = put_client()
+            .put(url)
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header(reqwest::header::CONTENT_LENGTH, body.len())
+            .body(body.to_vec())
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("S3 PUT transport failed: {e}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!("S3 PUT failed: {status}"));
+        }
+        Ok(())
+    }
+
+    fn presign(
+        &self,
+        method: &str,
+        key: &str,
+        headers: Option<BTreeMap<String, String>>,
+        now: chrono::DateTime<chrono::Utc>,
+        expires: u32,
+    ) -> Result<String> {
         let date_stamp = now.format("%Y%m%d").to_string();
-        // X-Amz-Date must be in the ISO8601 Long Format "yyyyMMdd'T'HHmmss'Z'"
         let date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let bucket = &self.bucket;
 
@@ -60,39 +102,40 @@ impl S3Signer {
             "{}/{}/{}/{}/aws4_request",
             self.access_key, date_stamp, self.region, self.service
         );
-        query_params.insert("X-Amz-Credential".to_string(), cred.clone());
+        query_params.insert("X-Amz-Credential".to_string(), cred);
         query_params.insert("X-Amz-Date".to_string(), date.to_string());
-        query_params.insert("X-Amz-Expires".to_string(), self.expires.to_string());
+        query_params.insert("X-Amz-Expires".to_string(), expires.to_string());
 
         let parsed_url = Url::parse(&self.endpoint)?;
         let mut host = parsed_url
             .host_str()
             .ok_or_else(|| anyhow::anyhow!("Invalid host in endpoint"))?
             .to_string();
-        // append port
         if let Some(port) = parsed_url.port() {
             host.push_str(&format!(":{port}"));
         }
 
-        let mut canonical_headers = String::from("host:");
-        canonical_headers.push_str(&host);
-        canonical_headers.push('\n');
-
-        let mut signed_headers = vec!["host".to_string()];
         let mut header_values = BTreeMap::new();
-        header_values.insert("host".to_string(), host.to_string());
+        header_values.insert("host".to_string(), host.clone());
 
         if let Some(custom_headers) = headers {
             for (key, value) in custom_headers {
-                let header_key = key.to_lowercase();
-                canonical_headers.push_str(&format!("{}:{}\n", header_key, value));
-                signed_headers.push(header_key.clone());
-                header_values.insert(header_key, value);
+                header_values.insert(key.to_lowercase(), value);
             }
         }
 
+        let mut signed_headers: Vec<String> = header_values.keys().cloned().collect();
         signed_headers.sort();
         let signed_headers_str = signed_headers.join(";");
+
+        let mut canonical_headers = String::new();
+        for name in &signed_headers {
+            canonical_headers.push_str(name);
+            canonical_headers.push(':');
+            canonical_headers.push_str(&header_values[name]);
+            canonical_headers.push('\n');
+        }
+
         query_params.insert(
             "X-Amz-SignedHeaders".to_string(),
             signed_headers_str.clone(),
@@ -117,7 +160,7 @@ impl S3Signer {
         }
 
         let canonical_request = format!(
-            "GET\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n{signed_headers_str}\nUNSIGNED-PAYLOAD"
+            "{method}\n{canonical_uri}\n{canonical_query_string}\n{canonical_headers}\n{signed_headers_str}\nUNSIGNED-PAYLOAD"
         );
 
         let string_to_sign = format!(
@@ -140,8 +183,7 @@ impl S3Signer {
         let signature = hex::encode(self.sign(&signing_key, string_to_sign.as_bytes()));
         canonical_query_string.push_str(&format!("&X-Amz-Signature={signature}"));
 
-        let endpoint_without_last_slash = self.endpoint.trim_end_matches('/').to_string();
-
+        let endpoint_without_last_slash = self.endpoint.trim_end_matches('/');
         let mut url = Url::parse(&format!("{endpoint_without_last_slash}{canonical_uri}"))?;
         url.set_query(Some(&canonical_query_string));
 
@@ -228,5 +270,65 @@ impl S3Signer {
         Ok(Self::new(
             access_key, secret_key, region, bucket, endpoint, path_mode, expires,
         ))
+    }
+}
+
+fn put_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("DFS2-SessionLog/1.0")
+            .timeout(Duration::from_secs(300))
+            .build()
+            .expect("session log S3 PUT client")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn test_signer() -> S3Signer {
+        S3Signer::new(
+            "AKIDEXAMPLE".to_string(),
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+            "us-east-1".to_string(),
+            "archive".to_string(),
+            "https://s3.example.com".to_string(),
+            true,
+            600,
+        )
+    }
+
+    #[test]
+    fn presigned_put_is_put_with_unsigned_payload_and_stable_signature() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 11, 1, 2, 3)
+            .single()
+            .expect("fixed timestamp");
+        let url = test_signer()
+            .presign_put_at("sessions.2026-09-11.log.zst", now)
+            .unwrap();
+
+        assert!(url.starts_with("https://s3.example.com/archive/sessions.2026-09-11.log.zst?"));
+        assert!(url.contains("X-Amz-Algorithm=AWS4-HMAC-SHA256"));
+        assert!(url.contains("X-Amz-SignedHeaders=host%3Bx-amz-content-sha256"));
+        assert!(url.contains("X-Amz-Expires=3600"));
+        assert!(url.contains("X-Amz-Signature="));
+        assert_eq!(
+            url,
+            test_signer()
+                .presign_put_at("sessions.2026-09-11.log.zst", now)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn put_object_error_omits_url() {
+        let err = anyhow::anyhow!("S3 PUT failed: 403 Forbidden");
+        let msg = err.to_string();
+        assert!(!msg.contains("X-Amz-"));
+        assert!(!msg.contains("s3.example.com"));
     }
 }

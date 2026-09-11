@@ -15,11 +15,22 @@ pub async fn parse_log_file(file_path: &str) -> Result<Vec<SessionLog>, String> 
     Ok(sessions)
 }
 
+fn is_zstd_path(file_path: &str) -> bool {
+    file_path.ends_with(".zst") || file_path.ends_with(".zstd")
+}
+
 /// Synchronous log file parser
 fn parse_log_file_sync(file_path: &str) -> Result<Vec<SessionLog>, String> {
     let file = File::open(file_path).map_err(|e| format!("Failed to open file: {}", e))?;
-    let reader = BufReader::new(file);
+    if is_zstd_path(file_path) {
+        let decoder = zstd::stream::read::Decoder::new(file)
+            .map_err(|e| format!("Failed to open zstd file: {}", e))?;
+        return parse_log_reader(BufReader::new(decoder));
+    }
+    parse_log_reader(BufReader::new(file))
+}
 
+fn parse_log_reader<R: BufRead>(reader: R) -> Result<Vec<SessionLog>, String> {
     let mut sessions = Vec::new();
     let mut total_lines = 0;
     let mut parse_errors = 0;
@@ -179,6 +190,30 @@ mod tests {
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].rid, "resource-1");
         assert_eq!(sessions[1].rid, "resource-2");
+    }
+
+    #[tokio::test]
+    async fn test_parse_zstd_log_file_matches_plaintext() {
+        let log_content = r#"{"start":1640995200,"end":1640995320,"type":"session_completed","sid":"test-1","rid":"resource-1","ver":"1.0.0","ua":"TestAgent/1.0","ip":["192.168.1.100",null],"chunks":[{"rng":"0-1023","att":1,"cdns":[{"url":"https://cdn.example.com/test","srv":"cdn-01","wgt":10,"ts":1640995210,"pen":false,"rsn":"flow_selected","ttfb":1234,"time":5678,"size":1024,"err":null,"mode":"http"}]}]}"#;
+
+        let plain = NamedTempFile::new().unwrap();
+        fs::write(plain.path(), log_content).unwrap();
+        let from_plain = parse_log_file(plain.path().to_str().unwrap())
+            .await
+            .unwrap();
+
+        let zst_path = plain.path().with_extension("log.zst");
+        let zst_file = fs::File::create(&zst_path).unwrap();
+        let mut encoder = zstd::stream::write::Encoder::new(zst_file, 3).unwrap();
+        std::io::Write::write_all(&mut encoder, log_content.as_bytes()).unwrap();
+        encoder.finish().unwrap();
+
+        let from_zst = parse_log_file(zst_path.to_str().unwrap()).await.unwrap();
+        let _ = fs::remove_file(&zst_path);
+        assert_eq!(from_plain.len(), from_zst.len());
+        assert_eq!(from_plain[0].rid, from_zst[0].rid);
+        assert_eq!(from_plain[0].sid, from_zst[0].sid);
+        assert_eq!(from_plain[0].chunks.len(), from_zst[0].chunks.len());
     }
 
     fn create_test_session() -> SessionLog {

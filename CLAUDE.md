@@ -165,6 +165,13 @@ flow:
 **Session Analytics**
 - `SESSION_LOG_ENABLED`: Enable session logging (default: true)
 - `SESSION_LOG_PATH`: Log directory (default: "logs/sessions")
+- `SESSION_LOG_ROTATE_HOURS`: Local-time bucket width 1–24 (default: 24)
+- `SESSION_LOG_COMPRESS`: `zstd` or `none` for closed files (default: zstd)
+- `SESSION_LOG_ZSTD_LEVEL`: zstd level for closed files (default: 3)
+- `SESSION_LOG_ARCHIVE_S3`: Optional S3 URL (same dialect as S3 servers); empty skips upload and minute sync
+- `SESSION_LOG_ARCHIVE_PREFIX`: Optional object key prefix
+- `SESSION_LOG_SYNC_MINUTES`: Minute interval to snapshot the current file to S3 (default: 0)
+- `SESSION_LOG_SYNC_ZSTD_LEVEL`: zstd level for current-file snapshots (default: 1)
 - `SESSION_CLEANUP_ENABLED`: Enable cleanup task (default: true)
 - `SESSION_CLEANUP_INTERVAL_MIN`: Cleanup interval (default: 5)
 - `SESSION_TIMEOUT_HOURS`: Session timeout (default: 2)

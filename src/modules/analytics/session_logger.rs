@@ -1,10 +1,9 @@
 use chrono::Utc;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::Path;
-use tokio::fs::{OpenOptions, create_dir_all};
-use tokio::io::AsyncWriteExt;
 use tracing::{error, warn};
+
+use crate::modules::analytics::session_log_rotate;
 
 use crate::config::SharedConfig;
 use crate::models::InsightData;
@@ -15,19 +14,11 @@ use crate::modules::storage::data_store::SessionStats;
 pub struct SessionLogger {
     config: SharedConfig,
     redis: DataStore,
-    log_path: String,
 }
 
 impl SessionLogger {
     pub fn new(config: SharedConfig, redis: DataStore) -> Self {
-        let log_path =
-            std::env::var("SESSION_LOG_PATH").unwrap_or_else(|_| "logs/sessions".to_string());
-
-        Self {
-            config,
-            redis,
-            log_path,
-        }
+        Self { config, redis }
     }
 
     /// 记录正常完成的 Session
@@ -377,17 +368,6 @@ impl SessionLogger {
             return Ok(());
         }
 
-        // 创建日志目录
-        if let Err(e) = create_dir_all(&self.log_path).await {
-            error!("Failed to create log directory {}: {}", self.log_path, e);
-            return Err(format!("Failed to create log directory: {e}"));
-        }
-
-        // 生成日志文件名（按日期分割）
-        let date = Utc::now().format("%Y-%m-%d").to_string();
-        let log_file = Path::new(&self.log_path).join(format!("sessions.{date}.log"));
-
-        // 序列化为 JSON
         let log_json = match serde_json::to_string(session_log) {
             Ok(json) => json,
             Err(e) => {
@@ -396,29 +376,7 @@ impl SessionLogger {
             }
         };
 
-        // 写入文件（追加模式）
-        match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .await
-        {
-            Ok(mut file) => {
-                if let Err(e) = file.write_all(format!("{log_json}\n").as_bytes()).await {
-                    error!("Failed to write to log file {:?}: {}", log_file, e);
-                    return Err(format!("Failed to write to log file: {e}"));
-                }
-                if let Err(e) = file.sync_all().await {
-                    warn!("Failed to sync log file {:?}: {}", log_file, e);
-                }
-            }
-            Err(e) => {
-                error!("Failed to open log file {:?}: {}", log_file, e);
-                return Err(format!("Failed to open log file: {e}"));
-            }
-        }
-
-        Ok(())
+        session_log_rotate::append_line(&log_json).await
     }
 
     /// 检查是否启用日志记录

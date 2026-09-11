@@ -376,6 +376,8 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
     cleanup_task.start_background_task().await;
     info!("Session cleanup task started");
 
+    modules::analytics::session_log_rotate::start_sync_ticker();
+
     // 构建路由 - 使用统一的AppContext
     let app = Router::new()
         .merge(routes::resource::routes())

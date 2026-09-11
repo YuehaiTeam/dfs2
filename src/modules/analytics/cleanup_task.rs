@@ -51,6 +51,8 @@ impl SessionCleanupTask {
     pub async fn run_cleanup(&self) -> Result<(), String> {
         info!("Running session cleanup task");
 
+        crate::modules::analytics::session_log_rotate::compress_stale_remembered().await;
+
         // 获取所有过期的会话ID
         let expired_sessions = self.find_expired_sessions().await?;
 
