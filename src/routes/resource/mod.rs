@@ -4,6 +4,7 @@ pub mod batch;
 pub mod chunk;
 pub mod downloads;
 pub mod metadata;
+pub mod schedule_override;
 pub mod sessions;
 
 // 解析range字符串为flowrunner的ranges格式
@@ -104,4 +105,5 @@ pub fn routes() -> Router {
             "/download/{resid}/{*sub_path}",
             get(downloads::download_prefix_redirect).post(downloads::download_prefix_json),
         )
+        .route("/override", get(schedule_override::claim))
 }

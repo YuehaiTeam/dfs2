@@ -70,6 +70,19 @@ pub trait DataStoreBackend: Send + Sync {
     async fn get_string(&self, key: &str) -> Result<Option<String>, String>;
     async fn set_string(&self, key: &str, value: &str, expires: Option<u32>) -> Result<(), String>;
 
+    /// 读 override 票。`None` 表示不存在或已过期；剩余 TTL 为 `None` 表示 key 在但没设过期。
+    async fn get_override_ticket(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<(String, Option<u32>)>, String>;
+    async fn get_override_binding(&self, bind_suffix: &str) -> Result<Option<String>, String>;
+    async fn set_override_binding(
+        &self,
+        bind_suffix: &str,
+        json: &str,
+        expires: u32,
+    ) -> Result<(), String>;
+
     // 新增：健康信息支持
     async fn get_health_info(
         &self,
@@ -282,6 +295,12 @@ impl<T> StoredValue<T> {
         } else {
             Some(self.data)
         }
+    }
+
+    fn remaining_ttl_secs(&self) -> Option<u32> {
+        let expires_at = self.expires_at?;
+        let now = chrono::Utc::now().timestamp() as u64;
+        Some(expires_at.saturating_sub(now) as u32)
     }
 }
 
@@ -554,6 +573,39 @@ impl DataStoreBackend for FileDataStore {
         let storage_key = format!("general_cache:{key}");
         let stored_value = StoredValue::new(value.to_string(), expires);
         self.write_json_file(&storage_key, &stored_value).await
+    }
+
+    async fn get_override_ticket(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<(String, Option<u32>)>, String> {
+        let key = format!("override:{uuid}");
+        match self.read_json_file::<StoredValue<String>>(&key).await? {
+            Some(stored) if !stored.is_expired() => {
+                let remaining = stored.remaining_ttl_secs();
+                Ok(Some((stored.data, remaining)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn get_override_binding(&self, bind_suffix: &str) -> Result<Option<String>, String> {
+        let key = format!("override:bind:{bind_suffix}");
+        match self.read_json_file::<StoredValue<String>>(&key).await? {
+            Some(stored) => Ok(stored.into_data()),
+            None => Ok(None),
+        }
+    }
+
+    async fn set_override_binding(
+        &self,
+        bind_suffix: &str,
+        json: &str,
+        expires: u32,
+    ) -> Result<(), String> {
+        let key = format!("override:bind:{bind_suffix}");
+        let stored = StoredValue::new(json.to_string(), Some(expires));
+        self.write_json_file(&key, &stored).await
     }
 
     async fn get_health_info(

@@ -481,6 +481,59 @@ impl DataStoreBackend for RedisDataStore {
         }
     }
 
+    async fn get_override_ticket(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<(String, Option<u32>)>, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        let key = self.redis_key("override", uuid);
+        let (value, ttl): (Option<String>, i64) = redis::pipe()
+            .get(&key)
+            .ttl(&key)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        match value {
+            None => Ok(None),
+            Some(csv) => match ttl {
+                -1 => Ok(Some((csv, None))),
+                n if n > 0 => Ok(Some((csv, Some(n as u32)))),
+                _ => Ok(None),
+            },
+        }
+    }
+
+    async fn get_override_binding(&self, bind_suffix: &str) -> Result<Option<String>, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        let key = self.redis_key("override", &format!("bind:{bind_suffix}"));
+        conn.get(key).await.map_err(|e| e.to_string())
+    }
+
+    async fn set_override_binding(
+        &self,
+        bind_suffix: &str,
+        json: &str,
+        expires: u32,
+    ) -> Result<(), String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        let key = self.redis_key("override", &format!("bind:{bind_suffix}"));
+        conn.set_ex(key, json, expires as u64)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn get_health_info(
         &self,
         server_id: &str,

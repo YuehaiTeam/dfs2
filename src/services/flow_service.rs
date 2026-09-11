@@ -7,7 +7,9 @@ use crate::{
     },
     modules::{
         external::geolocation,
-        flow::{FlowComp, FlowCond, FlowItem, FlowMode, FlowUse, ResourcePattern},
+        flow::{
+            FlowComp, FlowCond, FlowItem, FlowMode, FlowUse, ResourcePattern, schedule_override,
+        },
         network::capabilities,
         qjs::JsRunner,
         server::HealthInfo,
@@ -87,6 +89,20 @@ impl FlowService {
         penalties: FlowPenalties,
         session: Option<&crate::models::Session>,
     ) -> DfsResult<FlowResult> {
+        if !context.internal
+            && let Some(binding) = schedule_override::lookup_override(
+                &self.data_store,
+                context.session_id.as_deref(),
+                context.client_ip,
+                &target.resource_id,
+            )
+            .await?
+        {
+            return self
+                .execute_forced_override(&binding, target, context, options)
+                .await;
+        }
+
         let mut server_pool = Vec::new();
         let mut plugin_server_mapping = HashMap::new();
         let mut tier_mapping: HashMap<String, u32> = HashMap::new();
@@ -168,6 +184,41 @@ impl FlowService {
             selected_server_weight: selection.as_ref().map(|s| s.weight),
             selected_tier: selection.as_ref().map(|s| s.tier),
             plugin_server_mapping,
+        })
+    }
+
+    /// 绑定命中后只签发该节点：跳过 YAML 与惩罚，不健康或不在配置中则失败、不回落。
+    async fn execute_forced_override(
+        &self,
+        binding: &schedule_override::OverrideBinding,
+        target: &FlowTarget,
+        context: &FlowContext,
+        options: &FlowOptions,
+    ) -> DfsResult<FlowResult> {
+        info!(
+            ticket = %binding.ticket,
+            server = %binding.target_node,
+            session = ?context.session_id,
+            ip = ?context.client_ip,
+            resource = %target.resource_id,
+            "schedule override selected server"
+        );
+
+        let server = (binding.target_node.clone(), 1);
+        if !self.is_server_healthy(&server, target).await? {
+            return Err(DfsError::server_unavailable(&binding.target_node));
+        }
+
+        let url = self
+            .generate_server_url(&server, target, context, options)
+            .await?;
+
+        Ok(FlowResult {
+            url,
+            selected_server_id: Some(binding.target_node.clone()),
+            selected_server_weight: Some(1),
+            selected_tier: None,
+            plugin_server_mapping: HashMap::new(),
         })
     }
 
@@ -3888,5 +3939,181 @@ mod tests {
             pinned_result, trust_result,
             "Same cert hash should produce same URL regardless of policy type"
         );
+    }
+
+    fn yaml_only_server_one() -> Vec<FlowItem> {
+        vec![FlowItem {
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec![FlowUse::Server {
+                id: "test_server_1".to_string(),
+                weight: 10,
+            }],
+            tier: 0,
+        }]
+    }
+
+    #[tokio::test]
+    async fn schedule_override_skips_yaml_and_penalties() {
+        let env = TestEnvironment::new().await;
+        env.mock_data_store
+            .seed_override_ticket("flow-ov", "test_server_2", Some(300))
+            .await
+            .unwrap();
+        schedule_override::claim_override(
+            &env.data_store,
+            &env.shared_config.load(),
+            "flow-ov",
+            Some("192.168.1.100".parse().unwrap()),
+            Some("test_session"),
+        )
+        .await
+        .unwrap();
+
+        let (target, context, options) = create_test_context();
+        let result = env
+            .services
+            .flow_service
+            .execute_flow(
+                &target,
+                &context,
+                &options,
+                &yaml_only_server_one(),
+                FlowPenalties {
+                    banned: vec!["test_server_2".to_string()],
+                    demoted: vec![],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.selected_server_id.as_deref(), Some("test_server_2"));
+        assert_eq!(result.selected_tier, None);
+        assert!(result.url.contains("test2.example.com"));
+    }
+
+    #[tokio::test]
+    async fn schedule_override_does_not_fallback_when_target_is_unhealthy() {
+        let env = TestEnvironment::new().await;
+        env.data_store
+            .set_health_info(
+                "test_server_2",
+                "/test/file.bin",
+                &HealthInfo {
+                    is_alive: false,
+                    file_size: Some(1024),
+                    last_check: chrono::Utc::now().timestamp() as u64,
+                    observed_cert_hash: None,
+                    content_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        env.mock_data_store
+            .seed_override_ticket("flow-dead", "test_server_2", Some(300))
+            .await
+            .unwrap();
+        schedule_override::claim_override(
+            &env.data_store,
+            &env.shared_config.load(),
+            "flow-dead",
+            Some("192.168.1.100".parse().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (target, mut context, options) = create_test_context();
+        context.session_id = None;
+        let error = env
+            .services
+            .flow_service
+            .execute_flow(
+                &target,
+                &context,
+                &options,
+                &yaml_only_server_one(),
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:?}").contains("test_server_2"),
+            "forced node must fail instead of falling back: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_override_ignores_internal_fetches() {
+        let env = TestEnvironment::new().await;
+        env.mock_data_store
+            .seed_override_ticket("flow-int", "test_server_2", Some(300))
+            .await
+            .unwrap();
+        schedule_override::claim_override(
+            &env.data_store,
+            &env.shared_config.load(),
+            "flow-int",
+            Some("192.168.1.100".parse().unwrap()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (target, _context, options) = create_test_context();
+        let internal = FlowContext::internal(Some("192.168.1.100".parse().unwrap()));
+        let result = env
+            .services
+            .flow_service
+            .execute_flow(
+                &target,
+                &internal,
+                &options,
+                &yaml_only_server_one(),
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.selected_server_id.as_deref(), Some("test_server_1"));
+    }
+
+    #[tokio::test]
+    async fn schedule_override_resid_specific_key_does_not_apply_to_other_resources() {
+        let env = TestEnvironment::new().await;
+        env.mock_data_store
+            .seed_override_ticket("flow-res", "test_server_2,other_app", Some(300))
+            .await
+            .unwrap();
+        schedule_override::claim_override(
+            &env.data_store,
+            &env.shared_config.load(),
+            "flow-res",
+            Some("192.168.1.100".parse().unwrap()),
+            Some("test_session"),
+        )
+        .await
+        .unwrap();
+
+        let (target, context, options) = create_test_context();
+        let result = env
+            .services
+            .flow_service
+            .execute_flow(
+                &target,
+                &context,
+                &options,
+                &yaml_only_server_one(),
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.selected_server_id.as_deref(), Some("test_server_1"));
     }
 }

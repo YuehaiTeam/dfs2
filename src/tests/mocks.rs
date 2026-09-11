@@ -244,6 +244,23 @@ impl MockDataStore {
         let mut override_time = self.current_time_override.write().await;
         *override_time = minute_timestamp;
     }
+
+    /// 写入一张已过期的 override 票，供认领失败测试使用。
+    pub async fn seed_expired_override_ticket(&self, uuid: &str, csv: &str) {
+        let mut storage = self.string_storage.write().await;
+        storage.insert(format!("override:{uuid}"), (csv.to_string(), Some(1)));
+    }
+
+    /// 写入一张 override 票。生产由管理员 `SET`，测试走这条。
+    pub async fn seed_override_ticket(
+        &self,
+        uuid: &str,
+        csv: &str,
+        expires: Option<u32>,
+    ) -> Result<(), String> {
+        self.set_string(&format!("override:{uuid}"), csv, expires)
+            .await
+    }
 }
 
 #[async_trait::async_trait]
@@ -402,6 +419,37 @@ impl DataStoreBackend for MockDataStore {
         let expires_at = expires.map(|e| Self::current_timestamp() + e as u64);
         storage.insert(key.to_string(), (value.to_string(), expires_at));
         Ok(())
+    }
+
+    async fn get_override_ticket(
+        &self,
+        uuid: &str,
+    ) -> Result<Option<(String, Option<u32>)>, String> {
+        let key = format!("override:{uuid}");
+        let storage = self.string_storage.read().await;
+        match storage.get(&key) {
+            Some((value, expires_at)) if !Self::is_expired(*expires_at) => {
+                let remaining =
+                    expires_at.map(|at| at.saturating_sub(Self::current_timestamp()) as u32);
+                Ok(Some((value.clone(), remaining)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn get_override_binding(&self, bind_suffix: &str) -> Result<Option<String>, String> {
+        self.get_string(&format!("override:bind:{bind_suffix}"))
+            .await
+    }
+
+    async fn set_override_binding(
+        &self,
+        bind_suffix: &str,
+        json: &str,
+        expires: u32,
+    ) -> Result<(), String> {
+        self.set_string(&format!("override:bind:{bind_suffix}"), json, Some(expires))
+            .await
     }
 
     async fn get_health_info(
