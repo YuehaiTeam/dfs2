@@ -74,9 +74,11 @@ async-stream = "0.3"
 futures = "0.3"
 http = "1"
 zstd = "0.13"
+rmcp = { version = "3.1.3", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
 
 [dev-dependencies]
 tempfile = "3.14"
 tempdir = "0.3"
 tokio-test = "0.4"
 rcgen = "0.13"
+tower = { version = "0.5", features = ["util"] }

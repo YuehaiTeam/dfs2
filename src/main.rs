@@ -5,6 +5,7 @@ mod error;
 mod metrics;
 mod models;
 mod modules;
+mod redact;
 mod responses;
 mod routes;
 mod services;
@@ -82,6 +83,13 @@ enum Commands {
         /// Output file path, use "-" for stdout
         #[arg(short = 'o', long, help = "Output file path", default_value = "-")]
         output: String,
+    },
+    /// Redact credentials in each subdirectory tree and write the result
+    Redact {
+        /// Directory whose immediate subdirectories are the trees to process
+        input: std::path::PathBuf,
+        /// Destination directory (same subdirectory names)
+        output: std::path::PathBuf,
     },
 }
 
@@ -275,6 +283,19 @@ async fn main() -> DfsResult<()> {
         Some(Commands::Validate) => {
             return handle_validate().await;
         }
+        Some(Commands::Redact { input, output }) => {
+            return match crate::redact::run(&input, &output) {
+                Ok(()) => Ok(()),
+                Err(e) if e.is_leak() => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+                Err(e) => {
+                    error!("{e}");
+                    Err(DfsError::internal_error(e.to_string()))
+                }
+            };
+        }
         Some(Commands::Serve) | None => {
             info!("Starting DFS2 server...");
 
@@ -370,7 +391,6 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
 
     // 启动会话清理任务
     let cleanup_task = std::sync::Arc::new(analytics::SessionCleanupTask::new(
-        app_container.shared_config.clone(),
         app_container.data_store.clone(),
     ));
     cleanup_task.start_background_task().await;
@@ -378,11 +398,25 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
 
     modules::analytics::session_log_rotate::start_sync_ticker();
 
+    let mcp_router = match modules::mcp::maybe_router(app_context.clone()) {
+        Ok(router) => router,
+        Err(errors) => {
+            for error in &errors {
+                error!(%error, "invalid MCP configuration");
+            }
+            return Err(DfsError::invalid_input("MCP", errors.join("; ")));
+        }
+    };
+
     // 构建路由 - 使用统一的AppContext
-    let app = Router::new()
+    let mut app = Router::new()
         .merge(routes::resource::routes())
         .merge(routes::static_files::routes())
-        .merge(routes::mgmt::routes())
+        .merge(routes::mgmt::routes());
+    if let Some(mcp) = mcp_router {
+        app = app.merge(mcp);
+    }
+    let app = app
         .layer(middleware::from_fn(real_ip_middleware))
         .layer(axum::Extension(app_context));
 

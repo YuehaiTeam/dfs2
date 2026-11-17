@@ -56,6 +56,8 @@ pub struct Metrics {
     pub version_file_no_majority: GaugeVec,    // 各资源当前无多数派的版本文件数
     pub version_file_no_responders: GaugeVec,  // 各资源一个存活响应者都没有的版本文件数
 
+    pub no_res_available_total: CounterVec, // 客户端 NO_RES_AVAILABLE，按资源；不含 prefix 与内部取件
+
     // 配置引用（用于实时获取ID列表）
     pub config: SharedConfig,
 }
@@ -246,6 +248,15 @@ impl Metrics {
         )?;
         registry.register(Box::new(version_file_no_responders.clone()))?;
 
+        let no_res_available_total = CounterVec::new(
+            Opts::new(
+                "dfs_no_res_available_total",
+                "Client schedule attempts that returned NO_RES_AVAILABLE, by resource. Prefix resources and scheduler-internal fetches are omitted.",
+            ),
+            &["resource_id"],
+        )?;
+        registry.register(Box::new(no_res_available_total.clone()))?;
+
         Ok(Self {
             registry,
             requests_total,
@@ -273,6 +284,7 @@ impl Metrics {
             version_file_mismatch_files,
             version_file_no_majority,
             version_file_no_responders,
+            no_res_available_total,
             config,
         })
     }
@@ -342,6 +354,15 @@ impl Metrics {
     /// Record flow failure
     pub fn record_flow_failure(&self) {
         self.flow_failures_total.inc();
+    }
+
+    /// 记录一次客户端选点返回 `NO_RES_AVAILABLE`。
+    ///
+    /// 调用方排除 prefix 资源与内部取件。
+    pub fn record_no_res_available(&self, resource_id: &str) {
+        self.no_res_available_total
+            .with_label_values(&[resource_id])
+            .inc();
     }
 
     /// Record scheduled request (区分缓存状态)

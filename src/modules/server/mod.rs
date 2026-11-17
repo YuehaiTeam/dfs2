@@ -7,6 +7,7 @@ use tracing::{debug, warn};
 
 use crate::config::{AppConfig, CertHashPolicy, ServerConfig};
 use crate::modules::network::h3_middleware::{CertVerifyPolicy, H3TransportInfo};
+use crate::modules::storage::data_store::DataStore;
 
 pub mod dfs_node;
 pub mod dfs_sftp;
@@ -59,6 +60,9 @@ pub struct ServerPing {
     pub server_id: String,
     pub health_check_path: String,
     pub is_alive: bool,
+    pub file_size: Option<u64>,
+    pub observed_cert_hash: Option<String>,
+    pub last_check: u64,
 }
 
 /// 全量节点连通性探测的结果。
@@ -85,21 +89,52 @@ impl PingReport {
     }
 }
 
-/// 并发探测所有配置了健康检查路径的节点。
+/// 配置了健康检查路径、且落在 `only` 内（或 `only` 为空即全量）的节点 id，已排序。
+pub fn ping_candidate_ids(config: &AppConfig, only: Option<&HashSet<String>>) -> Vec<String> {
+    let mut ids: Vec<String> = config
+        .servers
+        .iter()
+        .filter(|(id, server)| {
+            server.health_check_path.is_some() && only.is_none_or(|set| set.contains(*id))
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// 并发探测所有配置了健康检查路径的节点。不写存储。
 ///
 /// 不读健康信息缓存：结果用于决定普查是否整轮跳过某节点，而过期的"不可达"判定会让该节点缺席
 /// 一整轮多数派计算，节点数少时足以改变多数派是否成立，因此每次都实测。未配置健康检查路径的
 /// 节点不出现在结果中——无从判定，交由普查按路径逐个探测。
 pub async fn ping_servers(config: &AppConfig, concurrency: usize) -> PingReport {
+    ping_selected_servers(config, None, concurrency, None).await
+}
+
+/// 与 [`ping_servers`] 相同，可把探测限制在给定节点集合。
+///
+/// 不读健康信息缓存。`store` 为 `Some` 时只写不读：把探测结论发布到
+/// `health:{id}:{health_check_path}`，不改变跳过判定的来源。
+pub async fn ping_selected_servers(
+    config: &AppConfig,
+    only: Option<&HashSet<String>>,
+    concurrency: usize,
+    store: Option<&DataStore>,
+) -> PingReport {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
     let mut report = PingReport::default();
     let mut tasks = Vec::new();
 
-    for (server_id, server_config) in &config.servers {
+    for server_id in ping_candidate_ids(config, only) {
+        let server_config = match config.servers.get(&server_id) {
+            Some(s) => s,
+            None => continue,
+        };
         let Some(health_check_path) = &server_config.health_check_path else {
             continue;
         };
-        let Some(server_impl) = config.get_server(server_id) else {
+        let Some(server_impl) = config.get_server(&server_id) else {
             report.implementation_missing.push(server_id.clone());
             continue;
         };
@@ -112,20 +147,65 @@ pub async fn ping_servers(config: &AppConfig, concurrency: usize) -> PingReport 
         tasks.push(async move {
             let _permit = semaphore.acquire().await.ok();
             debug!("Pinging server {} (path: {})", server_id, health_check_path);
-            let is_alive = server_impl
-                .is_alive(&server_id, &server_config, &health_check_path, None)
+            let info = server_impl
+                .probe_liveness(&server_id, &server_config, &health_check_path, None)
                 .await;
             ServerPing {
                 server_id,
                 health_check_path,
-                is_alive,
+                is_alive: info.is_alive,
+                file_size: info.file_size,
+                observed_cert_hash: info.observed_cert_hash,
+                last_check: info.last_check,
             }
         });
     }
 
     report.probed = futures::future::join_all(tasks).await;
     report.implementation_missing.sort_unstable();
+    if let Some(store) = store {
+        for ping in &report.probed {
+            let info = HealthInfo {
+                is_alive: ping.is_alive,
+                file_size: ping.file_size,
+                last_check: ping.last_check,
+                observed_cert_hash: ping.observed_cert_hash.clone(),
+                content_hash: None,
+            };
+            let _ = store
+                .set_health_info(&ping.server_id, &ping.health_check_path, &info)
+                .await;
+        }
+    }
     report
+}
+
+fn join_direct_url(base: &str, path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let rel = normalized.strip_prefix('/').unwrap_or(&normalized);
+    if base.ends_with('/') {
+        format!("{base}{rel}")
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+/// Range header map for S3 SigV4. Empty ranges omit the header.
+fn range_header_map(ranges: &[(u32, u32)]) -> Option<BTreeMap<String, String>> {
+    if ranges.is_empty() {
+        return None;
+    }
+    let range_header = format!(
+        "bytes={}",
+        ranges
+            .iter()
+            .map(|(start, end)| format!("{start}-{end}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut headers = BTreeMap::new();
+    headers.insert("range".to_string(), range_header);
+    Some(headers)
 }
 
 /// 从HTTP响应中提取文件大小
@@ -223,25 +303,9 @@ impl ServerImpl {
         data_store: Option<&crate::modules::storage::data_store::DataStore>,
     ) -> anyhow::Result<String> {
         match self {
-            ServerImpl::Direct(url) => Ok(format!(
-                "{}{}",
-                url,
-                path.strip_prefix('/').unwrap_or(path).replace('\\', "/")
-            )),
+            ServerImpl::Direct(url) => Ok(join_direct_url(url, path)),
             ServerImpl::S3(signer) => {
-                let mut headers = BTreeMap::new();
-                if let Some(ranges_vec) = ranges
-                    && !ranges_vec.is_empty()
-                {
-                    // S3 supports multiple ranges in a single Range header
-                    let range_specs: Vec<String> = ranges_vec
-                        .iter()
-                        .map(|(start, end)| format!("{start}-{end}"))
-                        .collect();
-                    let range_header = format!("bytes={}", range_specs.join(","));
-                    headers.insert("range".to_string(), range_header);
-                }
-                signer.generate_presigned_url(path, Some(headers))
+                signer.generate_presigned_url(path, ranges.as_deref().and_then(range_header_map))
             }
             ServerImpl::DfsNode(signer) => {
                 let session_id = session_id.unwrap_or("00000000000000000000000000000000");
@@ -265,18 +329,59 @@ impl ServerImpl {
         }
     }
 
+    /// Sign a GET for `path`. `expires` overrides the backend default TTL.
+    /// `session_id` is the dfs_node uuid; `None` uses the all-zero uuid.
+    pub async fn url_expiring(
+        &self,
+        path: &str,
+        ranges: Option<Vec<(u32, u32)>>,
+        session_id: Option<&str>,
+        data_store: Option<&crate::modules::storage::data_store::DataStore>,
+        expires: u32,
+    ) -> anyhow::Result<String> {
+        const ZERO_UUID: &str = "00000000000000000000000000000000";
+        let uuid = session_id.unwrap_or(ZERO_UUID);
+        match self {
+            ServerImpl::Direct(url) => Ok(join_direct_url(url, path)),
+            ServerImpl::S3(signer) => {
+                let headers = ranges.as_deref().and_then(range_header_map);
+                signer.generate_presigned_url_expiring(path, headers, expires)
+            }
+            ServerImpl::DfsNode(signer) => Ok(signer.generate_presigned_url_expiring(
+                path,
+                uuid,
+                ranges.as_deref(),
+                Some(expires),
+            )),
+            ServerImpl::DfsWt(signer) => Ok(signer.generate_presigned_url_expiring(
+                path,
+                uuid,
+                ranges.as_deref(),
+                Some(expires),
+            )),
+            ServerImpl::DfsSftp(signer) => {
+                signer.generate_presigned_url_expiring(path, uuid, ranges, Some(expires))
+            }
+            ServerImpl::GitLfs(signer) => {
+                if let Some(store) = data_store {
+                    signer.generate_url(path, store).await
+                } else {
+                    Err(anyhow::anyhow!("Git LFS requires data store for caching"))
+                }
+            }
+        }
+    }
+
     pub async fn is_alive(
         &self,
         server_id: &str,
         server_config: &ServerConfig,
         path: &str,
-        redis: Option<&crate::modules::storage::data_store::DataStore>,
+        redis: Option<&DataStore>,
     ) -> bool {
-        // Check cache first if store is available
         if let Some(redis_store) = redis
             && let Ok(Some(cached_health)) = redis_store.get_health_info(server_id, path).await
         {
-            // Trust mode must learn cert hash at least once.
             if server_config.h3_only {
                 let policy = server_config
                     .cert_hash_policy()
@@ -291,20 +396,31 @@ impl ServerImpl {
             }
         }
 
-        // Perform actual health check
+        let health_info = self
+            .probe_liveness(server_id, server_config, path, redis)
+            .await;
+        if let Some(redis_store) = redis {
+            let _ = redis_store
+                .set_health_info(server_id, path, &health_info)
+                .await;
+        }
+        health_info.is_alive
+    }
+
+    /// 实测连通性，不读不写健康缓存。`redis` 只给需要存储才能签 URL 的后端。
+    pub async fn probe_liveness(
+        &self,
+        server_id: &str,
+        server_config: &ServerConfig,
+        path: &str,
+        redis: Option<&DataStore>,
+    ) -> HealthInfo {
         let check_url = self.url(path, Some(vec![(0, 255)]), None, redis).await;
         let check_url = match check_url {
             Ok(url) => url,
             Err(e) => {
                 warn!("Keepalive URL generation failed for path {}: {:?}", path, e);
-                // Cache negative result
-                if let Some(redis_store) = redis {
-                    let health_info = HealthInfo::connectivity(false, None);
-                    let _ = redis_store
-                        .set_health_info(server_id, path, &health_info)
-                        .await;
-                }
-                return false;
+                return HealthInfo::connectivity(false, None);
             }
         };
 
@@ -327,7 +443,7 @@ impl ServerImpl {
                     Ok(url) => url,
                     Err(e) => {
                         warn!("Invalid HTTP/3 keepalive URL {}: {:?}", check_url, e);
-                        return false;
+                        return HealthInfo::connectivity(false, None);
                     }
                 };
                 match crate::container::FETCH_CLIENT
@@ -395,13 +511,7 @@ impl ServerImpl {
                             "SSH/SFTP keepalive request failed for URL {}: {:?}",
                             safe_url, e
                         );
-                        if let Some(redis_store) = redis {
-                            let health_info = HealthInfo::connectivity(false, None);
-                            let _ = redis_store
-                                .set_health_info(server_id, path, &health_info)
-                                .await;
-                        }
-                        return false;
+                        return HealthInfo::connectivity(false, None);
                     }
                 };
                 let is_alive = ret.status().is_success();
@@ -434,14 +544,7 @@ impl ServerImpl {
                     Ok(response) => response,
                     Err(e) => {
                         warn!("Keepalive request failed for URL {}: {:?}", check_url, e);
-                        // Cache negative result
-                        if let Some(redis_store) = redis {
-                            let health_info = HealthInfo::connectivity(false, None);
-                            let _ = redis_store
-                                .set_health_info(server_id, path, &health_info)
-                                .await;
-                        }
-                        return false;
+                        return HealthInfo::connectivity(false, None);
                     }
                 };
                 let is_alive = ret.status().is_success();
@@ -465,22 +568,13 @@ impl ServerImpl {
                 (is_alive, file_size, None)
             };
 
-        // 创建健康信息并缓存
-        let health_info = HealthInfo {
+        HealthInfo {
             is_alive,
             file_size,
             last_check: chrono::Utc::now().timestamp() as u64,
             observed_cert_hash,
             content_hash: None,
-        };
-
-        if let Some(redis_store) = redis {
-            let _ = redis_store
-                .set_health_info(server_id, path, &health_info)
-                .await;
         }
-
-        is_alive
     }
 
     /// Fetch a small file in full (used for version-file content comparison).
@@ -673,13 +767,20 @@ async fn execute_full_probe(
 
 #[cfg(test)]
 mod tests {
-    use super::{PingReport, ServerPing, ping_servers, to_http3_url};
+    use super::{
+        HealthInfo, PingReport, ServerImpl, ServerPing, join_direct_url, ping_selected_servers,
+        ping_servers, to_http3_url,
+    };
+    use crate::tests::mocks::TestEnvironment;
 
     fn ping(server_id: &str, is_alive: bool) -> ServerPing {
         ServerPing {
             server_id: server_id.to_string(),
             health_check_path: "health".to_string(),
             is_alive,
+            file_size: None,
+            observed_cert_hash: None,
+            last_check: 0,
         }
     }
 
@@ -719,6 +820,118 @@ mod tests {
         assert!(report.probed.is_empty());
         assert!(report.implementation_missing.is_empty());
         assert!(report.unreachable().is_empty());
+    }
+
+    fn rebuild_server_impl(config: &mut crate::config::AppConfig) {
+        config.server_impl.clear();
+        for (id, server_config) in config.servers.iter() {
+            if let Ok(server) = ServerImpl::new(server_config) {
+                config.server_impl.insert(id.clone(), server);
+            }
+        }
+    }
+
+    async fn fixture_with_health_paths() -> (crate::config::AppConfig, TestEnvironment) {
+        let mut config = crate::tests::mocks::create_default_test_config();
+        for (id, server) in config.servers.iter_mut() {
+            server.url = "http://127.0.0.1:1".into();
+            server.health_check_path = Some(format!("/health-{id}"));
+        }
+        rebuild_server_impl(&mut config);
+        let env = TestEnvironment::with_config(config.clone()).await;
+        (config, env)
+    }
+
+    #[tokio::test]
+    async fn ping_writes_health_only_when_store_is_some() {
+        let (config, env) = fixture_with_health_paths().await;
+        let paths: Vec<(String, String)> = config
+            .servers
+            .iter()
+            .filter_map(|(id, s)| {
+                s.health_check_path
+                    .as_ref()
+                    .map(|p| (id.clone(), p.clone()))
+            })
+            .collect();
+        assert!(!paths.is_empty());
+
+        ping_selected_servers(&config, None, 4, None).await;
+        for (id, path) in &paths {
+            assert!(
+                env.data_store
+                    .get_health_info(id, path)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "store=None must not write {id}:{path}"
+            );
+        }
+
+        let report = ping_selected_servers(&config, None, 4, Some(&env.data_store)).await;
+        assert_eq!(report.probed.len(), paths.len());
+        for (id, path) in &paths {
+            let info = env
+                .data_store
+                .get_health_info(id, path)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing health for {id}:{path}"));
+            assert!(!info.is_alive);
+        }
+    }
+
+    #[tokio::test]
+    async fn ping_overwrites_cached_dead_without_reading_it() {
+        let (config, env) = fixture_with_health_paths().await;
+        let (id, path) = config
+            .servers
+            .iter()
+            .find_map(|(id, s)| {
+                s.health_check_path
+                    .as_ref()
+                    .map(|p| (id.clone(), p.clone()))
+            })
+            .unwrap();
+        env.data_store
+            .set_health_info(
+                &id,
+                &path,
+                &HealthInfo {
+                    is_alive: false,
+                    file_size: Some(999),
+                    last_check: 1,
+                    observed_cert_hash: None,
+                    content_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        ping_selected_servers(&config, None, 4, Some(&env.data_store)).await;
+        let info = env
+            .data_store
+            .get_health_info(&id, &path)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            info.last_check, 1,
+            "probe must overwrite the seeded last_check"
+        );
+        assert_ne!(info.file_size, Some(999));
+    }
+
+    #[test]
+    fn join_direct_url_inserts_slash_when_base_has_none() {
+        assert_eq!(
+            join_direct_url("https://cdn.example.com", "/test/file.bin"),
+            "https://cdn.example.com/test/file.bin"
+        );
+        assert_eq!(
+            join_direct_url("https://cdn.example.com/", "/test/file.bin"),
+            "https://cdn.example.com/test/file.bin"
+        );
     }
 
     #[test]

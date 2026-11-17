@@ -1,6 +1,7 @@
 use crate::{
     config::{AppConfig, SharedConfig},
     error::{DfsError, DfsResult},
+    metrics::Metrics,
     models::{
         ClientCapabilities, FlowContext, FlowJsContext, FlowOptions, FlowPenalties, FlowResult,
         FlowTarget, PluginMetadata,
@@ -20,6 +21,7 @@ use crate::{
 };
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// 一个 flow 项执行完后对管道的处置。
@@ -51,6 +53,7 @@ pub struct FlowService {
     bandwidth_cache: crate::services::BandwidthCacheService,
     resource_service: crate::services::ResourceService,
     version_file_service: VersionFileService,
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl FlowService {
@@ -60,6 +63,7 @@ impl FlowService {
         js_runner: JsRunner,
         bandwidth_cache: crate::services::BandwidthCacheService,
         resource_service: crate::services::ResourceService,
+        metrics: Option<Arc<Metrics>>,
     ) -> Self {
         // 只用于读取普查结论，不跑普查，因此不需要 metrics
         let version_file_service = VersionFileService::new(
@@ -75,7 +79,30 @@ impl FlowService {
             bandwidth_cache,
             resource_service,
             version_file_service,
+            metrics,
         }
+    }
+
+    /// 客户端选点返回 `NO_RES_AVAILABLE` 时按资源计数。
+    ///
+    /// prefix 资源的一次下载会按文件各走一次选点，计入后计数被文件数放大。
+    /// 内部取件失败后，客户端请求还会再调度一次；两处都计会把同一次故障算两遍。
+    /// 配置里找不到的资源也不计。
+    fn record_client_no_res_available(&self, target: &FlowTarget, context: &FlowContext) {
+        if context.internal {
+            return;
+        }
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let config = self.shared_config.load();
+        let Some(resource) = config.get_resource(&target.resource_id) else {
+            return;
+        };
+        if resource.resource_type == "prefix" {
+            return;
+        }
+        metrics.record_no_res_available(&target.resource_id);
     }
 
     /// 纯函数式Flow执行，完全移除RunFlowParams依赖
@@ -158,6 +185,7 @@ impl FlowService {
         }
 
         if server_pool.is_empty() {
+            self.record_client_no_res_available(target, context);
             return Err(DfsError::internal_error("NO_RES_AVAILABLE"));
         }
 
@@ -878,7 +906,7 @@ impl FlowService {
                 .await?;
 
             // 使用统一的路径获取函数，支持前缀资源和子路径
-            let health_check_path = self
+            let resource_path = self
                 .resource_service
                 .get_version_path(
                     &validated_resource_id,
@@ -892,16 +920,12 @@ impl FlowService {
 
             if self
                 .version_file_service
-                .is_version_file_request(
-                    &validated_resource_id,
-                    &effective_version,
-                    &health_check_path,
-                )
+                .is_version_file_request(&validated_resource_id, &effective_version, &resource_path)
                 .await
             {
                 match self
                     .version_file_service
-                    .evaluate_path(&validated_resource_id, &health_check_path, &server.0)
+                    .evaluate_path(&validated_resource_id, &resource_path, &server.0)
                     .await
                 {
                     VersionFileDecision::SplitFailed | VersionFileDecision::Mismatch => {
@@ -915,7 +939,7 @@ impl FlowService {
                 .is_alive(
                     &server.0,
                     server_config,
-                    &health_check_path,
+                    &resource_path,
                     Some(&self.data_store),
                 )
                 .await)
@@ -1014,16 +1038,15 @@ impl FlowService {
         server_id: &str,
         target: &FlowTarget,
     ) -> Option<HealthInfo> {
-        // Try to resolve the health check path for this resource/version
         let path = self.resource_service.get_version_path(
             &target.resource_id,
             &target.version,
             Some(server_id),
             target.sub_path.as_deref(),
         );
-        if let Some(health_check_path) = path {
+        if let Some(resource_path) = path {
             self.data_store
-                .get_health_info(server_id, &health_check_path)
+                .get_health_info(server_id, &resource_path)
                 .await
                 .ok()
                 .flatten()
@@ -1057,6 +1080,18 @@ mod tests {
     use serde_json::json;
     use size::Size;
     use std::collections::HashMap;
+
+    #[test]
+    fn resource_path_is_not_named_health_check_path() {
+        let production = include_str!("flow_service.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        assert!(
+            !production.contains("health_check_path"),
+            "flow_service production code must not use that name for a resource path"
+        );
+    }
 
     /// 创建标准测试上下文
     fn create_test_context() -> (FlowTarget, FlowContext, FlowOptions) {
@@ -3449,7 +3484,15 @@ mod tests {
         let mut versions = HashMap::new();
         versions.insert("default".to_string(), TIER_TEST_PATH.to_string());
         resource.versions.insert("1.0.0".to_string(), versions);
+        let mut folder = resource.clone();
+        folder.resource_type = "prefix".to_string();
+        folder
+            .versions
+            .get_mut("1.0.0")
+            .expect("version")
+            .insert("default".to_string(), "/files".to_string());
         config.resources.insert("tier_app".to_string(), resource);
+        config.resources.insert("tier_folder".to_string(), folder);
 
         config
     }
@@ -3630,6 +3673,106 @@ mod tests {
             format!("{error:?}").contains("NO_RES_AVAILABLE"),
             "expected NO_RES_AVAILABLE, got {error:?}"
         );
+    }
+
+    fn no_res_available_count(env: &TestEnvironment, resource_id: &str) -> u64 {
+        env.app_context
+            .metrics
+            .no_res_available_total
+            .with_label_values(&[resource_id])
+            .get() as u64
+    }
+
+    /// 文件资源的 NO_RES_AVAILABLE 按资源加一；prefix 与内部取件仍报错但不计数。
+    ///
+    /// prefix 的版本路径是 `/files`，子路径 `tier.bin` 拼成与文件资源相同的健康检查键，
+    /// 因此两边都是节点已判死，而不是路径解析失败。
+    #[tokio::test]
+    async fn no_res_available_counts_file_resources_only() {
+        let env = TestEnvironment::with_config(create_tier_integration_config()).await;
+        set_tier_server_alive(&env, "tier_primary", false).await;
+        set_tier_server_alive(&env, "tier_backup", false).await;
+
+        let service = env.services.flow_service.clone();
+        let (_unused_target, context, options) = create_test_context();
+        let flow_items = tier_flow_items();
+
+        let error = service
+            .execute_flow(
+                &tier_flow_target(),
+                &context,
+                &options,
+                &flow_items,
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect_err("no tier has a healthy server");
+        assert!(
+            format!("{error:?}").contains("NO_RES_AVAILABLE"),
+            "expected NO_RES_AVAILABLE, got {error:?}"
+        );
+        assert_eq!(no_res_available_count(&env, "tier_app"), 1);
+
+        let mut folder_target = tier_flow_target();
+        folder_target.resource_id = "tier_folder".to_string();
+        folder_target.sub_path = Some("tier.bin".to_string());
+        let error = service
+            .execute_flow(
+                &folder_target,
+                &context,
+                &options,
+                &flow_items,
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect_err("a prefix resource still fails closed");
+        assert!(
+            format!("{error:?}").contains("NO_RES_AVAILABLE"),
+            "expected NO_RES_AVAILABLE, got {error:?}"
+        );
+        assert_eq!(no_res_available_count(&env, "tier_app"), 1);
+        assert_eq!(no_res_available_count(&env, "tier_folder"), 0);
+
+        let mut internal = context.clone();
+        internal.internal = true;
+        let error = service
+            .execute_flow(
+                &tier_flow_target(),
+                &internal,
+                &options,
+                &flow_items,
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect_err("an internal fetch still fails closed");
+        assert!(
+            format!("{error:?}").contains("NO_RES_AVAILABLE"),
+            "expected NO_RES_AVAILABLE, got {error:?}"
+        );
+        assert_eq!(no_res_available_count(&env, "tier_app"), 1);
+
+        let mut unknown = tier_flow_target();
+        unknown.resource_id = "does_not_exist".to_string();
+        let error = service
+            .execute_flow(
+                &unknown,
+                &context,
+                &options,
+                &[],
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect_err("an empty pool is NO_RES_AVAILABLE even when the resource is unknown");
+        assert!(
+            format!("{error:?}").contains("NO_RES_AVAILABLE"),
+            "expected NO_RES_AVAILABLE, got {error:?}"
+        );
+        assert_eq!(no_res_available_count(&env, "tier_app"), 1);
+        assert_eq!(no_res_available_count(&env, "does_not_exist"), 0);
     }
 
     /// 优先层内节点全部不可用时降到下一层。

@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
 
-use crate::config::SharedConfig;
 use crate::modules::analytics::SessionLogger;
 use crate::modules::storage::data_store::DataStore;
 
@@ -13,8 +12,8 @@ pub struct SessionCleanupTask {
 }
 
 impl SessionCleanupTask {
-    pub fn new(config: SharedConfig, redis: DataStore) -> Self {
-        let logger = SessionLogger::new(config.clone(), redis.clone());
+    pub fn new(redis: DataStore) -> Self {
+        let logger = SessionLogger::new(redis.clone());
 
         Self { redis, logger }
     }

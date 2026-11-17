@@ -143,9 +143,18 @@ impl DfsNodeSigner {
         uuid: &str,
         ranges: Option<Vec<(u32, u32)>>,
     ) -> Result<String> {
-        let ranges_slice = ranges.as_deref();
-        let url = self.generate_signed_url(path, uuid, None, ranges_slice);
-        Ok(url)
+        Ok(self.generate_presigned_url_expiring(path, uuid, ranges.as_deref(), None))
+    }
+
+    pub fn generate_presigned_url_expiring(
+        &self,
+        path: &str,
+        uuid: &str,
+        ranges: Option<&[(u32, u32)]>,
+        expire_seconds: Option<u32>,
+    ) -> String {
+        let expire_time = expire_seconds.map(|s| self.get_expire_time(s));
+        self.generate_signed_url(path, uuid, expire_time, ranges)
     }
 
     pub fn from_url(url_str: &str) -> Result<Self> {

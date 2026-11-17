@@ -66,7 +66,7 @@ pub fn parse_ticket_csv(raw: &str) -> DfsResult<OverrideTicket> {
     })
 }
 
-fn bind_suffix(kind: &str, subject: &str, resource_id: Option<&str>) -> String {
+pub(crate) fn bind_suffix(kind: &str, subject: &str, resource_id: Option<&str>) -> String {
     match resource_id {
         Some(resid) if !resid.is_empty() => format!("{kind}:{subject}:{resid}"),
         _ => format!("{kind}:{subject}"),

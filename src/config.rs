@@ -80,7 +80,10 @@ pub struct VersionProviderConfig {
     /// Plugin name (must start with "version_provider_")
     pub plugin_name: String,
 
-    /// Cache TTL in seconds (default: 300)
+    /// Seconds between successful plugin fetches (default: 300).
+    ///
+    /// The background task fetches again after 80% of this interval. The cached
+    /// version stays until the next successful fetch.
     #[serde(default)]
     pub cache_ttl: Option<u32>,
 
@@ -636,6 +639,9 @@ pub struct AppConfig {
     /// 本字段而不是自行判定。
     #[serde(default, skip)]
     pub pruned_flow_server_refs: Vec<(String, String)>,
+    /// 加载时读到的配置文件原文；热重载后换成新文件。
+    #[serde(default, skip)]
+    pub config_yaml: String,
 }
 
 impl<'js> IntoJs<'js> for AppConfig {
@@ -802,6 +808,7 @@ impl AppConfig {
         // 剔除——流量配比不受影响，但它们所在的层会被判为"整层不可用"而触发降级告警，与节点真的全
         // 挂无从区分。摘除本身不打日志，报告职责在 `dfs2 validate`。
         config.pruned_flow_server_refs = config.prune_undefined_flow_server_refs();
+        config.config_yaml = content;
 
         Ok(config)
     }
@@ -819,12 +826,14 @@ impl AppConfig {
 #[derive(Clone)]
 pub struct SharedConfig {
     config: Arc<ArcSwap<AppConfig>>,
+    loaded_at: Arc<ArcSwap<std::time::SystemTime>>,
 }
 
 impl SharedConfig {
     pub fn new(initial_config: AppConfig) -> Self {
         Self {
             config: Arc::new(ArcSwap::from_pointee(initial_config)),
+            loaded_at: Arc::new(ArcSwap::from_pointee(std::time::SystemTime::now())),
         }
     }
 
@@ -833,9 +842,15 @@ impl SharedConfig {
         self.config.load()
     }
 
+    /// 最近一次 `new` / `reload` 的时刻。
+    pub fn loaded_at(&self) -> std::time::SystemTime {
+        **self.loaded_at.load()
+    }
+
     /// 热重载配置（原子操作）
     pub fn reload(&self, new_config: AppConfig) {
         let old_config = self.config.swap(Arc::new(new_config));
+        self.loaded_at.store(Arc::new(std::time::SystemTime::now()));
         tracing::info!("Configuration reloaded successfully, old config dropped");
         drop(old_config); // 显式释放旧配置
     }
@@ -1290,6 +1305,7 @@ cert_hash: "trust"
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
             pruned_flow_server_refs: Vec::new(),
+            config_yaml: String::new(),
             internal: InternalConfig::default(),
         };
         let (errors, _warnings) = config.validate_servers_transport();
@@ -1402,6 +1418,7 @@ cert_hash: "trust"
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),
             pruned_flow_server_refs: Vec::new(),
+            config_yaml: String::new(),
             internal: InternalConfig::default(),
         };
 

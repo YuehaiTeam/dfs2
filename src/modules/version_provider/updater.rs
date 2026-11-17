@@ -94,7 +94,7 @@ impl VersionUpdater {
                 .should_update(&resource_id, cache_ttl)
                 .await
             {
-                match self.update_resource_version(&resource_id, cache_ttl).await {
+                match self.update_resource_version(&resource_id).await {
                     Ok(true) => {
                         update_count += 1;
                         debug!("Successfully updated version for {}", resource_id);
@@ -125,7 +125,6 @@ impl VersionUpdater {
     async fn update_resource_version(
         &self,
         resource_id: &str,
-        cache_ttl: u32,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         debug!("Updating version for resource: {}", resource_id);
 
@@ -157,7 +156,7 @@ impl VersionUpdater {
                 // 更新缓存（无论版本是否变化，都要更新时间戳）
                 if let Err(e) = self
                     .version_cache
-                    .set_cached_version_info(resource_id, &version_info, cache_ttl)
+                    .set_cached_version_info(resource_id, &version_info)
                     .await
                 {
                     error!("Failed to cache version for {}: {}", resource_id, e);
@@ -191,20 +190,18 @@ impl VersionUpdater {
             .get_resource(resource_id)
             .ok_or_else(|| crate::error::DfsError::resource_not_found(resource_id))?;
 
-        let version_provider = resource.version_provider.as_ref().ok_or_else(|| {
-            crate::error::DfsError::invalid_config(
+        if resource.version_provider.is_none() {
+            return Err(crate::error::DfsError::invalid_config(
                 "Resource does not have version provider configured".to_string(),
-            )
-        })?;
-
-        let cache_ttl = version_provider.cache_ttl.unwrap_or(300);
+            ));
+        }
 
         // 获取最新版本
         let version_info = self.plugin_provider.fetch_version_info(resource_id).await?;
 
         // 更新缓存
         self.version_cache
-            .set_cached_version_info(resource_id, &version_info, cache_ttl)
+            .set_cached_version_info(resource_id, &version_info)
             .await?;
 
         // 标记更新时间
@@ -218,7 +215,10 @@ impl VersionUpdater {
     }
 }
 
-/// 初始化版本缓存
+/// 启动版本缓存。
+///
+/// 不把配置里的 `latest` 写入缓存。键不存在时，读取方使用当前配置的 `latest`，直到插件第一次成功。
+/// 已有缓存若还带着旧的过期时间，这里重写一次去掉过期，避免键到期后退回 `latest`。
 pub async fn initialize_version_system(
     config: &AppConfig,
     version_cache: Arc<VersionCache>,
@@ -229,62 +229,216 @@ pub async fn initialize_version_system(
     info!("Initializing version system...");
 
     for (resource_id, resource) in &config.resources {
-        if let Some(version_provider) = &resource.version_provider {
-            // 检查缓存是否已存在
-            if version_cache
-                .get_cached_version(resource_id)
-                .await
-                .is_none()
-            {
-                let cache_ttl = version_provider.cache_ttl.unwrap_or(300);
-
-                // 使用latest字段作为初始缓存
-                if let Err(e) = version_cache
-                    .set_cached_version(resource_id, &resource.latest, cache_ttl)
-                    .await
-                {
-                    error!("Failed to set initial cache for {}: {}", resource_id, e);
-                    continue;
-                }
-
-                info!(
-                    "Set initial version cache for {}: {}",
-                    resource_id, resource.latest
-                );
-
-                // 异步触发首次版本检查
-                let resource_id = resource_id.clone();
-                let plugin_provider = plugin_provider.clone();
-                let version_cache = version_cache.clone();
-                tokio::spawn(async move {
-                    match plugin_provider.fetch_version_info(&resource_id).await {
-                        Ok(version_info) => {
-                            if let Err(e) = version_cache
-                                .set_cached_version_info(&resource_id, &version_info, cache_ttl)
-                                .await
-                            {
-                                error!(
-                                    "Failed to initialize version cache for {}: {}",
-                                    resource_id, e
-                                );
-                            } else {
-                                info!(
-                                    "Initialized version for {}: {}",
-                                    resource_id, version_info.version
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to fetch initial version for {}: {}", resource_id, e);
-                        }
-                    }
-                });
-
-                init_count += 1;
-            }
+        if resource.version_provider.is_none() {
+            continue;
         }
+
+        if version_cache
+            .get_cached_version(resource_id)
+            .await
+            .is_some()
+        {
+            keep_cached_version(&version_cache, resource_id).await;
+            continue;
+        }
+
+        // 异步触发首次版本检查。失败时缓存保持空，读取继续用配置里的 latest。
+        let resource_id = resource_id.clone();
+        let plugin_provider = plugin_provider.clone();
+        let version_cache = version_cache.clone();
+        tokio::spawn(async move {
+            match plugin_provider.fetch_version_info(&resource_id).await {
+                Ok(version_info) => {
+                    if let Err(e) = version_cache
+                        .set_cached_version_info(&resource_id, &version_info)
+                        .await
+                    {
+                        error!(
+                            "Failed to initialize version cache for {}: {}",
+                            resource_id, e
+                        );
+                    } else {
+                        info!(
+                            "Initialized version for {}: {}",
+                            resource_id, version_info.version
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to fetch initial version for {}: {}", resource_id, e);
+                }
+            }
+        });
+
+        init_count += 1;
     }
 
     info!("Version system initialized for {} resources", init_count);
     Ok(init_count)
+}
+
+/// 把还在的版本键重写成不过期。有详情时连同版本号一起重写。
+async fn keep_cached_version(version_cache: &VersionCache, resource_id: &str) {
+    if let Some(info) = version_cache.get_cached_version_info(resource_id).await {
+        if let Err(e) = version_cache
+            .set_cached_version_info(resource_id, &info)
+            .await
+        {
+            error!("Failed to keep cached version info for {resource_id}: {e}");
+        }
+        return;
+    }
+
+    if let Some(version) = version_cache.get_cached_version(resource_id).await
+        && let Err(e) = version_cache
+            .set_cached_version(resource_id, &version)
+            .await
+    {
+        error!("Failed to keep cached version for {resource_id}: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::storage::data_store::DataStoreBackend;
+    use crate::modules::version_provider::VersionInfo;
+    use crate::tests::common::TestEnvironment;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn startup_fetches_without_seeding_latest() {
+        let env = TestEnvironment::new().await;
+        let cache = Arc::new(VersionCache::new(env.data_store.clone()));
+        let provider = Arc::new(PluginVersionProvider::new(
+            env.js_runner.clone(),
+            env.shared_config.clone(),
+        ));
+
+        assert_eq!(
+            env.services
+                .resource_service
+                .get_effective_version("test_resource")
+                .await
+                .expect("latest is configured"),
+            "1.0.0"
+        );
+        assert_eq!(cache.get_cached_version("test_resource").await, None);
+
+        let config = env.shared_config.load();
+        let started = initialize_version_system(&config, cache.clone(), provider)
+            .await
+            .expect("init");
+        drop(config);
+        assert_eq!(started, 1);
+        assert_eq!(
+            cache.get_cached_version("test_resource").await,
+            None,
+            "startup must not write latest into the cache"
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if cache.get_cached_version("test_resource").await.as_deref() == Some("1.1.0") {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("plugin version was not cached");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            env.mock_data_store
+                .string_has_expiry("version_cache:test_resource")
+                .await,
+            Some(false)
+        );
+        assert_eq!(
+            env.mock_data_store
+                .string_has_expiry("version_info:test_resource")
+                .await,
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_drops_expiry_on_an_existing_version_without_replacing_it() {
+        let env = TestEnvironment::new().await;
+        let info = VersionInfo::new("9.9.9".into(), Some("old".into()), None);
+        let json = serde_json::to_string(&info).expect("version info");
+        env.data_store
+            .set_string("version_cache:test_resource", "9.9.9", Some(30))
+            .await
+            .expect("seed version");
+        env.data_store
+            .set_string("version_info:test_resource", &json, Some(30))
+            .await
+            .expect("seed info");
+
+        let cache = Arc::new(VersionCache::new(env.data_store.clone()));
+        let provider = Arc::new(PluginVersionProvider::new(
+            env.js_runner.clone(),
+            env.shared_config.clone(),
+        ));
+        let config = env.shared_config.load();
+        let started = initialize_version_system(&config, cache.clone(), provider)
+            .await
+            .expect("init");
+        drop(config);
+
+        assert_eq!(started, 0);
+        assert_eq!(
+            cache.get_cached_version("test_resource").await.as_deref(),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            env.mock_data_store
+                .string_has_expiry("version_cache:test_resource")
+                .await,
+            Some(false)
+        );
+        assert_eq!(
+            env.mock_data_store
+                .string_has_expiry("version_info:test_resource")
+                .await,
+            Some(false)
+        );
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            cache.get_cached_version("test_resource").await.as_deref(),
+            Some("9.9.9")
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_drops_expiry_when_only_the_version_string_is_cached() {
+        let env = TestEnvironment::new().await;
+        env.data_store
+            .set_string("version_cache:test_resource", "8.0.0", Some(30))
+            .await
+            .expect("seed version");
+
+        let cache = Arc::new(VersionCache::new(env.data_store.clone()));
+        let provider = Arc::new(PluginVersionProvider::new(
+            env.js_runner.clone(),
+            env.shared_config.clone(),
+        ));
+        let config = env.shared_config.load();
+        initialize_version_system(&config, cache.clone(), provider)
+            .await
+            .expect("init");
+        drop(config);
+
+        assert_eq!(
+            cache.get_cached_version("test_resource").await.as_deref(),
+            Some("8.0.0")
+        );
+        assert_eq!(
+            env.mock_data_store
+                .string_has_expiry("version_cache:test_resource")
+                .await,
+            Some(false)
+        );
+    }
 }

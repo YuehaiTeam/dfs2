@@ -46,7 +46,24 @@ impl S3Signer {
         key: &str,
         headers: Option<BTreeMap<String, String>>,
     ) -> Result<String> {
-        self.presign("GET", key, headers, chrono::Utc::now(), self.expires)
+        self.generate_presigned_url_expiring(key, headers, self.expires)
+    }
+
+    pub fn generate_presigned_get_url_for_expires(
+        &self,
+        key: &str,
+        expires: u32,
+    ) -> Result<String> {
+        self.generate_presigned_url_expiring(key, None, expires)
+    }
+
+    pub fn generate_presigned_url_expiring(
+        &self,
+        key: &str,
+        headers: Option<BTreeMap<String, String>>,
+        expires: u32,
+    ) -> Result<String> {
+        self.presign("GET", key, headers, chrono::Utc::now(), expires)
     }
 
     /// Presigned PUT. `UNSIGNED-PAYLOAD` matches the existing GET signer.
@@ -61,6 +78,35 @@ impl S3Signer {
             "UNSIGNED-PAYLOAD".to_string(),
         );
         self.presign("PUT", key, Some(headers), now, 3600)
+    }
+
+    pub fn existence_from_status(status: u16) -> Option<bool> {
+        match status {
+            200 | 206 => Some(true),
+            404 | 403 => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Range GET of the first byte. Same `GetObject` permission as the agent download.
+    /// Errors do not include the signed URL.
+    pub async fn object_exists(&self, key: &str) -> Result<bool> {
+        let mut headers = BTreeMap::new();
+        headers.insert("range".to_string(), "bytes=0-0".to_string());
+        let url = self.presign("GET", key, Some(headers), chrono::Utc::now(), 60)?;
+        let response = probe_client()
+            .get(url)
+            .header("range", "bytes=0-0")
+            .send()
+            .await
+            .map_err(|_| anyhow::anyhow!("S3 existence probe transport failed"))?;
+        match Self::existence_from_status(response.status().as_u16()) {
+            Some(exists) => Ok(exists),
+            None => Err(anyhow::anyhow!(
+                "S3 existence probe failed: {}",
+                response.status()
+            )),
+        }
     }
 
     /// Upload `body` with a presigned PUT. Errors do not include the signed URL.
@@ -273,6 +319,17 @@ impl S3Signer {
     }
 }
 
+fn probe_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("DFS2-SessionLog/1.0")
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("session log S3 existence client")
+    })
+}
+
 fn put_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -322,6 +379,37 @@ mod tests {
                 .presign_put_at("sessions.2026-09-11.log.zst", now)
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn existence_from_status_maps_common_codes() {
+        assert_eq!(S3Signer::existence_from_status(200), Some(true));
+        assert_eq!(S3Signer::existence_from_status(206), Some(true));
+        assert_eq!(S3Signer::existence_from_status(404), Some(false));
+        assert_eq!(S3Signer::existence_from_status(403), Some(false));
+        assert_eq!(S3Signer::existence_from_status(500), None);
+    }
+
+    #[test]
+    fn existence_probe_signs_range_get() {
+        let url = test_signer()
+            .presign(
+                "GET",
+                "sessions.2026-09-11.log.zst",
+                Some(BTreeMap::from([(
+                    "range".to_string(),
+                    "bytes=0-0".to_string(),
+                )])),
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 9, 11, 1, 2, 3)
+                    .single()
+                    .expect("fixed timestamp"),
+                60,
+            )
+            .unwrap();
+        assert!(url.contains("X-Amz-SignedHeaders=host%3Brange"), "{url}");
+        assert!(url.contains("X-Amz-Expires=60"), "{url}");
+        assert!(url.contains("X-Amz-Signature="), "{url}");
     }
 
     #[test]

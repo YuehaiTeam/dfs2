@@ -35,27 +35,21 @@ impl VersionCache {
         }
     }
 
-    /// 设置缓存版本
-    pub async fn set_cached_version(
-        &self,
-        resource_id: &str,
-        version: &str,
-        ttl: u32,
-    ) -> DfsResult<()> {
+    /// 写入版本号，不设过期。
+    ///
+    /// 插件失败不会删掉它。下一次插件成功才会覆盖。
+    pub async fn set_cached_version(&self, resource_id: &str, version: &str) -> DfsResult<()> {
         let cache_key = format!("version_cache:{resource_id}");
 
         self.redis
-            .set_string(&cache_key, version, Some(ttl))
+            .set_string(&cache_key, version, None)
             .await
             .map_err(|e| {
                 error!("Failed to cache version for {}: {}", resource_id, e);
                 e
             })?;
 
-        debug!(
-            "Cached version for {} (TTL: {}s): {}",
-            resource_id, ttl, version
-        );
+        debug!("Cached version for {}: {}", resource_id, version);
         Ok(())
     }
 
@@ -87,12 +81,11 @@ impl VersionCache {
         }
     }
 
-    /// 设置详细的版本信息
+    /// 写入版本详情和版本号，两者都不设过期。
     pub async fn set_cached_version_info(
         &self,
         resource_id: &str,
         version_info: &VersionInfo,
-        ttl: u32,
     ) -> DfsResult<()> {
         let info_key = format!("version_info:{resource_id}");
         let cache_key = format!("version_cache:{resource_id}");
@@ -103,22 +96,21 @@ impl VersionCache {
         })?;
 
         // 同时设置详细信息和简单版本号
+        self.redis.set_string(&info_key, &json_str, None).await?;
         self.redis
-            .set_string(&info_key, &json_str, Some(ttl))
-            .await?;
-        self.redis
-            .set_string(&cache_key, &version_info.version, Some(ttl))
+            .set_string(&cache_key, &version_info.version, None)
             .await?;
 
         debug!(
-            "Cached version info for {} (TTL: {}s): {}",
-            resource_id, ttl, version_info.version
+            "Cached version info for {}: {}",
+            resource_id, version_info.version
         );
         Ok(())
     }
 
-    /// 检查缓存是否应该更新
-    /// 在80%过期时间点时返回true，以便提前更新
+    /// 距上次成功更新已过 `cache_ttl` 的 80% 时返回 true。
+    ///
+    /// 版本值本身不过期。这个间隔只决定何时再拉插件。
     pub async fn should_update(&self, resource_id: &str, cache_ttl: u32) -> bool {
         let update_key = format!("version_update_time:{resource_id}");
 
@@ -172,7 +164,7 @@ impl VersionCache {
             .set_string(
                 &update_key,
                 &timestamp.to_string(),
-                Some(86400), // 24小时过期
+                Some(86400), // 24小时过期；过期后下次检查会再拉插件，不删版本值
             )
             .await?;
 
@@ -181,5 +173,38 @@ impl VersionCache {
             resource_id, timestamp
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VersionCache;
+    use crate::modules::version_provider::VersionInfo;
+    use crate::tests::mocks::MockDataStore;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn cached_version_is_not_given_an_expiry() {
+        let mock = Arc::new(MockDataStore::new());
+        let cache = VersionCache::new(mock.clone());
+        let info = VersionInfo::new("2.0.0".into(), Some("notes".into()), None);
+
+        cache
+            .set_cached_version_info("app", &info)
+            .await
+            .expect("cache version");
+
+        assert_eq!(
+            cache.get_cached_version("app").await.as_deref(),
+            Some("2.0.0")
+        );
+        assert_eq!(
+            mock.string_has_expiry("version_cache:app").await,
+            Some(false)
+        );
+        assert_eq!(
+            mock.string_has_expiry("version_info:app").await,
+            Some(false)
+        );
     }
 }

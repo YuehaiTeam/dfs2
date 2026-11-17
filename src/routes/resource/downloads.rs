@@ -373,10 +373,8 @@ pub async fn handle_download_request_unified(
             {
                 // 缓存命中！所有下载策略都记日志，否则 enabled 资源的命中会完全没有痕迹
                 if let Some(ip) = client_ip {
-                    let session_logger = crate::modules::analytics::SessionLogger::new(
-                        ctx.shared_config.clone(),
-                        ctx.data_store.clone(),
-                    );
+                    let session_logger =
+                        crate::modules::analytics::SessionLogger::new(ctx.data_store.clone());
                     let log_result = session_logger
                         .log_cached_download(
                             &resid,
@@ -534,10 +532,8 @@ pub async fn handle_download_request_unified(
             .record_scheduled_request(&resid, &source_server, false);
 
         if let Some(ip) = client_ip {
-            let session_logger = crate::modules::analytics::SessionLogger::new(
-                ctx.shared_config.clone(),
-                ctx.data_store.clone(),
-            );
+            let session_logger =
+                crate::modules::analytics::SessionLogger::new(ctx.data_store.clone());
             if let Err(e) = session_logger
                 .log_cached_download(
                     &resid,
@@ -715,10 +711,7 @@ pub async fn handle_download_request_unified(
     if matches!(resource_config.download, DownloadPolicy::Free)
         && let Some(ip) = client_ip
     {
-        let session_logger = crate::modules::analytics::SessionLogger::new(
-            ctx.shared_config.clone(),
-            ctx.data_store.clone(),
-        );
+        let session_logger = crate::modules::analytics::SessionLogger::new(ctx.data_store.clone());
         // 使用选中的服务器ID和权重，如果没有则使用默认值
         let server_id = flow_result
             .selected_server_id
@@ -752,10 +745,8 @@ pub async fn handle_download_request_unified(
     {
         // 在删除之前记录直接下载日志
         if let Some(ip) = client_ip {
-            let session_logger = crate::modules::analytics::SessionLogger::new(
-                ctx.shared_config.clone(),
-                ctx.data_store.clone(),
-            );
+            let session_logger =
+                crate::modules::analytics::SessionLogger::new(ctx.data_store.clone());
             let server_id = flow_result
                 .selected_server_id
                 .as_deref()

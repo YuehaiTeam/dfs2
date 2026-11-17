@@ -69,6 +69,11 @@ pub trait DataStoreBackend: Send + Sync {
     -> Result<(), String>;
     async fn get_string(&self, key: &str) -> Result<Option<String>, String>;
     async fn set_string(&self, key: &str, value: &str, expires: Option<u32>) -> Result<(), String>;
+    /// 原子地取出并删除 `set_string` 写入的值；并发调用只有一方拿到值。
+    async fn take_string(&self, key: &str) -> Result<Option<String>, String>;
+    /// 原子自增计数器并返回新值。过期只在计数器新建时设为 `window` 秒（固定窗口），之后的自增保留原过期时间。
+    /// 计数器以十进制字符串存放，可用 `get_string` 读取。
+    async fn incr_fixed_window(&self, key: &str, window: u32) -> Result<u64, String>;
 
     /// 读 override 票。`None` 表示不存在或已过期；剩余 TTL 为 `None` 表示 key 在但没设过期。
     async fn get_override_ticket(
@@ -211,6 +216,9 @@ pub struct BandwidthUpdateBatch {
     pub bytes: u64,
 }
 
+/// 分钟环长度：24 小时。`bandwidth_recent` 的 `minutes` 截到这个上限。
+pub const BANDWIDTH_MINUTE_RING_SIZE: u32 = 1440;
+
 /// 环形缓冲区元数据
 #[derive(Debug, Clone)]
 pub struct RingBufferMeta {
@@ -266,6 +274,8 @@ pub struct MultiBandwidthUpdateBatch {
 // 文件数据存储实现 - 每个key对应一个文件
 pub struct FileDataStore {
     base_path: PathBuf,
+    /// 串行化 `take_string` / `incr_fixed_window` 的读改写。
+    rmw_lock: tokio::sync::Mutex<()>,
 }
 
 // 存储过期时间的包装结构
@@ -315,7 +325,10 @@ impl FileDataStore {
             return Err(format!("Failed to create data store directory: {e}"));
         }
 
-        let store = Self { base_path };
+        let store = Self {
+            base_path,
+            rmw_lock: tokio::sync::Mutex::new(()),
+        };
 
         info!("File data store initialized at {:?}", store.base_path);
         Ok(store)
@@ -573,6 +586,43 @@ impl DataStoreBackend for FileDataStore {
         let storage_key = format!("general_cache:{key}");
         let stored_value = StoredValue::new(value.to_string(), expires);
         self.write_json_file(&storage_key, &stored_value).await
+    }
+
+    async fn take_string(&self, key: &str) -> Result<Option<String>, String> {
+        let _guard = self.rmw_lock.lock().await;
+        let storage_key = format!("general_cache:{key}");
+        let stored = self
+            .read_json_file::<StoredValue<String>>(&storage_key)
+            .await?;
+        if stored.is_some() {
+            self.delete_file(&storage_key).await?;
+        }
+        Ok(stored.and_then(StoredValue::into_data))
+    }
+
+    async fn incr_fixed_window(&self, key: &str, window: u32) -> Result<u64, String> {
+        let _guard = self.rmw_lock.lock().await;
+        let storage_key = format!("general_cache:{key}");
+        let current = self
+            .read_json_file::<StoredValue<String>>(&storage_key)
+            .await?
+            .filter(|stored| !stored.is_expired());
+        let (next, expires_at) = match current {
+            Some(stored) => (
+                stored.data.parse::<u64>().unwrap_or(0).saturating_add(1),
+                stored.expires_at,
+            ),
+            None => (
+                1,
+                Some(chrono::Utc::now().timestamp() as u64 + window as u64),
+            ),
+        };
+        let stored = StoredValue {
+            data: next.to_string(),
+            expires_at,
+        };
+        self.write_json_file(&storage_key, &stored).await?;
+        Ok(next)
     }
 
     async fn get_override_ticket(

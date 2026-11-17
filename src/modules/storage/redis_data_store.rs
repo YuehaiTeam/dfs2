@@ -481,6 +481,47 @@ impl DataStoreBackend for RedisDataStore {
         }
     }
 
+    async fn take_string(&self, key: &str) -> Result<Option<String>, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        // 同一个 MULTI/EXEC 里 GET + DEL，各版本 Redis 都可用。
+        let (value,): (Option<String>,) = redis::pipe()
+            .atomic()
+            .get(key)
+            .del(key)
+            .ignore()
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(value)
+    }
+
+    async fn incr_fixed_window(&self, key: &str, window: u32) -> Result<u64, String> {
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection()
+            .await
+            .map_err(|e| e.to_string())?;
+        // `SET NX EX` 只在 key 不存在时建出带过期的 0，INCR 保留已有 TTL，窗口因此固定。
+        let (count,): (u64,) = redis::pipe()
+            .atomic()
+            .cmd("SET")
+            .arg(key)
+            .arg(0)
+            .arg("NX")
+            .arg("EX")
+            .arg(window.max(1))
+            .ignore()
+            .incr(key, 1)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(count)
+    }
+
     async fn get_override_ticket(
         &self,
         uuid: &str,

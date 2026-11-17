@@ -93,13 +93,23 @@ impl DfsSftpSigner {
         uuid: &str,
         ranges: Option<Vec<(u32, u32)>>,
     ) -> Result<String> {
-        let full_path = format!("{}{}", self.path_prefix, path);
+        self.generate_presigned_url_expiring(path, uuid, ranges, None)
+    }
 
-        // Generate the DFS signature using the inner signer
-        let ranges_slice = ranges.as_deref();
-        let signed_url = self
-            .inner
-            .generate_signed_url(path, uuid, None, ranges_slice);
+    pub fn generate_presigned_url_expiring(
+        &self,
+        path: &str,
+        uuid: &str,
+        ranges: Option<Vec<(u32, u32)>>,
+        expire_seconds: Option<u32>,
+    ) -> Result<String> {
+        let full_path = format!("{}{}", self.path_prefix, path);
+        let signed_url = self.inner.generate_presigned_url_expiring(
+            path,
+            uuid,
+            ranges.as_deref(),
+            expire_seconds,
+        );
 
         // Extract signature from ?$= parameter
         let sig = if let Some(sig_start) = signed_url.find("?$=") {

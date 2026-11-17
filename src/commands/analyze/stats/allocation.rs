@@ -92,13 +92,13 @@ fn collect_chunk_data(sessions: &[SessionLog]) -> Vec<ChunkData> {
 }
 
 pub fn parse_chunk_size(range: &str) -> f64 {
-    // Parse range format like "117607337-152236120" to get size in MB
+    let range = crate::services::SessionService::scoped_key_range(range);
     if let Some((start_str, end_str)) = range.split_once('-')
         && let (Ok(start), Ok(end)) = (start_str.parse::<u64>(), end_str.parse::<u64>())
     {
-        return (end - start + 1) as f64 / 1024.0 / 1024.0; // Convert to MB
+        return (end - start + 1) as f64 / 1024.0 / 1024.0;
     }
-    0.0 // Return 0 if parsing fails
+    0.0
 }
 
 fn calculate_server_speeds(chunk_data: &[ChunkData]) -> HashMap<String, f64> {
@@ -269,7 +269,12 @@ mod tests {
     #[test]
     fn test_parse_chunk_size() {
         let size_mb = parse_chunk_size("117607337-152236120");
-        assert!((size_mb - 33.01).abs() < 0.1); // Should be around 33MB
+        assert!((size_mb - 33.01).abs() < 0.1);
+        assert_eq!(
+            parse_chunk_size("a/one.bin:117607337-152236120"),
+            parse_chunk_size("117607337-152236120")
+        );
+        assert_eq!(parse_chunk_size("a/one.bin:0-"), 0.0);
     }
 
     #[test]

@@ -164,6 +164,7 @@ impl AppContainer {
             self.js_runner.clone(),
             bandwidth_cache_service.clone(),
             resource_service.clone(),
+            Some(self.metrics.clone()),
         );
         let challenge_service = ChallengeService::new(
             self.data_store.clone(),

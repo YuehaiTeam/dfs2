@@ -24,10 +24,13 @@ enum CompressMode {
     None,
 }
 
+#[cfg(test)]
+type CaptureBuf = std::sync::Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
 enum ArchiveSink {
     S3(S3Signer),
     #[cfg(test)]
-    Capture(std::sync::Arc<Mutex<Vec<(String, Vec<u8>)>>>),
+    Capture(CaptureBuf),
     #[cfg(test)]
     Fail,
 }
@@ -155,6 +158,7 @@ impl SessionLogRotator {
         }
     }
 
+    #[cfg(test)]
     async fn append_line_at(&self, line: &str, now: DateTime<Local>) -> Result<(), String> {
         self.append_with_time(line, Some(now)).await
     }
@@ -395,7 +399,7 @@ impl SessionLogRotator {
     }
 }
 
-pub(crate) fn bucket_stem(now: DateTime<Local>, hours: u32) -> String {
+pub fn bucket_stem(now: DateTime<Local>, hours: u32) -> String {
     let hours = hours.clamp(1, 24);
     if hours >= 24 {
         format!("sessions.{}", now.format("%Y-%m-%d"))
@@ -403,6 +407,92 @@ pub(crate) fn bucket_stem(now: DateTime<Local>, hours: u32) -> String {
         let hour = now.hour() / hours * hours;
         format!("sessions.{}-{:02}", now.format("%Y-%m-%d"), hour)
     }
+}
+
+/// `from`/`to` 为 unix 秒，按服务端本地时区切桶。`prefixes` 为空时只生成无前缀 key。
+pub fn archive_object_keys(
+    from_unix: i64,
+    to_unix: i64,
+    rotate_hours: u32,
+    prefixes: &[String],
+) -> Vec<String> {
+    let hours = rotate_hours.clamp(1, 24);
+    let (start, end) = if from_unix <= to_unix {
+        (from_unix, to_unix)
+    } else {
+        (to_unix, from_unix)
+    };
+    let start_dt = match chrono::DateTime::from_timestamp(start, 0) {
+        Some(utc) => utc.with_timezone(&Local),
+        None => return Vec::new(),
+    };
+    let end_dt = match chrono::DateTime::from_timestamp(end, 0) {
+        Some(utc) => utc.with_timezone(&Local),
+        None => return Vec::new(),
+    };
+    let step = chrono::TimeDelta::try_hours(hours as i64).unwrap_or(chrono::TimeDelta::hours(1));
+    let mut t = start_dt;
+    let mut stems = Vec::new();
+    let mut seen = HashSet::new();
+    let cap = ((end - start).unsigned_abs() / (hours as u64 * 3600) + 4).min(24 * 366) as usize;
+    while t <= end_dt && stems.len() < cap {
+        let stem = bucket_stem(t, hours);
+        if seen.insert(stem.clone()) {
+            stems.push(stem);
+        }
+        match t.checked_add_signed(step) {
+            Some(next) if next > t => t = next,
+            _ => break,
+        }
+    }
+    let end_stem = bucket_stem(end_dt, hours);
+    if seen.insert(end_stem.clone()) {
+        stems.push(end_stem);
+    }
+    let prefixes: &[String] = if prefixes.is_empty() {
+        &[String::new()]
+    } else {
+        prefixes
+    };
+    let mut keys = Vec::with_capacity(stems.len() * prefixes.len());
+    for prefix in prefixes {
+        for stem in &stems {
+            keys.push(format!("{prefix}{stem}.log.zst"));
+        }
+    }
+    keys
+}
+
+/// 归档切桶宽度会变。探测时同时覆盖日桶、小时桶，以及当前 `SESSION_LOG_ROTATE_HOURS`。
+pub fn archive_probe_hours() -> Vec<u32> {
+    let mut hours = vec![1, 24, rotate_hours_from_env()];
+    hours.sort_unstable();
+    hours.dedup();
+    hours
+}
+
+/// 对多个切桶宽度求 object key 并集，去重后按文件名排序。
+pub fn archive_object_keys_union(
+    from_unix: i64,
+    to_unix: i64,
+    hours: &[u32],
+    prefixes: &[String],
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    for &h in hours {
+        for key in archive_object_keys(from_unix, to_unix, h, prefixes) {
+            if seen.insert(key.clone()) {
+                keys.push(key);
+            }
+        }
+    }
+    keys.sort();
+    keys
+}
+
+pub fn rotate_hours_from_env() -> u32 {
+    parse_rotate_hours()
 }
 
 fn parse_rotate_hours() -> u32 {
@@ -521,6 +611,78 @@ mod tests {
     #[test]
     fn daily_stem_has_no_hour() {
         assert_eq!(bucket_stem(at(2026, 9, 11, 7), 24), "sessions.2026-09-11");
+    }
+
+    #[test]
+    fn archive_keys_cross_midnight_hourly() {
+        let from = Local
+            .with_ymd_and_hms(2026, 9, 11, 23, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let to = Local
+            .with_ymd_and_hms(2026, 9, 12, 1, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let keys = archive_object_keys(from, to, 1, &[String::new()]);
+        assert_eq!(
+            keys,
+            vec![
+                "sessions.2026-09-11-23.log.zst".to_string(),
+                "sessions.2026-09-12-00.log.zst".to_string(),
+                "sessions.2026-09-12-01.log.zst".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn archive_probe_hours_always_covers_daily_and_hourly() {
+        let hours = archive_probe_hours();
+        assert!(hours.contains(&1));
+        assert!(hours.contains(&24));
+    }
+
+    #[test]
+    fn archive_keys_union_includes_daily_and_hourly() {
+        let from = Local
+            .with_ymd_and_hms(2026, 9, 11, 23, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let to = Local
+            .with_ymd_and_hms(2026, 9, 12, 1, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let keys = archive_object_keys_union(from, to, &[1, 24], &[String::new()]);
+        assert!(keys.contains(&"sessions.2026-09-11.log.zst".to_string()));
+        assert!(keys.contains(&"sessions.2026-09-12.log.zst".to_string()));
+        assert!(keys.contains(&"sessions.2026-09-11-23.log.zst".to_string()));
+        assert!(keys.contains(&"sessions.2026-09-12-00.log.zst".to_string()));
+        assert!(keys.contains(&"sessions.2026-09-12-01.log.zst".to_string()));
+    }
+
+    #[test]
+    fn archive_keys_daily_window() {
+        let from = Local
+            .with_ymd_and_hms(2026, 9, 11, 10, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let to = Local
+            .with_ymd_and_hms(2026, 9, 12, 10, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let keys = archive_object_keys(from, to, 24, &["inst/".to_string()]);
+        assert_eq!(
+            keys,
+            vec![
+                "inst/sessions.2026-09-11.log.zst".to_string(),
+                "inst/sessions.2026-09-12.log.zst".to_string(),
+            ]
+        );
     }
 
     #[test]

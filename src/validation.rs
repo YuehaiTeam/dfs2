@@ -18,6 +18,7 @@ pub struct ValidationReport {
     pub redis_valid: bool,
     pub version_providers_valid: bool,
     pub version_files_valid: bool,
+    pub env_valid: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -31,6 +32,7 @@ impl ValidationReport {
             redis_valid: true,
             version_providers_valid: true,
             version_files_valid: true,
+            env_valid: true,
             errors: Vec::new(),
             warnings: Vec::new(),
         }
@@ -51,6 +53,7 @@ impl ValidationReport {
             && self.redis_valid
             && self.version_providers_valid
             && self.version_files_valid
+            && self.env_valid
     }
 
     pub fn print_report(&self) {
@@ -100,6 +103,14 @@ impl ValidationReport {
         println!(
             "📄 版本文件: {}",
             if self.version_files_valid {
+                "✅ 有效"
+            } else {
+                "❌ 无效"
+            }
+        );
+        println!(
+            "🔧 环境变量: {}",
+            if self.env_valid {
                 "✅ 有效"
             } else {
                 "❌ 无效"
@@ -302,15 +313,15 @@ impl ConfigValidator {
                     report.config_valid = false;
                 }
 
-                // 验证缓存TTL设置
+                // cache_ttl 是再次拉取插件的间隔，不是版本值的过期时间
                 if let Some(cache_ttl) = version_provider.cache_ttl {
                     if cache_ttl < 60 {
                         report.add_warning(format!(
-                            "资源 '{resource_id}' 的缓存TTL ({cache_ttl}) 小于60秒，可能导致API调用过于频繁"
+                            "资源 '{resource_id}' 的 cache_ttl ({cache_ttl}) 小于60秒，版本插件会过于频繁地请求上游"
                         ));
                     } else if cache_ttl > 86400 {
                         report.add_warning(format!(
-                            "资源 '{resource_id}' 的缓存TTL ({cache_ttl}) 大于24小时，版本更新可能不及时"
+                            "资源 '{resource_id}' 的 cache_ttl ({cache_ttl}) 大于24小时，版本要过很久才会再拉"
                         ));
                     }
                 }
@@ -751,6 +762,13 @@ impl ConfigValidator {
         if store_type == "redis" && std::env::var("REDIS_URL").is_err() {
             report.add_warning("使用Redis存储但未设置REDIS_URL，将使用默认值".to_string());
         }
+
+        if let Err(errors) = crate::modules::mcp::settings::validate_env() {
+            for error in errors {
+                report.add_error(error);
+            }
+            report.env_valid = false;
+        }
     }
 }
 
@@ -811,5 +829,43 @@ resources:
 
         assert!(!report.warnings.iter().any(|w| w.contains("已被忽略")));
         assert!(report.is_valid());
+    }
+
+    #[tokio::test]
+    async fn validate_does_not_publish_health_entries() {
+        let mut config = crate::tests::mocks::create_default_test_config();
+        for (id, server) in config.servers.iter_mut() {
+            server.url = "http://127.0.0.1:1".into();
+            server.health_check_path = Some(format!("/validate-health-{id}"));
+        }
+        config.server_impl.clear();
+        for (id, server_config) in config.servers.iter() {
+            if let Ok(server) = crate::modules::server::ServerImpl::new(server_config) {
+                config.server_impl.insert(id.clone(), server);
+            }
+        }
+        let env = crate::tests::mocks::TestEnvironment::with_config(config.clone()).await;
+        let paths: Vec<(String, String)> = config
+            .servers
+            .iter()
+            .filter_map(|(id, s)| {
+                s.health_check_path
+                    .as_ref()
+                    .map(|p| (id.clone(), p.clone()))
+            })
+            .collect();
+        ConfigValidator::validate_full(&config, &env.data_store)
+            .await
+            .unwrap();
+        for (id, path) in paths {
+            assert!(
+                env.data_store
+                    .get_health_info(&id, &path)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "validate must not write health:{id}:{path}"
+            );
+        }
     }
 }

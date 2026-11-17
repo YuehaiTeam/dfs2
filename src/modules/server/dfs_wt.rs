@@ -37,7 +37,20 @@ impl DfsWtSigner {
         uuid: &str,
         ranges: Option<Vec<(u32, u32)>>,
     ) -> Result<String> {
-        self.inner.generate_presigned_url(path, uuid, ranges)
+        Ok(self
+            .inner
+            .generate_presigned_url_expiring(path, uuid, ranges.as_deref(), None))
+    }
+
+    pub fn generate_presigned_url_expiring(
+        &self,
+        path: &str,
+        uuid: &str,
+        ranges: Option<&[(u32, u32)]>,
+        expire_seconds: Option<u32>,
+    ) -> String {
+        self.inner
+            .generate_presigned_url_expiring(path, uuid, ranges, expire_seconds)
     }
 }
 

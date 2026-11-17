@@ -2,6 +2,7 @@ pub mod analytics;
 pub mod auth;
 pub mod external;
 pub mod flow;
+pub mod mcp;
 pub mod network;
 pub mod qjs;
 pub mod server;

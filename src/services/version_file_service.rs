@@ -5,7 +5,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{ResourceConfig, SharedConfig};
 use crate::metrics::Metrics;
-use crate::modules::server::{HealthInfo, ping_servers};
+use crate::modules::server::{HealthInfo, ping_selected_servers};
 use crate::modules::storage::cache::generate_etag;
 use crate::modules::storage::data_store::{CacheMetadata, DataStore};
 use crate::modules::version_file::{
@@ -147,7 +147,7 @@ impl VersionFileService {
     ) -> Result<CensusReport, String> {
         let ping = {
             let config = self.shared_config.load();
-            ping_servers(&config, PROBE_CONCURRENCY).await
+            ping_selected_servers(&config, None, PROBE_CONCURRENCY, Some(&self.data_store)).await
         };
 
         for server_id in &ping.implementation_missing {

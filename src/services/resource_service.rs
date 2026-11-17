@@ -62,8 +62,9 @@ impl ResourceService {
         Ok((resource_id.to_string(), effective_version))
     }
 
+    /// 有版本缓存时用缓存。该值由插件成功写入，不过期。
+    /// 没有缓存时用配置里的 `latest`。
     pub async fn get_effective_version(&self, resource_id: &str) -> Result<String, DfsError> {
-        // 集成版本缓存逻辑
         if let Some(cached_version) = self.version_cache.get_cached_version(resource_id).await {
             Ok(cached_version)
         } else {

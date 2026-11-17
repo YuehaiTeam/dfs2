@@ -223,10 +223,8 @@ pub async fn delete_session(
         Some(_stats) => {
             // 如果有客户端IP，记录结构化日志
             if let Some(ip) = client_ip {
-                let session_logger = crate::modules::analytics::SessionLogger::new(
-                    ctx.shared_config.clone(),
-                    ctx.data_store.clone(),
-                );
+                let session_logger =
+                    crate::modules::analytics::SessionLogger::new(ctx.data_store.clone());
                 let insights = req_body
                     .as_ref()
                     .and_then(|Json(req)| req.insights.as_ref());

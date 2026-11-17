@@ -1,24 +1,23 @@
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use tracing::{error, warn};
 
 use crate::modules::analytics::session_log_rotate;
 
-use crate::config::SharedConfig;
-use crate::models::InsightData;
+use crate::models::{InsightData, InsightItem};
 use crate::modules::analytics::models::*;
 use crate::modules::storage::data_store::DataStore;
 use crate::modules::storage::data_store::SessionStats;
+use crate::services::SessionService;
 
 pub struct SessionLogger {
-    config: SharedConfig,
     redis: DataStore,
 }
 
 impl SessionLogger {
-    pub fn new(config: SharedConfig, redis: DataStore) -> Self {
-        Self { config, redis }
+    pub fn new(redis: DataStore) -> Self {
+        Self { redis }
     }
 
     /// 记录正常完成的 Session
@@ -200,7 +199,6 @@ impl SessionLogger {
         self.write_log(&session_log).await
     }
 
-    /// 构建 Session 日志
     #[allow(clippy::too_many_arguments)]
     async fn build_session_log(
         &self,
@@ -212,154 +210,16 @@ impl SessionLogger {
         stats: &SessionStats,
         insights: Option<InsightData>,
     ) -> Result<SessionLog, String> {
-        let config_guard = self.config.load();
-        let resource_config = config_guard
-            .get_resource(resource_id)
-            .ok_or_else(|| format!("Resource {resource_id} not found"))?;
-
-        let now = Utc::now();
-
-        // 构建分块信息和客户端数据匹配
-        let mut chunks = Vec::new();
-        let mut unmatched_insights = Vec::new();
-
-        // 收集所有未匹配的客户端数据
-        if let Some(insight_data) = &insights {
-            unmatched_insights.extend(insight_data.servers.clone());
-        }
-
-        for chunk_id in &stats.chunks {
-            let download_attempts = stats.download_counts.get(chunk_id).unwrap_or(&0);
-            let empty_records = Vec::new();
-            let cdn_records = stats.cdn_records.get(chunk_id).unwrap_or(&empty_records);
-
-            let mut cdn_record_logs: Vec<CdnRecordLog> = cdn_records
-                .iter()
-                .map(|record| {
-                    // 尝试匹配客户端数据
-                    let mut matched_insight: Option<crate::models::InsightItem> = None;
-                    if let Some(insight_data) = &insights {
-                        for insight in insight_data.servers.iter() {
-                            // 通过URL和range匹配
-                            if Self::urls_match(&insight.url, &record.url)
-                                && Self::ranges_match(&insight.range, chunk_id)
-                            {
-                                matched_insight = Some(insight.clone());
-                                // 从未匹配列表中移除
-                                if let Some(pos) = unmatched_insights
-                                    .iter()
-                                    .position(|x| x.url == insight.url && x.range == insight.range)
-                                {
-                                    unmatched_insights.remove(pos);
-                                }
-                                break;
-                            }
-                        }
-                    }
-
-                    CdnRecordLog {
-                        url: record.url.clone(),
-                        srv: record.server_id.clone(),
-                        wgt: Some(record.weight),
-                        ts: record.timestamp,
-                        pen: Some(record.skip_penalty),
-                        rsn: Some(
-                            if record.skip_penalty {
-                                "retry_fallback"
-                            } else {
-                                "flow_selected"
-                            }
-                            .to_string(),
-                        ),
-                        ttfb: matched_insight.as_ref().map(|i| i.ttfb),
-                        time: matched_insight.as_ref().map(|i| i.time),
-                        size: matched_insight.as_ref().map(|i| i.size),
-                        err: matched_insight.as_ref().and_then(|i| i.error.clone()),
-                        mode: matched_insight.as_ref().and_then(|i| i.mode.clone()),
-                    }
-                })
-                .collect();
-
-            // 为当前chunk添加未匹配的客户端记录
-            for insight in unmatched_insights.iter() {
-                if Self::ranges_match(&insight.range, chunk_id) {
-                    cdn_record_logs.push(CdnRecordLog {
-                        url: insight.url.clone(),
-                        srv: None, // 客户端记录没有服务器信息
-                        wgt: None,
-                        ts: now.timestamp() as u64, // 使用当前时间
-                        pen: None,
-                        rsn: None,
-                        ttfb: Some(insight.ttfb),
-                        time: Some(insight.time),
-                        size: Some(insight.size),
-                        err: insight.error.clone(),
-                        mode: insight.mode.clone(),
-                    });
-                }
-            }
-
-            // 从未匹配列表中移除已处理的项
-            unmatched_insights.retain(|insight| !Self::ranges_match(&insight.range, chunk_id));
-
-            chunks.push(ChunkLog {
-                rng: chunk_id.clone(),
-                att: *download_attempts,
-                cdns: cdn_record_logs,
-            });
-        }
-
-        // 处理剩余未匹配的客户端数据（创建新的chunk）
-        let mut additional_chunks = HashMap::<String, Vec<crate::models::InsightItem>>::new();
-        for insight in unmatched_insights {
-            for (start, end) in &insight.range {
-                let range_str = format!("{}-{}", start, end);
-                additional_chunks
-                    .entry(range_str)
-                    .or_default()
-                    .push(insight.clone());
-            }
-        }
-
-        for (range_str, insight_items) in additional_chunks {
-            let cdn_records: Vec<CdnRecordLog> = insight_items
-                .into_iter()
-                .map(|insight| CdnRecordLog {
-                    url: insight.url,
-                    srv: None,
-                    wgt: None,
-                    ts: now.timestamp() as u64,
-                    pen: None,
-                    rsn: None,
-                    ttfb: Some(insight.ttfb),
-                    time: Some(insight.time),
-                    size: Some(insight.size),
-                    err: insight.error,
-                    mode: insight.mode,
-                })
-                .collect();
-
-            chunks.push(ChunkLog {
-                rng: range_str,
-                att: 0, // 客户端记录没有服务端下载尝试
-                cdns: cdn_records,
-            });
-        }
-
-        Ok(SessionLog {
-            start: stats.created_at,
-            end: now.timestamp() as u64,
-            log_type: log_type.to_string(),
-            sid: session_id,
-            rid: resource_id.to_string(),
-            ver: resource_config.latest.clone(),
-            ua: user_agent,
-            ip: (
-                client_ip.to_string(),
-                crate::modules::external::geolocation::get_ip_location_data(client_ip),
-            ),
-            chunks,
-        })
+        Ok(assemble_session_log(
+            log_type,
+            session_id,
+            resource_id,
+            client_ip,
+            user_agent,
+            stats,
+            insights,
+            Utc::now().timestamp() as u64,
+        ))
     }
 
     /// 写入日志文件
@@ -377,6 +237,18 @@ impl SessionLogger {
         };
 
         session_log_rotate::append_line(&log_json).await
+    }
+
+    fn take_matching_insight(
+        unmatched: &mut Vec<InsightItem>,
+        record_url: &str,
+        chunk_id: &str,
+    ) -> Option<InsightItem> {
+        let pos = unmatched.iter().position(|insight| {
+            Self::urls_match(&insight.url, record_url)
+                && Self::ranges_match(&insight.range, chunk_id)
+        })?;
+        Some(unmatched.remove(pos))
     }
 
     /// 检查是否启用日志记录
@@ -404,8 +276,9 @@ impl SessionLogger {
         }
     }
 
-    /// 检查客户端range是否与chunk_id完全匹配
+    /// 检查客户端range是否与 chunk key 的 range 段完全匹配。
     fn ranges_match(client_ranges: &[(u32, u32)], chunk_id: &str) -> bool {
+        let chunk_id = SessionService::scoped_key_range(chunk_id);
         if Self::ranges_to_string(client_ranges) == chunk_id {
             return true;
         }
@@ -446,21 +319,340 @@ impl SessionLogger {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn assemble_session_log(
+    log_type: &str,
+    session_id: Option<String>,
+    resource_id: &str,
+    client_ip: IpAddr,
+    user_agent: Option<String>,
+    stats: &SessionStats,
+    insights: Option<InsightData>,
+    now_ts: u64,
+) -> SessionLog {
+    let mut unmatched_insights = insights.map(|data| data.servers).unwrap_or_default();
+    let mut chunks = Vec::new();
+
+    for chunk_id in log_chunk_ids(stats) {
+        let download_attempts = stats.download_counts.get(&chunk_id).copied().unwrap_or(0);
+        let empty_records = Vec::new();
+        let cdn_records = stats.cdn_records.get(&chunk_id).unwrap_or(&empty_records);
+        let scoped = chunk_id.contains(':');
+
+        let mut cdn_record_logs: Vec<CdnRecordLog> = cdn_records
+            .iter()
+            .map(|record| {
+                let matched = SessionLogger::take_matching_insight(
+                    &mut unmatched_insights,
+                    &record.url,
+                    &chunk_id,
+                );
+                CdnRecordLog {
+                    url: record.url.clone(),
+                    srv: record.server_id.clone(),
+                    wgt: Some(record.weight),
+                    ts: record.timestamp,
+                    pen: Some(record.skip_penalty),
+                    rsn: Some(
+                        if record.skip_penalty {
+                            "retry_fallback"
+                        } else {
+                            "flow_selected"
+                        }
+                        .to_string(),
+                    ),
+                    ttfb: matched.as_ref().map(|i| i.ttfb),
+                    time: matched.as_ref().map(|i| i.time),
+                    size: matched.as_ref().map(|i| i.size),
+                    err: matched.as_ref().and_then(|i| i.error.clone()),
+                    mode: matched.as_ref().and_then(|i| i.mode.clone()),
+                }
+            })
+            .collect();
+
+        // scoped key 只靠 URL 对齐 insight；相同 range 不能跨文件归堆。
+        if !scoped {
+            for insight in unmatched_insights.iter() {
+                if SessionLogger::ranges_match(&insight.range, &chunk_id) {
+                    cdn_record_logs.push(insight_only_record(insight, now_ts));
+                }
+            }
+            unmatched_insights
+                .retain(|insight| !SessionLogger::ranges_match(&insight.range, &chunk_id));
+        }
+
+        chunks.push(ChunkLog {
+            rng: chunk_id,
+            att: download_attempts,
+            cdns: cdn_record_logs,
+        });
+    }
+
+    let mut additional_chunks = HashMap::<String, Vec<InsightItem>>::new();
+    for insight in unmatched_insights {
+        for (start, end) in &insight.range {
+            additional_chunks
+                .entry(format!("{start}-{end}"))
+                .or_default()
+                .push(insight.clone());
+        }
+    }
+
+    for (range_str, insight_items) in additional_chunks {
+        chunks.push(ChunkLog {
+            rng: range_str,
+            att: 0,
+            cdns: insight_items
+                .into_iter()
+                .map(|insight| insight_only_record(&insight, now_ts))
+                .collect(),
+        });
+    }
+
+    SessionLog {
+        start: stats.created_at,
+        end: now_ts,
+        log_type: log_type.to_string(),
+        sid: session_id,
+        rid: resource_id.to_string(),
+        ver: stats.version.clone(),
+        ua: user_agent,
+        ip: (
+            client_ip.to_string(),
+            crate::modules::external::geolocation::get_ip_location_data(client_ip),
+        ),
+        chunks,
+    }
+}
+
+fn insight_only_record(insight: &InsightItem, now_ts: u64) -> CdnRecordLog {
+    CdnRecordLog {
+        url: insight.url.clone(),
+        srv: None,
+        wgt: None,
+        ts: now_ts,
+        pen: None,
+        rsn: None,
+        ttfb: Some(insight.ttfb),
+        time: Some(insight.time),
+        size: Some(insight.size),
+        err: insight.error.clone(),
+        mode: insight.mode.clone(),
+    }
+}
+
+/// `session.chunks` 是白名单 range；已有 scoped key 覆盖该 range 时不再单写裸 key。
+fn log_chunk_ids(stats: &SessionStats) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    for key in stats.cdn_records.keys().chain(stats.download_counts.keys()) {
+        if seen.insert(key.clone()) {
+            ids.push(key.clone());
+        }
+    }
+    for chunk in &stats.chunks {
+        if seen.contains(chunk) {
+            continue;
+        }
+        if ids
+            .iter()
+            .any(|id| SessionService::scoped_key_range(id) == chunk)
+        {
+            continue;
+        }
+        seen.insert(chunk.clone());
+        ids.push(chunk.clone());
+    }
+    ids.sort();
+    ids
+}
+
 #[cfg(test)]
 mod tests {
-    use super::SessionLogger;
+    use super::*;
+    use crate::models::CdnRecord;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn insight(url: &str, range: Vec<(u32, u32)>, size: u32) -> InsightItem {
+        InsightItem {
+            url: url.to_string(),
+            ttfb: 10,
+            time: 20,
+            size,
+            error: None,
+            range,
+            mode: None,
+        }
+    }
+
+    fn record(url: &str, server: &str) -> CdnRecord {
+        CdnRecord {
+            url: url.to_string(),
+            server_id: Some(server.to_string()),
+            skip_penalty: false,
+            timestamp: 1,
+            weight: 10,
+            size: Some(100),
+        }
+    }
+
+    fn stats(
+        version: &str,
+        chunks: Vec<&str>,
+        download_counts: HashMap<String, u32>,
+        cdn_records: HashMap<String, Vec<CdnRecord>>,
+    ) -> SessionStats {
+        SessionStats {
+            resource_id: "resid".into(),
+            version: version.into(),
+            chunks: chunks.into_iter().map(str::to_string).collect(),
+            download_counts,
+            cdn_records,
+            created_at: 100,
+        }
+    }
+
+    fn assemble(stats: &SessionStats, insights: Option<InsightData>) -> SessionLog {
+        assemble_session_log(
+            "session_completed",
+            Some("sid".into()),
+            "resid",
+            IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
+            None,
+            stats,
+            insights,
+            200,
+        )
+    }
+
+    fn chunk<'a>(log: &'a SessionLog, rng: &str) -> &'a ChunkLog {
+        log.chunks.iter().find(|c| c.rng == rng).unwrap_or_else(|| {
+            panic!(
+                "missing chunk {rng}; have {:?}",
+                log.chunks.iter().map(|c| &c.rng).collect::<Vec<_>>()
+            )
+        })
+    }
 
     #[test]
     fn closed_range_matches_exact_chunk() {
         assert!(SessionLogger::ranges_match(&[(100, 200)], "100-200"));
         assert!(!SessionLogger::ranges_match(&[(100, 200)], "0-"));
+        assert!(SessionLogger::ranges_match(
+            &[(100, 200)],
+            "a/one.bin:100-200"
+        ));
+        assert!(!SessionLogger::ranges_match(&[(100, 200)], "a/one.bin:0-"));
     }
 
     #[test]
     fn open_chunk_matches_same_start() {
         assert!(SessionLogger::ranges_match(&[(0, u32::MAX)], "0-"));
         assert!(SessionLogger::ranges_match(&[(0, 10)], "0-"));
+        assert!(SessionLogger::ranges_match(
+            &[(0, u32::MAX)],
+            "a/one.bin:0-"
+        ));
         assert!(!SessionLogger::ranges_match(&[(1, u32::MAX)], "0-"));
         assert!(!SessionLogger::ranges_match(&[(0, 10), (11, 20)], "0-"));
+    }
+
+    #[test]
+    fn prefix_scoped_keys_keep_server_records() {
+        let stats = stats(
+            "1.2.3",
+            vec!["0-"],
+            HashMap::from([("a/one.bin:0-".into(), 2)]),
+            HashMap::from([(
+                "a/one.bin:0-".into(),
+                vec![record("https://cdn.example/a/one.bin?sig=1", "cdn1")],
+            )]),
+        );
+        let insights = InsightData {
+            servers: vec![insight(
+                "https://cdn.example/a/one.bin?sig=1",
+                vec![(0, u32::MAX)],
+                42,
+            )],
+        };
+        let log = assemble(&stats, Some(insights));
+        let file_chunk = chunk(&log, "a/one.bin:0-");
+        assert_eq!(file_chunk.att, 2);
+        assert_eq!(file_chunk.cdns.len(), 1);
+        assert_eq!(file_chunk.cdns[0].srv.as_deref(), Some("cdn1"));
+        assert_eq!(file_chunk.cdns[0].size, Some(42));
+        assert!(!log.chunks.iter().any(|c| c.rng == "0-"));
+        assert_eq!(log.ver, "1.2.3");
+    }
+
+    #[test]
+    fn insight_is_consumed_once_across_retries() {
+        let stats = stats(
+            "1.0.0",
+            vec!["0-"],
+            HashMap::from([("0-".into(), 2)]),
+            HashMap::from([(
+                "0-".into(),
+                vec![
+                    record("https://cdn.example/file?sig=1", "cdn1"),
+                    record("https://cdn.example/file?sig=2", "cdn2"),
+                ],
+            )]),
+        );
+        let insights = InsightData {
+            servers: vec![insight(
+                "https://cdn.example/file?sig=1",
+                vec![(0, u32::MAX)],
+                42,
+            )],
+        };
+        let log = assemble(&stats, Some(insights));
+        let cdns = &chunk(&log, "0-").cdns;
+        assert_eq!(cdns.len(), 2);
+        assert_eq!(cdns[0].size, Some(42));
+        assert_eq!(cdns[0].srv.as_deref(), Some("cdn1"));
+        assert_eq!(cdns[1].size, None);
+        assert_eq!(cdns[1].srv.as_deref(), Some("cdn2"));
+    }
+
+    #[test]
+    fn prefix_unmatched_insight_does_not_attach_by_range_only() {
+        let stats = stats(
+            "1.0.0",
+            vec!["0-"],
+            HashMap::new(),
+            HashMap::from([
+                (
+                    "a/one.bin:0-".into(),
+                    vec![record("https://cdn.example/a/one.bin", "cdn1")],
+                ),
+                (
+                    "b/two.bin:0-".into(),
+                    vec![record("https://cdn.example/b/two.bin", "cdn2")],
+                ),
+            ]),
+        );
+        let insights = InsightData {
+            servers: vec![insight(
+                "https://other.example/orphan",
+                vec![(0, u32::MAX)],
+                7,
+            )],
+        };
+        let log = assemble(&stats, Some(insights));
+        assert_eq!(chunk(&log, "a/one.bin:0-").cdns.len(), 1);
+        assert_eq!(chunk(&log, "b/two.bin:0-").cdns.len(), 1);
+        let extra = chunk(&log, "0-4294967295");
+        assert_eq!(extra.cdns.len(), 1);
+        assert_eq!(extra.cdns[0].size, Some(7));
+        assert!(extra.cdns[0].srv.is_none());
+    }
+
+    #[test]
+    fn ver_uses_session_version() {
+        let stats = stats("9.9.9-rc", vec!["0-"], HashMap::new(), HashMap::new());
+        let log = assemble(&stats, None);
+        assert_eq!(log.ver, "9.9.9-rc");
+        assert_eq!(chunk(&log, "0-").att, 0);
     }
 }

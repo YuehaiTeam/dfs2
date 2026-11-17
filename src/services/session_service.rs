@@ -102,6 +102,11 @@ impl SessionService {
         }
     }
 
+    /// `scoped_download_key` 的逆：取出 range 段。range 不含 `:`，所以从右侧切开。
+    pub fn scoped_key_range(key: &str) -> &str {
+        key.rsplit_once(':').map(|(_, range)| range).unwrap_or(key)
+    }
+
     /// 从ranges生成chunk_key
     pub fn generate_chunk_key_from_ranges(&self, ranges: &[(u32, u32)]) -> String {
         if ranges.is_empty() {
@@ -408,12 +413,39 @@ fn schedule_penalties_from_records(
     FlowPenalties { banned, demoted }
 }
 
+/// 前缀 sid 可解码的最早 unix 秒（2026-01-01T00:00:00Z）。更早的 32 位 hex 视为无前缀。
+pub const SID_CREATED_AT_FLOOR: u64 = 1_767_225_600;
+
+/// 服务端生成的 sid：前 8 位 hex 是创建时刻 unix 秒（`u32` 大端），后 24 位是 12 字节随机。
 pub fn generate_session_id() -> String {
     use rand::RngCore;
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().min(u32::MAX as u64) as u32)
+        .unwrap_or(0);
     let mut rng = rand::rng();
-    let mut bytes = [0u8; 16];
-    rng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    let mut rand_bytes = [0u8; 12];
+    rng.fill_bytes(&mut rand_bytes);
+    let mut out = String::with_capacity(32);
+    out.push_str(&hex::encode(secs.to_be_bytes()));
+    out.push_str(&hex::encode(rand_bytes));
+    out
+}
+
+/// 解出服务端前缀 sid 的创建 unix 秒。客户端自带、legacy md5、旧随机 sid 返回 `None`。
+pub fn sid_created_at(sid: &str) -> Option<u64> {
+    if sid.len() != 32 || !sid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let secs = u32::from_str_radix(&sid[..8], 16).ok()? as u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if secs < SID_CREATED_AT_FLOOR || secs > now.saturating_add(5 * 60) {
+        return None;
+    }
+    Some(secs)
 }
 
 #[cfg(test)]
@@ -595,6 +627,12 @@ mod tests {
             SessionService::scoped_download_key(Some("a/one.bin"), "0-"),
             SessionService::scoped_download_key(Some("b/two.bin"), "0-")
         );
+        assert_eq!(SessionService::scoped_key_range("0-"), "0-");
+        assert_eq!(SessionService::scoped_key_range("a/one.bin:0-"), "0-");
+        assert_eq!(
+            SessionService::scoped_key_range("a/one.bin:100-200"),
+            "100-200"
+        );
     }
 
     #[tokio::test]
@@ -663,26 +701,41 @@ mod tests {
         assert_eq!(penalty_servers[0], "penalty_server");
     }
 
-    #[tokio::test]
-    async fn test_session_id_generation() {
-        // 测试生成的session ID格式
+    #[test]
+    fn test_session_id_generation() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let session_id1 = generate_session_id();
         let session_id2 = generate_session_id();
 
-        // 应该是32个字符的十六进制字符串
         assert_eq!(session_id1.len(), 32);
         assert_eq!(session_id2.len(), 32);
+        assert!(
+            session_id1
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        assert_ne!(&session_id1[8..], &session_id2[8..]);
 
-        // 两次生成应该不同
-        assert_ne!(session_id1, session_id2);
+        let created = sid_created_at(&session_id1).expect("new sid carries created_at");
+        assert!(created.abs_diff(now) <= 1);
+    }
 
-        // 应该只包含十六进制字符
-        for c in session_id1.chars() {
-            assert!(
-                c.is_ascii_hexdigit(),
-                "Session ID should only contain hex characters"
-            );
-        }
+    #[test]
+    fn sid_created_at_rejects_non_prefix() {
+        assert_eq!(sid_created_at("abc"), None);
+        assert_eq!(sid_created_at("gg000000000000000000000000000000"), None);
+        let too_old = format!("{:08x}{}", 1u32, "aa".repeat(12));
+        assert_eq!(sid_created_at(&too_old), None);
+        let future_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600;
+        let future = format!("{:08x}{}", future_secs as u32, "bb".repeat(12));
+        assert_eq!(sid_created_at(&future), None);
     }
 
     #[tokio::test]

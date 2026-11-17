@@ -76,12 +76,14 @@ impl TestEnvironment {
         let resource_service =
             ResourceService::new(shared_config.clone(), version_cache, version_updater);
         let bandwidth_cache_service = BandwidthCacheService::new(data_store.clone());
+        let metrics = Arc::new(Metrics::new(shared_config.clone()).unwrap());
         let flow_service = FlowService::new(
             shared_config.clone(),
             data_store.clone(),
             js_runner.clone(),
             bandwidth_cache_service.clone(),
             resource_service.clone(),
+            Some(metrics.clone()),
         );
         let challenge_service = ChallengeService::new(
             data_store.clone(),
@@ -90,8 +92,6 @@ impl TestEnvironment {
             session_service.clone(),
         );
 
-        // 创建AppContext
-        let metrics = Arc::new(Metrics::new(shared_config.clone()).unwrap());
         let version_file_service = VersionFileService::new(
             shared_config.clone(),
             data_store.clone(),
@@ -147,6 +147,7 @@ pub struct MockDataStore {
     ring_meta: Arc<RwLock<HashMap<String, RingBufferMeta>>>,           // ring_key -> meta
     // 时间注入机制（测试专用）
     current_time_override: Arc<RwLock<Option<u64>>>, // 注入的当前分钟时间戳
+    pub scan_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl MockDataStore {
@@ -204,6 +205,7 @@ impl MockDataStore {
             minute_bandwidth: Arc::new(RwLock::new(HashMap::new())),
             ring_meta: Arc::new(RwLock::new(HashMap::new())),
             current_time_override: Arc::new(RwLock::new(None)),
+            scan_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -243,6 +245,15 @@ impl MockDataStore {
     pub async fn set_current_time(&self, minute_timestamp: Option<u64>) {
         let mut override_time = self.current_time_override.write().await;
         *override_time = minute_timestamp;
+    }
+
+    /// 版本键是否带过期时间。键不存在时返回 `None`。
+    pub async fn string_has_expiry(&self, key: &str) -> Option<bool> {
+        self.string_storage
+            .read()
+            .await
+            .get(key)
+            .map(|(_, expires_at)| expires_at.is_some())
     }
 
     /// 写入一张已过期的 override 票，供认领失败测试使用。
@@ -421,6 +432,27 @@ impl DataStoreBackend for MockDataStore {
         Ok(())
     }
 
+    async fn take_string(&self, key: &str) -> Result<Option<String>, String> {
+        let mut storage = self.string_storage.write().await;
+        Ok(storage
+            .remove(key)
+            .filter(|(_, expires_at)| !Self::is_expired(*expires_at))
+            .map(|(value, _)| value))
+    }
+
+    async fn incr_fixed_window(&self, key: &str, window: u32) -> Result<u64, String> {
+        let mut storage = self.string_storage.write().await;
+        let (next, expires_at) = match storage.get(key) {
+            Some((value, expires_at)) if !Self::is_expired(*expires_at) => (
+                value.parse::<u64>().unwrap_or(0).saturating_add(1),
+                *expires_at,
+            ),
+            _ => (1, Some(Self::current_timestamp() + window as u64)),
+        };
+        storage.insert(key.to_string(), (next.to_string(), expires_at));
+        Ok(next)
+    }
+
     async fn get_override_ticket(
         &self,
         uuid: &str,
@@ -478,7 +510,8 @@ impl DataStoreBackend for MockDataStore {
         &self,
         _timeout_seconds: u64,
     ) -> Result<Vec<(String, String, std::net::IpAddr)>, String> {
-        // Mock实现：返回空列表
+        self.scan_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Vec::new())
     }
 
@@ -819,6 +852,7 @@ pub fn create_default_test_config() -> AppConfig {
         plugin_code: HashMap::new(),
         server_impl: HashMap::new(),
         pruned_flow_server_refs: Vec::new(),
+        config_yaml: String::new(),
         internal: crate::config::InternalConfig::default(),
     };
 

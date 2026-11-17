@@ -1,0 +1,42 @@
+# 追加到 dfs-secrets 仓库 .cnb.yml 的镜像流水线片段。
+#
+# 前置准备（一次性）：
+#   1. 建镜像仓库（例如 cnb.cool/uigf/dfs-config-mirror），agent/成员只读。
+#   2. 在 dfs-ci-secrets 的 envs.yml 里加 MIRROR_PUSH_TOKEN：
+#      一个只对镜像仓库有 repo-code:rw 权限的访问令牌。
+#   3. 把 tools/mirror.sh 提交进 dfs-secrets 仓库。
+#   4. PATH 上有 dfs2（或设 DFS2），与本仓库 `dfs2 redact` 子命令同一二进制。
+#
+# 说明：
+#   - 与现有 sync-config 并行、互不阻塞：镜像失败不影响部署，只发通知。
+#   - 每次 push 全量重建 + force push，脱敏规则升级后历史自动整体重写。
+#   - CNB_TOKEN 作用域限本仓库，跨仓库 push 必须用专用 token。
+
+.mirror-config: &mirror-config
+  imports: https://cnb.cool/uigf/dfs-ci-secrets/-/blob/main/envs.yml
+  runner:
+    tags: cnb:arch:amd64
+    cpus: 1
+  stages:
+    - name: Rebuild redacted mirror
+      script: |
+        set -euo pipefail
+        git fetch --unshallow || true
+        bash tools/mirror.sh \
+          --source . \
+          --target /tmp/mirror \
+          --branch main \
+          --push "https://cnb:${MIRROR_PUSH_TOKEN}@cnb.cool/uigf/dfs-config-mirror.git" \
+          --push-branch main
+  failStages:
+    - name: Mirror failure notification
+      script: |
+        curl -sfL -X POST \
+          -H "Authorization: Bearer ${BOT_AUTH_KEY}" \
+          -H "Content-Type: text/plain;charset=UTF-8" \
+          -d "🚨 dfs config mirror rebuild FAILED (可能检测到泄露，未发布)\n${CNB_BUILD_WEB_URL}" \
+          https://api.qhy04.com/dev/dfs/notify
+
+main:
+  push:
+    - <<: *mirror-config
