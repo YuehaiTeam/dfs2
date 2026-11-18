@@ -382,6 +382,7 @@ mod tests {
             servers: HashMap::new(),
             resources: HashMap::new(),
             plugins: HashMap::new(),
+            flows: HashMap::new(),
             debug_mode: true,
             plugin_code: HashMap::new(),
             server_impl: HashMap::new(),

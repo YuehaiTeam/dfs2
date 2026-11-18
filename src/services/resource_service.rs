@@ -212,10 +212,10 @@ pub fn collect_resource_server_ids(resource: &crate::config::ResourceConfig) -> 
     let mut ids = resource.server.clone();
     for item in &resource.flow {
         for flow_use in &item.r#use {
-            if let crate::modules::flow::config::FlowUse::Server { id, .. } = flow_use
+            if let Some(id) = flow_use.introduces_server_id()
                 && !ids.iter().any(|existing| existing == id)
             {
-                ids.push(id.clone());
+                ids.push(id.to_string());
             }
         }
     }
@@ -306,6 +306,50 @@ mod tests {
         assert_eq!(
             version_file_path_for_resource(&resource, "1.0.0", None, "version.json").as_deref(),
             Some("/game/v3/version.json")
+        );
+    }
+
+    #[test]
+    fn collect_resource_server_ids_ignores_zero_and_sub_adjustments() {
+        let resource = crate::config::ResourceConfig {
+            latest: "1.0.0".to_string(),
+            versions: std::collections::HashMap::new(),
+            tries: vec![],
+            server: vec!["default_srv".to_string()],
+            flow: vec![crate::modules::flow::FlowItem {
+                insert: None,
+                mode: crate::modules::flow::FlowMode::AND,
+                rules: vec![],
+                r#use: vec![
+                    "server base_srv 10".parse().unwrap(),
+                    "server boost_srv +20".parse().unwrap(),
+                    "server throttled_srv 0".parse().unwrap(),
+                    "server zero_add +0".parse().unwrap(),
+                    "server reduced_srv -5".parse().unwrap(),
+                ],
+                tier: 0,
+            }],
+            challenge: None,
+            download: crate::config::DownloadPolicy::Free,
+            resource_type: "file".to_string(),
+            cache_enabled: false,
+            cache_subpaths: vec![],
+            cache_max_age: 300,
+            legacy_client_support: false,
+            legacy_client_full_range: false,
+            changelog: None,
+            version_provider: None,
+            version_files: vec![],
+            version_file_split_ttl: 300,
+        };
+
+        assert_eq!(
+            collect_resource_server_ids(&resource),
+            vec![
+                "default_srv".to_string(),
+                "base_srv".to_string(),
+                "boost_srv".to_string(),
+            ]
         );
     }
 }

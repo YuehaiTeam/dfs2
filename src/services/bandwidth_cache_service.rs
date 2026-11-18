@@ -6,7 +6,10 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::modules::storage::data_store::DataStore;
+use crate::modules::storage::data_store::{BANDWIDTH_MINUTE_RING_SIZE, DataStore};
+
+/// 汇总全站外部节点签发流量的内部桶键（不含进程内缓存直回 `"cache"`）。
+pub const GLOBAL_BANDWIDTH_KEY: &str = "*";
 
 /// 缓存的带宽数据
 #[derive(Debug, Clone)]
@@ -41,6 +44,13 @@ pub struct BandwidthCacheService {
 
     /// 刷新间隔（默认1秒）
     flush_interval: Duration,
+
+    /// 串行化后台定时刷盘与测试手动刷盘，保证 `fetch_sub` 回扣不会并发重入
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
+
+    /// 测试时钟覆盖（秒级 Unix 时间戳；`u64::MAX` 表示未启用覆盖）
+    #[cfg(test)]
+    mock_unix_secs: Arc<AtomicU64>,
 }
 
 impl BandwidthCacheService {
@@ -52,6 +62,9 @@ impl BandwidthCacheService {
             data_store,
             cache_ttl: Duration::from_secs(5),
             flush_interval: Duration::from_secs(1),
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            mock_unix_secs: Arc::new(AtomicU64::new(u64::MAX)),
         };
 
         // 启动后台刷新任务
@@ -77,9 +90,10 @@ impl BandwidthCacheService {
             "Querying bandwidth for server {} in last {} minutes",
             server_id, minutes
         );
+        let query_minute = self.current_minute_timestamp();
 
         // 1. 尝试从缓存获取
-        if let Some(cached_result) = self.get_from_cache(server_id, minutes).await {
+        if let Some(cached_result) = self.get_from_cache(server_id, minutes, query_minute).await {
             debug!(
                 "Cache hit for server {} ({} minutes): {} bytes",
                 server_id, minutes, cached_result
@@ -92,10 +106,13 @@ impl BandwidthCacheService {
             "Cache miss for server {} ({} minutes), querying Redis",
             server_id, minutes
         );
-        let redis_result = self.query_from_redis(server_id, minutes).await?;
+        let redis_result = self
+            .query_from_redis(server_id, minutes, query_minute)
+            .await?;
 
         // 3. 更新缓存
-        self.update_cache(server_id, minutes, redis_result).await;
+        self.update_cache(server_id, minutes, redis_result, query_minute)
+            .await;
 
         debug!(
             "Redis query result for server {} ({} minutes): {} bytes",
@@ -104,57 +121,116 @@ impl BandwidthCacheService {
         Ok(redis_result)
     }
 
-    /// 记录流量（异步写入）
+    /// 查询用于速率判定的采样总字节与真实覆盖秒数。
+    ///
+    /// 采样包含过去 `window_minutes` 个完整分钟桶外加当前进行中的分钟桶（共 `window_minutes + 1`
+    /// 个桶，上限截断至 [`BANDWIDTH_MINUTE_RING_SIZE`]），覆盖时长为完整分钟秒数加上当前分钟已走过的
+    /// `now_secs % 60` 秒，消除跨整分时刻采样窗口缩水导致的速率周期性低估。
+    pub async fn get_rate_window_stats(
+        &self,
+        target_id: &str,
+        window_minutes: u32,
+    ) -> Result<(u64, u64), String> {
+        let now_secs = self.current_unix_timestamp_secs();
+        let buckets = window_minutes
+            .max(1)
+            .saturating_add(1)
+            .min(BANDWIDTH_MINUTE_RING_SIZE);
+        let total_bytes = self
+            .get_server_minutes_bandwidth(target_id, buckets)
+            .await?;
+        let elapsed_secs = (buckets.saturating_sub(1) as u64) * 60 + (now_secs % 60);
+        Ok((total_bytes, elapsed_secs.max(1)))
+    }
+
+    /// 记录流量（异步写入）。非 `"cache"` 节点同步计入全局汇总桶 [`GLOBAL_BANDWIDTH_KEY`]。
     ///
     /// # 参数
     /// - `server_id`: 服务器ID
     /// - `bytes`: 流量字节数
     pub async fn record_bandwidth(&self, server_id: &str, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
         let current_minute = self.current_minute_timestamp();
-        let key = (server_id.to_string(), current_minute);
+        self.record_target_at_minute(server_id, bytes, current_minute)
+            .await;
+        if server_id != "cache" && server_id != GLOBAL_BANDWIDTH_KEY {
+            self.record_target_at_minute(GLOBAL_BANDWIDTH_KEY, bytes, current_minute)
+                .await;
+        }
+    }
+
+    async fn record_target_at_minute(&self, target_id: &str, bytes: u64, minute_timestamp: u64) {
+        let key = (target_id.to_string(), minute_timestamp);
 
         debug!(
             "Recording {} bytes for server {} at minute {}",
-            bytes, server_id, current_minute
+            bytes, target_id, minute_timestamp
         );
 
-        // 原子累加，完全无锁
         self.write_buffer
             .entry(key)
             .or_insert_with(|| AtomicU64::new(0))
             .fetch_add(bytes, Ordering::Relaxed);
 
-        // 立即更新本地缓存（保证查询一致性）
-        self.increment_local_cache(server_id, bytes, current_minute)
+        self.increment_local_cache(target_id, bytes, minute_timestamp)
             .await;
     }
 
-    /// 从缓存获取数据
-    async fn get_from_cache(&self, server_id: &str, minutes: u32) -> Option<u64> {
+    /// 从缓存获取数据；跨整分后旧分钟快照失效，避免漏计新分钟写入并残留过期分钟。
+    async fn get_from_cache(
+        &self,
+        server_id: &str,
+        minutes: u32,
+        current_minute: u64,
+    ) -> Option<u64> {
         let cache = self.read_cache.read().await;
 
         if let Some(server_cache) = cache.get(server_id)
             && let Some(cached_data) = server_cache.get(&minutes)
+            && cached_data.last_redis_sync == current_minute
+            && cached_data.cached_at.elapsed().unwrap_or(Duration::MAX) < self.cache_ttl
         {
-            // 检查缓存是否过期
-            if cached_data.cached_at.elapsed().unwrap_or(Duration::MAX) < self.cache_ttl {
-                return Some(cached_data.total_bytes);
-            }
+            return Some(cached_data.total_bytes);
         }
 
         None
     }
 
-    /// 从Redis查询数据
-    async fn query_from_redis(&self, server_id: &str, minutes: u32) -> Result<u64, String> {
-        // 使用环形缓冲区查询
-        self.data_store
+    /// 从存储查询数据，并叠加写缓冲区中尚未刷盘的窗口内增量。
+    async fn query_from_redis(
+        &self,
+        server_id: &str,
+        minutes: u32,
+        current_minute: u64,
+    ) -> Result<u64, String> {
+        let minutes = minutes.min(BANDWIDTH_MINUTE_RING_SIZE);
+        let persisted = self
+            .data_store
             .get_server_minutes_bandwidth_direct(server_id, minutes)
-            .await
+            .await?;
+        let mut pending = 0u64;
+        for i in 0..minutes {
+            let target_minute = current_minute.saturating_sub(i as u64);
+            if let Some(counter) = self
+                .write_buffer
+                .get(&(server_id.to_string(), target_minute))
+            {
+                pending = pending.saturating_add(counter.load(Ordering::Acquire));
+            }
+        }
+        Ok(persisted.saturating_add(pending))
     }
 
     /// 更新本地缓存
-    async fn update_cache(&self, server_id: &str, minutes: u32, total_bytes: u64) {
+    async fn update_cache(
+        &self,
+        server_id: &str,
+        minutes: u32,
+        total_bytes: u64,
+        sync_minute: u64,
+    ) {
         let mut cache = self.read_cache.write().await;
         let server_cache = cache
             .entry(server_id.to_string())
@@ -166,7 +242,7 @@ impl BandwidthCacheService {
                 total_bytes,
                 window_minutes: minutes,
                 cached_at: SystemTime::now(),
-                last_redis_sync: self.current_minute_timestamp(),
+                last_redis_sync: sync_minute,
             },
         );
 
@@ -191,15 +267,17 @@ impl BandwidthCacheService {
 
         if let Some(server_cache) = cache.get_mut(server_id) {
             for cached_data in server_cache.values_mut() {
-                // 如果这个字节数应该包含在缓存的时间窗口内
+                if cached_data.window_minutes == 0 {
+                    continue;
+                }
                 let cache_start_minute = cached_data
                     .last_redis_sync
-                    .saturating_sub(cached_data.window_minutes as u64 - 1);
+                    .saturating_sub(cached_data.window_minutes.saturating_sub(1) as u64);
 
                 if minute_timestamp >= cache_start_minute
                     && minute_timestamp <= cached_data.last_redis_sync
                 {
-                    cached_data.total_bytes += bytes;
+                    cached_data.total_bytes = cached_data.total_bytes.saturating_add(bytes);
                 }
             }
         }
@@ -207,8 +285,7 @@ impl BandwidthCacheService {
 
     /// 启动后台批量刷新任务
     fn start_background_flush_task(&self) {
-        let write_buffer = Arc::clone(&self.write_buffer);
-        let data_store = self.data_store.clone();
+        let service = self.clone();
         let flush_interval = self.flush_interval;
 
         info!(
@@ -222,26 +299,11 @@ impl BandwidthCacheService {
             loop {
                 interval.tick().await;
 
-                // 跳过空的刷新周期
-                if write_buffer.is_empty() {
+                if service.write_buffer.is_empty() {
                     continue;
                 }
 
-                // 创建新的空buffer，收集数据
-                let updates_to_flush = DashMap::new();
-
-                // 移动所有数据到新的DashMap
-                for entry in write_buffer.iter() {
-                    let (key, value) = entry.pair();
-                    updates_to_flush
-                        .insert(key.clone(), AtomicU64::new(value.load(Ordering::Relaxed)));
-                }
-
-                // 清空原始 buffer
-                write_buffer.clear();
-
-                // 批量刷新到Redis
-                if let Err(e) = Self::flush_to_redis(&data_store, updates_to_flush).await {
+                if let Err(e) = service.flush_pending_entries().await {
                     error!("Failed to flush bandwidth updates to Redis: {}", e);
                 } else {
                     debug!("Successfully flushed bandwidth updates to Redis");
@@ -250,24 +312,18 @@ impl BandwidthCacheService {
         });
     }
 
-    /// 批量刷新到Redis
-    async fn flush_to_redis(
-        data_store: &DataStore,
-        updates: DashMap<(String, u64), AtomicU64>,
-    ) -> Result<(), String> {
-        if updates.is_empty() {
+    /// 将写缓冲区中的增量刷入存储，单条写入成功后再从对应原子计数器回扣已刷字节数，
+    /// 避免整表清空丢失并发写入或在网络写入期间出现读取空窗。
+    async fn flush_pending_entries(&self) -> Result<(), String> {
+        let _guard = self.flush_lock.lock().await;
+        if self.write_buffer.is_empty() {
             return Ok(());
         }
 
-        debug!("Flushing {} bandwidth entries to Redis", updates.len());
-
-        // 按server_id分组并收集数据
         let mut server_data: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
-
-        for entry in updates.iter() {
+        for entry in self.write_buffer.iter() {
             let ((server_id, minute_timestamp), counter) = entry.pair();
-            let bytes = counter.load(Ordering::Relaxed);
-
+            let bytes = counter.load(Ordering::Acquire);
             if bytes > 0 {
                 server_data
                     .entry(server_id.clone())
@@ -276,9 +332,7 @@ impl BandwidthCacheService {
             }
         }
 
-        // 为每个服务器排序并写入Redis
         for (server_id, mut minute_list) in server_data {
-            // 按时间戳排序，确保顺序写入
             minute_list.sort_by_key(|(minute, _)| *minute);
 
             debug!(
@@ -287,33 +341,65 @@ impl BandwidthCacheService {
                 server_id
             );
 
-            for (minute_timestamp, total_bytes) in minute_list {
-                if let Err(e) = data_store
+            for (minute_timestamp, flushed_bytes) in minute_list {
+                match self
+                    .data_store
                     .update_server_minute_bandwidth_direct(
                         &server_id,
                         minute_timestamp,
-                        total_bytes,
+                        flushed_bytes,
                     )
                     .await
                 {
-                    warn!(
-                        "Failed to update minute bandwidth for server {} at minute {}: {}",
-                        server_id, minute_timestamp, e
-                    );
+                    Ok(()) => {
+                        if let Some(counter) = self
+                            .write_buffer
+                            .get(&(server_id.clone(), minute_timestamp))
+                        {
+                            counter.fetch_sub(flushed_bytes, Ordering::AcqRel);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to update minute bandwidth for server {} at minute {}: {}",
+                            server_id, minute_timestamp, e
+                        );
+                    }
                 }
             }
         }
 
+        let current_minute = self.current_minute_timestamp();
+        self.write_buffer.retain(|(_, min_ts), counter| {
+            *min_ts >= current_minute || counter.load(Ordering::Acquire) > 0
+        });
+
         Ok(())
+    }
+
+    fn current_unix_timestamp_secs(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let mocked = self.mock_unix_secs.load(Ordering::Relaxed);
+            if mocked != u64::MAX {
+                return mocked;
+            }
+        }
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
     }
 
     /// 获取当前分钟时间戳
     fn current_minute_timestamp(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-            / 60
+        self.current_unix_timestamp_secs() / 60
+    }
+
+    #[cfg(test)]
+    pub fn set_mock_unix_secs(&self, unix_secs: Option<u64>) {
+        self.mock_unix_secs
+            .store(unix_secs.unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     /// 获取缓存统计信息（用于监控和调试）
@@ -336,18 +422,7 @@ impl BandwidthCacheService {
     #[cfg(test)]
     /// 手动触发刷新到Redis（测试用）
     pub async fn flush_pending_for_test(&self) -> Result<(), String> {
-        let updates_to_flush = DashMap::new();
-
-        // 移动所有数据到新的DashMap
-        for entry in self.write_buffer.iter() {
-            let (key, value) = entry.pair();
-            updates_to_flush.insert(key.clone(), AtomicU64::new(value.load(Ordering::Relaxed)));
-        }
-
-        // 清空原始 buffer
-        self.write_buffer.clear();
-
-        Self::flush_to_redis(&self.data_store, updates_to_flush).await
+        self.flush_pending_entries().await
     }
 
     #[cfg(test)]
@@ -358,18 +433,15 @@ impl BandwidthCacheService {
         bytes: u64,
         minute_timestamp: u64,
     ) {
-        let key = (server_id.to_string(), minute_timestamp);
-
-        debug!(
-            "Recording {} bytes for server {} at minute {}",
-            bytes, server_id, minute_timestamp
-        );
-
-        // 原子累加
-        self.write_buffer
-            .entry(key)
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(bytes, Ordering::Relaxed);
+        if bytes == 0 {
+            return;
+        }
+        self.record_target_at_minute(server_id, bytes, minute_timestamp)
+            .await;
+        if server_id != "cache" && server_id != GLOBAL_BANDWIDTH_KEY {
+            self.record_target_at_minute(GLOBAL_BANDWIDTH_KEY, bytes, minute_timestamp)
+                .await;
+        }
     }
 }
 
@@ -541,5 +613,117 @@ mod tests {
                 .await;
             assert_eq!(result.unwrap(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn minute_bandwidth_continues_past_24_hours() {
+        let env = TestEnvironment::new().await;
+        let cache_service = env.app_context.bandwidth_cache_service.clone();
+
+        let day_zero_minute = 500_000u64;
+        env.set_mock_current_time(Some(day_zero_minute)).await;
+        cache_service.record_bandwidth("long_lived", 4096).await;
+        cache_service.flush_pending_for_test().await.unwrap();
+        assert_eq!(
+            cache_service
+                .get_server_minutes_bandwidth("long_lived", 5)
+                .await
+                .unwrap(),
+            4096
+        );
+
+        let after_33_hours = day_zero_minute + 2000;
+        env.set_mock_current_time(Some(after_33_hours)).await;
+        cache_service.record_bandwidth("long_lived", 8192).await;
+        cache_service.flush_pending_for_test().await.unwrap();
+
+        assert_eq!(
+            cache_service
+                .get_server_minutes_bandwidth("long_lived", 5)
+                .await
+                .unwrap(),
+            8192
+        );
+    }
+
+    #[tokio::test]
+    async fn global_bandwidth_aggregates_external_servers_and_excludes_cache() {
+        let env = TestEnvironment::new().await;
+        let cache_service = env.app_context.bandwidth_cache_service.clone();
+        env.set_mock_unix_secs(Some(700_000 * 60 + 15)).await;
+
+        cache_service.record_bandwidth("node_a", 1_000).await;
+        cache_service.record_bandwidth("node_b", 2_500).await;
+        cache_service.record_bandwidth("cache", 9_999).await;
+
+        // 未刷盘前直接查询也包含写缓冲中的增量
+        assert_eq!(
+            cache_service
+                .get_server_minutes_bandwidth(GLOBAL_BANDWIDTH_KEY, 5)
+                .await
+                .unwrap(),
+            3_500
+        );
+
+        cache_service.flush_pending_for_test().await.unwrap();
+        assert_eq!(
+            cache_service
+                .get_server_minutes_bandwidth(GLOBAL_BANDWIDTH_KEY, 5)
+                .await
+                .unwrap(),
+            3_500
+        );
+
+        // 全局桶已在本地读缓存命中期间，同分钟新增节点写入仍实时叠加且刷盘后不重计
+        cache_service.record_bandwidth("node_a", 500).await;
+        assert_eq!(
+            cache_service
+                .get_server_minutes_bandwidth(GLOBAL_BANDWIDTH_KEY, 5)
+                .await
+                .unwrap(),
+            4_000
+        );
+        cache_service.flush_pending_for_test().await.unwrap();
+        assert_eq!(
+            cache_service
+                .get_server_minutes_bandwidth(GLOBAL_BANDWIDTH_KEY, 5)
+                .await
+                .unwrap(),
+            4_000
+        );
+    }
+
+    #[tokio::test]
+    async fn read_cache_invalidates_on_minute_rollover_and_rate_window_includes_partial_minute() {
+        let env = TestEnvironment::new().await;
+        let cache_service = env.app_context.bandwidth_cache_service.clone();
+
+        let base_minute = 800_000u64;
+        env.set_mock_unix_secs(Some(base_minute * 60 + 30)).await;
+        cache_service
+            .record_bandwidth_at_minute("node_a", 10_000, base_minute - 5)
+            .await;
+        cache_service
+            .record_bandwidth_at_minute("node_a", 5_000, base_minute)
+            .await;
+        cache_service.flush_pending_for_test().await.unwrap();
+
+        // 5 分钟速率窗口采样 5 个完整分钟 + 当前进行中的 30 秒，总跨度 330 秒
+        let (bytes, elapsed_secs) = cache_service
+            .get_rate_window_stats("node_a", 5)
+            .await
+            .unwrap();
+        assert_eq!(bytes, 15_000);
+        assert_eq!(elapsed_secs, 5 * 60 + 30);
+
+        // 推进到 base_minute + 1（仍在本地缓存 wall-clock TTL 内），滑出窗口的旧桶不再保留
+        env.set_mock_unix_secs(Some((base_minute + 1) * 60 + 10))
+            .await;
+        let (bytes_after, elapsed_after) = cache_service
+            .get_rate_window_stats("node_a", 5)
+            .await
+            .unwrap();
+        assert_eq!(bytes_after, 5_000);
+        assert_eq!(elapsed_after, 5 * 60 + 10);
     }
 }

@@ -9,7 +9,8 @@ use crate::{
     modules::{
         external::geolocation,
         flow::{
-            FlowComp, FlowCond, FlowItem, FlowMode, FlowUse, ResourcePattern, schedule_override,
+            FlowComp, FlowCond, FlowItem, FlowMode, FlowUse, ResourcePattern, SpeedTarget,
+            WeightDelta, schedule_override,
         },
         network::capabilities,
         qjs::JsRunner,
@@ -43,6 +44,23 @@ struct Poolized {
     server_id: String,
     weight: u32,
     tier: u32,
+}
+
+#[derive(Clone, Copy)]
+enum ServerOp {
+    Set(u32),
+    Add(u32),
+    Sub(u32),
+}
+
+impl ServerOp {
+    fn apply(self, base: u32) -> u32 {
+        match self {
+            ServerOp::Set(w) => w,
+            ServerOp::Add(n) => base.saturating_add(n),
+            ServerOp::Sub(n) => base.saturating_sub(n),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -265,6 +283,10 @@ impl FlowService {
         selection: &mut Option<Poolized>,
         tier_mapping: &mut HashMap<String, u32>,
     ) -> DfsResult<ItemControl> {
+        if item.r#use.is_empty() {
+            return Ok(ItemControl::Proceed);
+        }
+
         // 评估规则
         let should_exec = if !item.rules.is_empty() {
             self.evaluate_flow_rules(&item.rules, &item.mode, target, context)
@@ -287,28 +309,36 @@ impl FlowService {
                         control = ItemControl::EndTier;
                         break;
                     }
-                    FlowUse::Clear => pool.clear(),
+                    FlowUse::Clear => {
+                        pool.clear();
+                        tier_mapping.clear();
+                        plugin_server_mapping.clear();
+                    }
                     FlowUse::Server { id, weight } => {
-                        if penalties.banned.iter().any(|server_id| server_id == id) {
-                            continue;
-                        }
-
-                        let config = self.shared_config.load();
-                        if let Some(server_config) = config.servers.get(id)
-                            && !capabilities::server_transport_is_usable(
-                                server_config,
-                                &context.capabilities,
-                            )
-                        {
-                            debug!(
-                                server = %id,
-                                "Skipping server: client cannot speak the transport it requires"
-                            );
-                            continue;
-                        }
-
-                        Self::record_pool_entry_tier(tier_mapping, id, item.tier);
-                        pool.push((id.clone(), *weight));
+                        self.apply_server_op(
+                            pool,
+                            tier_mapping,
+                            id,
+                            ServerOp::Set(*weight),
+                            item.tier,
+                            penalties,
+                            context,
+                        );
+                    }
+                    FlowUse::ServerDelta { id, delta } => {
+                        let op = match *delta {
+                            WeightDelta::Add(n) => ServerOp::Add(n),
+                            WeightDelta::Sub(n) => ServerOp::Sub(n),
+                        };
+                        self.apply_server_op(
+                            pool,
+                            tier_mapping,
+                            id,
+                            op,
+                            item.tier,
+                            penalties,
+                            context,
+                        );
                     }
                     FlowUse::Plugin { id, indirect } => {
                         let flow_context = FlowJsContext {
@@ -463,6 +493,66 @@ impl FlowService {
             .entry(name.to_string())
             .and_modify(|existing| *existing = (*existing).min(tier))
             .or_insert(tier);
+    }
+
+    fn server_passes_admission_gates(
+        &self,
+        id: &str,
+        penalties: &FlowPenalties,
+        context: &FlowContext,
+    ) -> bool {
+        if penalties.banned.iter().any(|server_id| server_id == id) {
+            return false;
+        }
+
+        let config = self.shared_config.load();
+        if let Some(server_config) = config.servers.get(id)
+            && !capabilities::server_transport_is_usable(server_config, &context.capabilities)
+        {
+            debug!(
+                server = %id,
+                "Skipping server: client cannot speak the transport it requires"
+            );
+            return false;
+        }
+
+        true
+    }
+
+    /// 按层更新候选池中的节点权重：同层就地计算新值；更高优先层仅在结果非零时接管归属；
+    /// 未入池节点仅在结果非零且通过门禁时入池。
+    #[allow(clippy::too_many_arguments)]
+    fn apply_server_op(
+        &self,
+        pool: &mut Vec<(String, u32)>,
+        tier_mapping: &mut HashMap<String, u32>,
+        id: &str,
+        op: ServerOp,
+        tier: u32,
+        penalties: &FlowPenalties,
+        context: &FlowContext,
+    ) {
+        if let Some((_, existing_weight)) =
+            pool.iter_mut().find(|(existing_id, _)| existing_id == id)
+        {
+            let existing_tier = Self::pool_entry_tier(id, tier_mapping);
+            if tier == existing_tier {
+                *existing_weight = op.apply(*existing_weight);
+            } else if tier < existing_tier {
+                let next = op.apply(0);
+                if next > 0 {
+                    Self::record_pool_entry_tier(tier_mapping, id, tier);
+                    *existing_weight = next;
+                }
+            }
+            return;
+        }
+
+        let next = op.apply(0);
+        if next > 0 && self.server_passes_admission_gates(id, penalties, context) {
+            Self::record_pool_entry_tier(tier_mapping, id, tier);
+            pool.push((id.to_string(), next));
+        }
     }
 
     /// 评估Flow规则（只使用必要的参数）
@@ -660,14 +750,24 @@ impl FlowService {
                     .unwrap_or(0);
 
                 let limit_bytes = limit.bytes() as u64;
-                Ok(match comp {
-                    FlowComp::Eq => current_usage == limit_bytes,
-                    FlowComp::Ne => current_usage != limit_bytes,
-                    FlowComp::Gt => current_usage > limit_bytes,
-                    FlowComp::Ge => current_usage >= limit_bytes,
-                    FlowComp::Lt => current_usage < limit_bytes,
-                    FlowComp::Le => current_usage <= limit_bytes,
-                })
+                Ok(comp.matches(current_usage, limit_bytes))
+            }
+            FlowCond::Speed(target, minutes, comp, rate) => {
+                let target_key = match target {
+                    SpeedTarget::Global => {
+                        crate::services::bandwidth_cache_service::GLOBAL_BANDWIDTH_KEY
+                    }
+                    SpeedTarget::Server(server_id) => server_id.as_str(),
+                };
+                let (total_bytes, elapsed_secs) = self
+                    .bandwidth_cache
+                    .get_rate_window_stats(target_key, *minutes)
+                    .await
+                    .unwrap_or((0, (*minutes as u64).max(1) * 60));
+
+                let actual_bits = (total_bytes as u128) * 8;
+                let threshold_bits = (rate.bits_per_sec() as u128) * (elapsed_secs as u128);
+                Ok(comp.matches(actual_bits, threshold_bits))
             }
             FlowCond::Time(comp, expected_time) => {
                 let current_time = chrono::Local::now().time();
@@ -834,7 +934,7 @@ impl FlowService {
             .unwrap_or(name)
     }
 
-    /// 已签过的节点降权摊开：减半，下限 1。
+    /// 已签过的节点降权摊开：正权重减半（下限 1），0 权重保持禁用不恢复。
     fn apply_penalty_to_pool(
         &self,
         pool: &mut [(String, u32)],
@@ -846,6 +946,9 @@ impl FlowService {
         }
 
         for (server_name, weight) in pool.iter_mut() {
+            if *weight == 0 {
+                continue;
+            }
             let server_id = Self::pool_entry_server_id(server_name, plugin_server_mapping);
             if demoted.iter().any(|id| id == server_id) {
                 let new_weight = (*weight / 2).max(1);
@@ -2331,6 +2434,7 @@ mod tests {
         assert!(!context.capabilities.wt, "本进程不做 WebTransport 客户端");
 
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Server {
@@ -2512,6 +2616,7 @@ mod tests {
 
         // Flow item with h3_only server
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Server {
@@ -2558,6 +2663,7 @@ mod tests {
         context.capabilities.h3 = true;
 
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Server {
@@ -2607,6 +2713,7 @@ mod tests {
         context.capabilities.h3 = false;
 
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Server {
@@ -2656,6 +2763,7 @@ mod tests {
 
         // Flow item with both h3_only and normal servers
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![
@@ -2745,6 +2853,7 @@ mod tests {
         };
 
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![
@@ -2798,6 +2907,7 @@ mod tests {
         context.capabilities.h3 = false;
 
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Server {
@@ -2846,6 +2956,7 @@ mod tests {
         let mut tier_mapping: HashMap<String, u32> = HashMap::new();
 
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![
@@ -2903,6 +3014,7 @@ mod tests {
 
         for tier in [3, 1, 4] {
             let item = FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![FlowUse::Server {
@@ -2944,6 +3056,7 @@ mod tests {
 
         for (command, expected_control, name) in cases {
             let item = FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![
@@ -2998,6 +3111,7 @@ mod tests {
         context.client_ip = Some("8.8.8.8".parse().unwrap());
 
         let item = FlowItem {
+            insert: None,
             rules: vec![FlowCond::CnIp(true)],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Break],
@@ -3047,6 +3161,7 @@ mod tests {
             demoted: vec!["normal_server".to_string()],
         };
         let item = FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![
@@ -3361,6 +3476,7 @@ mod tests {
             tries: vec![],
             server: vec![],
             flow: vec![FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![FlowUse::Server {
@@ -3395,6 +3511,7 @@ mod tests {
             tries: vec![],
             server: vec![],
             flow: vec![FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![
@@ -3524,6 +3641,7 @@ mod tests {
     fn tier_flow_items() -> Vec<FlowItem> {
         vec![
             FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![FlowUse::Server {
@@ -3533,6 +3651,7 @@ mod tests {
                 tier: 0,
             },
             FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![FlowUse::Server {
@@ -3584,6 +3703,7 @@ mod tests {
     fn tier_items_with_control_command(command: FlowUse) -> Vec<FlowItem> {
         vec![
             FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![
@@ -3596,6 +3716,7 @@ mod tests {
                 tier: 0,
             },
             FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![FlowUse::Server {
@@ -3605,6 +3726,7 @@ mod tests {
                 tier: 0,
             },
             FlowItem {
+                insert: None,
                 rules: vec![],
                 mode: FlowMode::AND,
                 r#use: vec![FlowUse::Server {
@@ -3846,6 +3968,7 @@ mod tests {
         let flow_items: Vec<FlowItem> = tier_flow_items()
             .into_iter()
             .map(|item| FlowItem {
+                insert: None,
                 tier: 0,
                 r#use: item
                     .r#use
@@ -3911,6 +4034,7 @@ mod tests {
         };
 
         let flow_items = vec![FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Server {
@@ -3977,6 +4101,7 @@ mod tests {
         };
 
         let flow_items = vec![FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![
@@ -4086,6 +4211,7 @@ mod tests {
 
     fn yaml_only_server_one() -> Vec<FlowItem> {
         vec![FlowItem {
+            insert: None,
             rules: vec![],
             mode: FlowMode::AND,
             r#use: vec![FlowUse::Server {
@@ -4258,5 +4384,226 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.selected_server_id.as_deref(), Some("test_server_1"));
+    }
+
+    #[tokio::test]
+    async fn speed_condition_evaluates_server_and_global_rates_across_minute_boundaries() {
+        let env = TestEnvironment::new().await;
+        let service = env.services.flow_service.clone();
+        let bw = env.app_context.bandwidth_cache_service.clone();
+        let (target, context, _options) = create_test_context();
+
+        // 固定在 1000m20s：5 分钟窗口覆盖 [995..=1000]，有效时长 5 * 60 + 20 = 320 秒。
+        // 80 Mbps * 320 s = 25_600_000_000 bits = 3_200_000_000 bytes。
+        let base_minute = 1_000u64;
+        env.set_mock_unix_secs(Some(base_minute * 60 + 20)).await;
+        bw.record_bandwidth_at_minute("cyrene", 2_000_000_000, base_minute - 3)
+            .await;
+        bw.record_bandwidth_at_minute("cyrene", 1_200_000_000, base_minute)
+            .await;
+        bw.record_bandwidth_at_minute("cache", 9_000_000_000, base_minute)
+            .await;
+        bw.flush_pending_for_test().await.unwrap();
+
+        let gt_80: FlowCond = serde_yaml::from_str("speed cyrene > 80Mbps").unwrap();
+        let ge_80: FlowCond = serde_yaml::from_str("speed cyrene >= 80Mbps").unwrap();
+        assert!(
+            !service
+                .evaluate_condition(&gt_80, &target, &context)
+                .await
+                .unwrap()
+        );
+        assert!(
+            service
+                .evaluate_condition(&ge_80, &target, &context)
+                .await
+                .unwrap()
+        );
+
+        // 再加 1 字节越过严格大于阈值，且无需等待刷盘即可生效
+        bw.record_bandwidth("cyrene", 1).await;
+        assert!(
+            service
+                .evaluate_condition(&gt_80, &target, &context)
+                .await
+                .unwrap()
+        );
+
+        // 全局 `*` 汇总所有外部节点流量并排除 `cache`
+        bw.record_bandwidth("saiguu", 3_200_000_000).await;
+        let global_gt_160: FlowCond = serde_yaml::from_str("speed * 5 > 160Mbps").unwrap();
+        let global_gt_200: FlowCond = serde_yaml::from_str("speed * 5 > 200Mbps").unwrap();
+        assert!(
+            service
+                .evaluate_condition(&global_gt_160, &target, &context)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !service
+                .evaluate_condition(&global_gt_200, &target, &context)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn server_weight_ops_respect_tiers_gates_and_clear() {
+        let service = create_h3_test_flow_service().await;
+        let (target, mut context, options) = create_test_context();
+        context.capabilities.h3 = false;
+
+        let mut pool = Vec::new();
+        let mut plugin_server_mapping = HashMap::new();
+        let mut selection: Option<Poolized> = None;
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
+
+        for (tier, cmds) in [
+            // 未入池时 `0` / `-N` 为空操作，不抢占 tier 0
+            (0u32, &["server fallback_srv 0", "server absent -5"][..]),
+            // 同层赋值、累加、扣减及传输门禁过滤
+            (
+                0,
+                &["server node_a 8", "server node_b 6", "server cdn_a 20"],
+            ),
+            (
+                0,
+                &[
+                    "server node_a 0",
+                    "server node_b -4",
+                    "server cdn_a +30",
+                    "server h3_server +10",
+                ],
+            ),
+            // 低优先层正权重可入池，低优先层 `0`/`-N` 与高优先层后置 `0` 均不跨层篡改
+            (
+                1,
+                &[
+                    "server fallback_srv 7",
+                    "server cdn_a 0",
+                    "server node_b -2",
+                ],
+            ),
+            (0, &["server fallback_srv 0", "server node_b -99"]),
+        ] {
+            let item = FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: cmds.iter().map(|c| c.parse().unwrap()).collect(),
+                tier,
+            };
+            service
+                .execute_flow_item(
+                    &mut pool,
+                    &item,
+                    &target,
+                    &context,
+                    &options,
+                    None,
+                    &mut plugin_server_mapping,
+                    &FlowPenalties::default(),
+                    &mut selection,
+                    &mut tier_mapping,
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            pool,
+            vec![
+                ("node_a".to_string(), 0),
+                ("node_b".to_string(), 0),
+                ("cdn_a".to_string(), 50),
+                ("fallback_srv".to_string(), 7),
+            ]
+        );
+        assert_eq!(tier_mapping.get("fallback_srv"), Some(&1));
+
+        // `clear` 同步重置 `tier_mapping`，后续在更低优先层重填时归属新层
+        for (tier, r#use) in [
+            (0u32, vec![FlowUse::Clear]),
+            (3, vec!["server cdn_a 4".parse().unwrap()]),
+        ] {
+            let item = FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use,
+                tier,
+            };
+            service
+                .execute_flow_item(
+                    &mut pool,
+                    &item,
+                    &target,
+                    &context,
+                    &options,
+                    None,
+                    &mut plugin_server_mapping,
+                    &FlowPenalties::default(),
+                    &mut selection,
+                    &mut tier_mapping,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(pool, vec![("cdn_a".to_string(), 4)]);
+        assert_eq!(tier_mapping.get("cdn_a"), Some(&3));
+    }
+
+    #[tokio::test]
+    async fn demoted_penalty_does_not_revive_zero_weight_servers() {
+        let env = TestEnvironment::with_config(create_tier_integration_config()).await;
+        set_tier_server_alive(&env, "tier_primary", true).await;
+        set_tier_server_alive(&env, "tier_secondary", true).await;
+
+        let service = env.services.flow_service.clone();
+        let (_unused_target, context, options) = create_test_context();
+
+        let items = vec![
+            FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![
+                    "server tier_primary 8".parse().unwrap(),
+                    "server tier_secondary 10".parse().unwrap(),
+                ],
+                tier: 0,
+            },
+            FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec!["server tier_primary 0".parse().unwrap()],
+                tier: 0,
+            },
+        ];
+
+        let penalties = FlowPenalties {
+            banned: vec![],
+            demoted: vec!["tier_primary".to_string(), "tier_secondary".to_string()],
+        };
+
+        for _ in 0..20 {
+            let result = service
+                .execute_flow(
+                    &tier_flow_target(),
+                    &context,
+                    &options,
+                    &items,
+                    penalties.clone(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                result.selected_server_id.as_deref(),
+                Some("tier_secondary"),
+                "a zero-weight server in demoted must stay disabled"
+            );
+        }
     }
 }

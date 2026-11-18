@@ -3,6 +3,11 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use size::Size;
 
+use crate::modules::storage::data_store::BANDWIDTH_MINUTE_RING_SIZE;
+
+/// `speed` 条件省略窗口参数时的默认分钟数。
+pub const DEFAULT_SPEED_WINDOW_MINUTES: u32 = 5;
+
 // TODO(unconstructed-type): 全仓库只有这一行提到 FlowsList，没有任何构造点；flow 一律以
 // Vec<FlowItem> 的形式在 ResourceConfig 上流转。确认无外部依赖后删除。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -19,14 +24,26 @@ pub enum FlowMode {
     OR,
 }
 
+/// 同层节点权重的相对增减运算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightDelta {
+    Add(u32),
+    Sub(u32),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowUse {
     // clear
     Clear,
-    // server id server id weight
+    /// 将本层内节点权重设为指定值（未入池时仅正权重入池；0 将同层已有节点禁用）。
     Server {
         id: String,
         weight: u32,
+    },
+    /// 在本层内对节点权重做相对增减（`+N` 累加或入池，`-N` 饱和扣减至 0）。
+    ServerDelta {
+        id: String,
+        delta: WeightDelta,
     },
     // plugin id plugin id indirect
     Plugin {
@@ -41,12 +58,33 @@ pub enum FlowUse {
     /// 本项 `use` 中它之后的命令同属本层，因此也不再执行。
     Continue,
 }
-impl<'de> Deserialize<'de> for FlowUse {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
+
+impl FlowUse {
+    /// 命令指向的服务器 ID（无论赋值还是增减），供配置加载期死引用摘除使用。
+    pub fn server_id(&self) -> Option<&str> {
+        match self {
+            FlowUse::Server { id, .. } | FlowUse::ServerDelta { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    /// 命令是否可能以正权重将节点引入候选池（排除置 0 与纯扣减），供副本枚举与文件大小探测使用。
+    pub fn introduces_server_id(&self) -> Option<&str> {
+        match self {
+            FlowUse::Server { id, weight } if *weight > 0 => Some(id),
+            FlowUse::ServerDelta {
+                id,
+                delta: WeightDelta::Add(w),
+            } if *w > 0 => Some(id),
+            _ => None,
+        }
+    }
+}
+
+impl FromStr for FlowUse {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
         if s == "clear" {
             Ok(FlowUse::Clear)
@@ -56,37 +94,97 @@ impl<'de> Deserialize<'de> for FlowUse {
             Ok(FlowUse::Break)
         } else if s == "continue" {
             Ok(FlowUse::Continue)
-        } else if s.starts_with("server ") {
-            // server id server id weight
-            // eg. server example 2
-            let mut parts: Vec<&str> = s.split(' ').collect();
-            let id = parts[1].to_string();
-            parts.remove(0);
-            parts.remove(0);
-            let last_all = parts.join(" ");
-            let weight = if last_all.is_empty() {
-                0
-            } else {
-                last_all.parse::<u32>().map_err(serde::de::Error::custom)?
+        } else if let Some(rest) = s.strip_prefix("server") {
+            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                return Err(format!("Invalid FlowUse: {s}"));
+            }
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let Some(&id_raw) = parts.first() else {
+                return Err(
+                    "server command requires format: server {id} [weight|+N|-N]".to_string()
+                );
             };
-            Ok(FlowUse::Server { id, weight })
-        } else if s.starts_with("plugin ") {
-            // plugin:id plugin:id[indirect]
-            // eg. plugin:example[2]
-            let mut parts: Vec<&str> = s.split(' ').collect();
-            let id = parts[1].to_string();
-            parts.remove(0);
-            parts.remove(0);
-            let last_all = parts.join(" ");
-            let indirect = if last_all.is_empty() {
-                String::new()
+            if parts.len() > 2 {
+                return Err(format!(
+                    "server command requires format: server {{id}} [weight|+N|-N], got '{s}'"
+                ));
+            }
+            let id = id_raw.to_string();
+            let Some(&weight_token) = parts.get(1) else {
+                return Ok(FlowUse::Server { id, weight: 0 });
+            };
+            if let Some(num) = weight_token.strip_prefix('+') {
+                let delta = num
+                    .parse::<u32>()
+                    .map_err(|e| format!("Invalid server weight delta '+{num}': {e}"))?;
+                Ok(FlowUse::ServerDelta {
+                    id,
+                    delta: WeightDelta::Add(delta),
+                })
+            } else if let Some(num) = weight_token.strip_prefix('-') {
+                let delta = num
+                    .parse::<u32>()
+                    .map_err(|e| format!("Invalid server weight delta '-{num}': {e}"))?;
+                Ok(FlowUse::ServerDelta {
+                    id,
+                    delta: WeightDelta::Sub(delta),
+                })
             } else {
-                last_all
+                let weight = weight_token
+                    .parse::<u32>()
+                    .map_err(|e| format!("Invalid server weight '{weight_token}': {e}"))?;
+                Ok(FlowUse::Server { id, weight })
+            }
+        } else if let Some(rest) = s.strip_prefix("plugin ") {
+            let trimmed = rest.trim_start();
+            if trimmed.is_empty() {
+                return Err("plugin command requires format: plugin {id} [indirect]".to_string());
+            }
+            let (id, indirect) = match trimmed.split_once(char::is_whitespace) {
+                Some((id, rem)) => (id.to_string(), rem.trim().to_string()),
+                None => (trimmed.to_string(), String::new()),
             };
             Ok(FlowUse::Plugin { id, indirect })
         } else {
-            Err(serde::de::Error::custom(format!("Invalid FlowUse: {s}")))
+            Err(format!("Invalid FlowUse: {s}"))
         }
+    }
+}
+
+impl std::fmt::Display for FlowUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlowUse::Clear => write!(f, "clear"),
+            FlowUse::Poolize => write!(f, "poolize"),
+            FlowUse::Break => write!(f, "break"),
+            FlowUse::Continue => write!(f, "continue"),
+            FlowUse::Server { id, weight } => write!(f, "server {id} {weight}"),
+            FlowUse::ServerDelta {
+                id,
+                delta: WeightDelta::Add(n),
+            } => write!(f, "server {id} +{n}"),
+            FlowUse::ServerDelta {
+                id,
+                delta: WeightDelta::Sub(n),
+            } => write!(f, "server {id} -{n}"),
+            FlowUse::Plugin { id, indirect } => {
+                if indirect.is_empty() {
+                    write!(f, "plugin {id}")
+                } else {
+                    write!(f, "plugin {id} {indirect}")
+                }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FlowUse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        FlowUse::from_str(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -95,26 +193,7 @@ impl Serialize for FlowUse {
     where
         S: serde::Serializer,
     {
-        match self {
-            FlowUse::Clear => serializer.serialize_str("clear"),
-            FlowUse::Poolize => serializer.serialize_str("poolize"),
-            FlowUse::Break => serializer.serialize_str("break"),
-            FlowUse::Continue => serializer.serialize_str("continue"),
-            FlowUse::Server { id, weight } => {
-                if *weight > 0 {
-                    serializer.serialize_str(&format!("server {id}[{weight}]"))
-                } else {
-                    serializer.serialize_str(&format!("server {id}"))
-                }
-            }
-            FlowUse::Plugin { id, indirect } => {
-                if !indirect.is_empty() {
-                    serializer.serialize_str(&format!("plugin {id}[{indirect}]"))
-                } else {
-                    serializer.serialize_str(&format!("plugin {id}"))
-                }
-            }
-        }
+        serializer.serialize_str(&self.to_string())
     }
 }
 
@@ -128,6 +207,19 @@ pub enum FlowComp {
     Lt,
     Le,
 }
+impl FlowComp {
+    pub fn matches<T: PartialOrd>(&self, lhs: T, rhs: T) -> bool {
+        match self {
+            FlowComp::Eq => lhs == rhs,
+            FlowComp::Ne => lhs != rhs,
+            FlowComp::Gt => lhs > rhs,
+            FlowComp::Ge => lhs >= rhs,
+            FlowComp::Lt => lhs < rhs,
+            FlowComp::Le => lhs <= rhs,
+        }
+    }
+}
+
 impl std::str::FromStr for FlowComp {
     type Err = String;
 
@@ -197,6 +289,128 @@ pub enum ResourcePattern {
     Specific(String), // 具体资源ID
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpeedTarget {
+    /// 全站外部节点汇总流量（`*`）
+    Global,
+    /// 指定节点（`server_id`）
+    Server(String),
+}
+
+impl std::fmt::Display for SpeedTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpeedTarget::Global => write!(f, "*"),
+            SpeedTarget::Server(id) => write!(f, "{id}"),
+        }
+    }
+}
+
+/// 带宽速率阈值，内部统一按 `bits/s` 存储；字节率（`MB/s`、`MiB/s` 等）复用 [`Size`] 解析。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BandwidthRate {
+    bits_per_sec: u64,
+}
+
+impl BandwidthRate {
+    pub fn bits_per_sec(&self) -> u64 {
+        self.bits_per_sec
+    }
+}
+
+impl FromStr for BandwidthRate {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty bandwidth rate".to_string());
+        }
+
+        // 大写 `B/s` 结尾的字节率直接委托 `Size`（与 `size`、`bw_daily` 共享同一套字节单位语义）
+        if let Some(size_part) = s.strip_suffix("/s").or_else(|| s.strip_suffix("/S"))
+            && size_part.ends_with('B')
+        {
+            let size =
+                Size::from_str(size_part).map_err(|e| format!("invalid byte rate '{s}': {e}"))?;
+            let bytes = u64::try_from(size.bytes())
+                .map_err(|_| format!("bandwidth rate '{s}' must be non-negative"))?;
+            let bits_per_sec = bytes
+                .checked_mul(8)
+                .ok_or_else(|| format!("bandwidth rate overflow in '{s}'"))?;
+            return Ok(Self { bits_per_sec });
+        }
+
+        let unit_pos = s
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .ok_or_else(|| format!("bandwidth rate '{s}' requires a unit (e.g. Mbps, MB/s)"))?;
+        let (num_str, unit_raw) = s.split_at(unit_pos);
+        if num_str.is_empty() || num_str.starts_with('.') {
+            return Err(format!("invalid number in bandwidth rate '{s}'"));
+        }
+
+        let unit = unit_raw.trim();
+        if unit.ends_with("Bps") {
+            return Err(format!(
+                "ambiguous bandwidth unit '{unit}' in '{s}'; use 'MB/s' for bytes/s or 'Mbps' for bits/s"
+            ));
+        }
+
+        let mag = if unit.len() >= 3 && unit[unit.len() - 3..].eq_ignore_ascii_case("bps") {
+            &unit[..unit.len() - 3]
+        } else if let Some(head) = unit.strip_suffix("/s").or_else(|| unit.strip_suffix("/S")) {
+            if head.len() >= 3 && head[head.len() - 3..].eq_ignore_ascii_case("bit") {
+                &head[..head.len() - 3]
+            } else if let Some(m) = head.strip_suffix('b') {
+                m
+            } else {
+                return Err(format!("unsupported bandwidth rate unit '{unit}' in '{s}'"));
+            }
+        } else {
+            return Err(format!("unsupported bandwidth rate unit '{unit}' in '{s}'"));
+        };
+
+        let scale: f64 = match mag.to_ascii_lowercase().as_str() {
+            "" => 1.0,
+            "k" => 1e3,
+            "m" => 1e6,
+            "g" => 1e9,
+            "t" => 1e12,
+            _ => return Err(format!("unsupported bandwidth rate unit '{unit}' in '{s}'")),
+        };
+
+        let val: f64 = num_str
+            .parse()
+            .map_err(|e| format!("invalid number in bandwidth rate '{s}': {e}"))?;
+        let bps = val * scale;
+        if !bps.is_finite() || bps < 0.0 || bps > (u64::MAX as f64) {
+            return Err(format!("bandwidth rate out of range in '{s}'"));
+        }
+        Ok(Self {
+            bits_per_sec: bps.round() as u64,
+        })
+    }
+}
+
+impl std::fmt::Display for BandwidthRate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bps = self.bits_per_sec;
+        if bps == 0 {
+            return write!(f, "0bps");
+        }
+        for (unit_val, suffix) in [
+            (1_000_000_000u64, "Gbps"),
+            (1_000_000u64, "Mbps"),
+            (1_000u64, "Kbps"),
+        ] {
+            if bps.is_multiple_of(unit_val) {
+                return write!(f, "{}{suffix}", bps / unit_val);
+            }
+        }
+        write!(f, "{bps}bps")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum FlowCond {
     CnIp(bool),
@@ -207,6 +421,8 @@ pub enum FlowCond {
     ResourceBwDaily(ResourcePattern, FlowComp, Size), // 资源级别的日流量限制
     ServerBwDaily(String, FlowComp, Size),            // 服务器级别的日流量限制，必须指定server_id
     ServerBwMinutes(String, u32, FlowComp, Size), // 服务器分钟级流量限制：server_id, minutes, comp, size
+    /// 实时估算速率条件：`speed <* | server_id> [minutes] <comp> <rate>`（默认 5 分钟窗口）。
+    Speed(SpeedTarget, u32, FlowComp, BandwidthRate),
     Time(FlowComp, chrono::NaiveTime),
     GeoIp(String), // geoip关键词匹配
     /// 取反内层条件的求值结果，包括"信息缺失"导致的 false（例如没有客户端 IP 时 `cnip` 恒为
@@ -214,6 +430,19 @@ pub enum FlowCond {
     Not(Box<FlowCond>),
     /// 本次取件是否由调度器自身发起。用来把只对真实客户端有意义的层与内部取件分开。
     Internal(bool),
+}
+
+impl FlowCond {
+    /// 条件中显式引用的具体服务器 ID（供 `dfs2 validate` 检查未定义节点名拼写错误）。
+    pub fn referenced_server_id(&self) -> Option<&str> {
+        match self {
+            FlowCond::ServerBwDaily(id, _, _)
+            | FlowCond::ServerBwMinutes(id, _, _, _)
+            | FlowCond::Speed(SpeedTarget::Server(id), _, _, _) => Some(id),
+            FlowCond::Not(inner) => inner.referenced_server_id(),
+            _ => None,
+        }
+    }
 }
 
 /// 取第 `index` 个空格分隔的词，缺失时给出带用法的错误。
@@ -330,6 +559,45 @@ impl FromStr for FlowCond {
                     size,
                 ))
             }
+            "speed" => {
+                let usage = "speed {* | server_id} [minutes] {comp} {rate}";
+                let raw_target = cond_arg(&parts, 1, usage)?;
+                if raw_target == "$" {
+                    return Err(
+                        "speed target does not support '$'; use '*' or a server_id".to_string()
+                    );
+                }
+                let target = if raw_target == "*" {
+                    SpeedTarget::Global
+                } else {
+                    SpeedTarget::Server(raw_target.to_string())
+                };
+
+                let (minutes, comp_str, rate_str) = match parts.len() {
+                    4 => (DEFAULT_SPEED_WINDOW_MINUTES, parts[2], parts[3]),
+                    5 => {
+                        if FlowComp::from_str(parts[2]).is_ok() {
+                            return Err(format!(
+                                "bandwidth rate in '{s}' must not contain whitespace (e.g. '80Mbps')"
+                            ));
+                        }
+                        let m = parts[2]
+                            .parse::<u32>()
+                            .map_err(|e| format!("invalid minutes '{}' in '{s}': {e}", parts[2]))?;
+                        if m == 0 || m > BANDWIDTH_MINUTE_RING_SIZE {
+                            return Err(format!(
+                                "speed minutes must be between 1 and {BANDWIDTH_MINUTE_RING_SIZE}, got {m}"
+                            ));
+                        }
+                        (m, parts[3], parts[4])
+                    }
+                    _ => return Err(format!("condition requires format: {usage}")),
+                };
+
+                let comp = FlowComp::from_str(comp_str)?;
+                let rate = BandwidthRate::from_str(rate_str)?;
+                Ok(FlowCond::Speed(target, minutes, comp, rate))
+            }
             "time" => {
                 let usage = "time {comp} {HH:MM:SS}";
                 let comp = FlowComp::from_str(cond_arg(&parts, 1, usage)?)?;
@@ -365,6 +633,9 @@ impl std::fmt::Display for FlowCond {
             }
             FlowCond::ServerBwMinutes(server_id, minutes, comp, size) => {
                 write!(f, "server_bw_minutes {server_id} {minutes} {comp} {size}")
+            }
+            FlowCond::Speed(target, minutes, comp, rate) => {
+                write!(f, "speed {target} {minutes} {comp} {rate}")
             }
             FlowCond::Time(comp, time) => write!(f, "time {comp} {time}"),
             FlowCond::Not(inner) => write!(f, "not {inner}"),
@@ -560,6 +831,109 @@ mod tests {
         assert!(item.rules.is_empty());
         assert_eq!(item.tier, 0);
     }
+
+    #[test]
+    fn server_use_supports_set_and_signed_deltas() {
+        let set_plain: FlowUse = serde_yaml::from_str("server node_a 10").unwrap();
+        assert_eq!(set_plain.to_string(), "server node_a 10");
+        assert_eq!(set_plain.introduces_server_id(), Some("node_a"));
+
+        let set_zero: FlowUse = serde_yaml::from_str("server node_a 0").unwrap();
+        assert_eq!(set_zero.server_id(), Some("node_a"));
+        assert_eq!(set_zero.introduces_server_id(), None);
+        assert_eq!(
+            serde_yaml::from_str::<FlowUse>("server node_a").unwrap(),
+            set_zero
+        );
+
+        let add_delta: FlowUse = serde_yaml::from_str("server cdn_a +25").unwrap();
+        assert_eq!(
+            add_delta,
+            FlowUse::ServerDelta {
+                id: "cdn_a".to_string(),
+                delta: WeightDelta::Add(25),
+            }
+        );
+        assert_eq!(add_delta.to_string(), "server cdn_a +25");
+        assert_eq!(add_delta.introduces_server_id(), Some("cdn_a"));
+        assert_eq!(
+            serde_yaml::from_str::<FlowUse>("server cdn_a +0")
+                .unwrap()
+                .introduces_server_id(),
+            None
+        );
+
+        let sub_delta: FlowUse = serde_yaml::from_str("server node_a -4").unwrap();
+        assert_eq!(sub_delta.to_string(), "server node_a -4");
+        assert_eq!(sub_delta.server_id(), Some("node_a"));
+        assert_eq!(sub_delta.introduces_server_id(), None);
+
+        for invalid in [
+            "server",
+            "server node_a +",
+            "server node_a -",
+            "server node_a =10",
+            "server node_a abc",
+            "server node_a 1 2",
+        ] {
+            assert!(
+                serde_yaml::from_str::<FlowUse>(invalid).is_err(),
+                "'{invalid}' should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn bandwidth_rate_and_speed_condition_round_trip() {
+        for (input, expected_bps) in [
+            ("80Mbps", 80_000_000),
+            ("80Mb/s", 80_000_000),
+            ("80Mbit/s", 80_000_000),
+            ("7.5Mbps", 7_500_000),
+            ("1.5Gbps", 1_500_000_000),
+            ("10MB/s", 80_000_000),
+            ("10MiB/s", 8 * 10 * 1024 * 1024),
+        ] {
+            assert_eq!(
+                BandwidthRate::from_str(input).unwrap().bits_per_sec(),
+                expected_bps,
+                "failed on {input}"
+            );
+        }
+        assert_eq!(
+            BandwidthRate::from_str("7.5Mbps").unwrap().to_string(),
+            "7500Kbps"
+        );
+
+        let default_win: FlowCond = serde_yaml::from_str("speed cyrene > 80Mbps").unwrap();
+        assert_eq!(default_win.to_string(), "speed cyrene 5 > 80Mbps");
+        assert_eq!(default_win.referenced_server_id(), Some("cyrene"));
+
+        let global_win: FlowCond = serde_yaml::from_str("speed * 1 > 800Mbps").unwrap();
+        assert_eq!(global_win.to_string(), "speed * 1 > 800Mbps");
+        assert_eq!(global_win.referenced_server_id(), None);
+
+        let negated: FlowCond = serde_yaml::from_str("not speed iroha 10 >= 15Mbps").unwrap();
+        assert_eq!(negated.referenced_server_id(), Some("iroha"));
+
+        for invalid in [
+            "speed",
+            "speed cyrene >",
+            "speed $ > 80Mbps",
+            "speed cyrene 0 > 80Mbps",
+            "speed cyrene 1441 > 80Mbps",
+            "speed cyrene > 80",
+            "speed cyrene > 80MB",
+            "speed cyrene > 10MBps",
+            "speed cyrene > -10MB/s",
+            "speed cyrene > 80 Mbps",
+        ] {
+            assert!(
+                serde_yaml::from_str::<FlowCond>(invalid).is_err(),
+                "'{invalid}' should be rejected"
+            );
+        }
+    }
 }
 
 impl Serialize for FlowCond {
@@ -573,6 +947,9 @@ impl Serialize for FlowCond {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct FlowItem {
+    /// 展开顶层 `flows` 中同名列表片段；与 `rules`、`use` 互斥，在配置加载期单层内联。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert: Option<String>,
     #[serde(default)]
     pub mode: FlowMode,
     #[serde(default)]

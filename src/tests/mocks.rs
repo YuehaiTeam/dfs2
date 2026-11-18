@@ -10,7 +10,7 @@ use crate::models::{CdnRecord, Session};
 use crate::modules::qjs::JsRunner;
 use crate::modules::server::HealthInfo;
 use crate::modules::storage::data_store::{
-    BandwidthUpdateBatch, CacheMetadata, DataStoreBackend, RingBufferMeta, SessionStats,
+    BANDWIDTH_MINUTE_RING_SIZE, BandwidthUpdateBatch, CacheMetadata, DataStoreBackend, SessionStats,
 };
 use crate::modules::version_provider::{PluginVersionProvider, VersionCache, VersionUpdater};
 use crate::services::{
@@ -44,12 +44,24 @@ impl TestEnvironment {
         Self::with_config(config).await
     }
 
-    /// 设置Mock的当前时间（测试用）
+    /// 设置Mock的当前时间（测试用，分钟粒度）
     pub async fn set_mock_current_time(&self, minute_timestamp: Option<u64>) {
-        // 直接使用存储的MockDataStore引用
         self.mock_data_store
             .set_current_time(minute_timestamp)
             .await;
+        self.app_context
+            .bandwidth_cache_service
+            .set_mock_unix_secs(minute_timestamp.map(|m| m * 60));
+    }
+
+    /// 设置Mock的当前时间（测试用，秒粒度）
+    pub async fn set_mock_unix_secs(&self, unix_secs: Option<u64>) {
+        self.mock_data_store
+            .set_current_time(unix_secs.map(|s| s / 60))
+            .await;
+        self.app_context
+            .bandwidth_cache_service
+            .set_mock_unix_secs(unix_secs);
     }
 
     /// 使用自定义配置创建测试环境
@@ -142,9 +154,8 @@ pub struct MockDataStore {
     cache_content: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     string_storage: Arc<RwLock<HashMap<String, ExpiringValue>>>,
     bandwidth_stats: Arc<RwLock<HashMap<String, u64>>>,
-    // 分钟级流量统计存储
-    minute_bandwidth: Arc<RwLock<HashMap<String, HashMap<u32, u64>>>>, // server_id -> (minute_index -> bytes)
-    ring_meta: Arc<RwLock<HashMap<String, RingBufferMeta>>>,           // ring_key -> meta
+    // 分钟级流量统计存储：server_id -> (minute_timestamp -> bytes)
+    minute_bandwidth: Arc<RwLock<HashMap<String, HashMap<u64, u64>>>>,
     // 时间注入机制（测试专用）
     current_time_override: Arc<RwLock<Option<u64>>>, // 注入的当前分钟时间戳
     pub scan_calls: std::sync::atomic::AtomicUsize,
@@ -203,7 +214,6 @@ impl MockDataStore {
             string_storage: Arc::new(RwLock::new(HashMap::new())),
             bandwidth_stats: Arc::new(RwLock::new(HashMap::new())),
             minute_bandwidth: Arc::new(RwLock::new(HashMap::new())),
-            ring_meta: Arc::new(RwLock::new(HashMap::new())),
             current_time_override: Arc::new(RwLock::new(None)),
             scan_calls: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -683,62 +693,13 @@ impl DataStoreBackend for MockDataStore {
         minute_timestamp: u64,
         bytes: u64,
     ) -> Result<(), String> {
-        println!(
-            "[Mock] update_server_minute_bandwidth_direct: server={}, minute={}, bytes={}",
-            server_id, minute_timestamp, bytes
-        );
-
-        let ring_key = format!("server_bw_ring:{}", server_id);
-
-        // 获取或创建环形缓冲区元数据
-        let ring_size = 1440u32; // 24小时
-
-        let mut meta_storage = self.ring_meta.write().await;
-        let is_new = !meta_storage.contains_key(&ring_key);
-        let meta = meta_storage.entry(ring_key.clone()).or_insert_with(|| {
-            println!(
-                "[Mock] 创建新环形缓冲区: server={}, start_minute={}",
-                server_id, minute_timestamp
-            );
-            RingBufferMeta {
-                start_minute: minute_timestamp, // 使用第一次写入的时间戳作为起始时间
-                head_index: 0,
-                ring_size,
-            }
-        });
-
-        if !is_new {
-            println!(
-                "[Mock] 使用现有环形缓冲区: server={}, start_minute={}, head_index={}",
-                server_id, meta.start_minute, meta.head_index
-            );
+        if bytes == 0 {
+            return Ok(());
         }
-
-        // 计算物理索引
-        if let Some(physical_index) = meta.get_physical_index(minute_timestamp) {
-            println!(
-                "[Mock] 物理索引计算成功: minute={}, physical_index={}",
-                minute_timestamp, physical_index
-            );
-            let mut minute_data = self.minute_bandwidth.write().await;
-            let server_data = minute_data
-                .entry(server_id.to_string())
-                .or_insert_with(HashMap::new);
-            let current_bytes = server_data.get(&physical_index).copied().unwrap_or(0);
-            server_data.insert(physical_index, current_bytes + bytes);
-            println!(
-                "[Mock] 更新数据: physical_index={}, old_bytes={}, new_bytes={}",
-                physical_index,
-                current_bytes,
-                current_bytes + bytes
-            );
-        } else {
-            println!(
-                "[Mock] 物理索引计算失败: minute={}, meta.start_minute={}, ring_size={}",
-                minute_timestamp, meta.start_minute, meta.ring_size
-            );
-        }
-
+        let mut minute_data = self.minute_bandwidth.write().await;
+        let server_data = minute_data.entry(server_id.to_string()).or_default();
+        let entry = server_data.entry(minute_timestamp).or_insert(0);
+        *entry = entry.saturating_add(bytes);
         Ok(())
     }
 
@@ -747,94 +708,21 @@ impl DataStoreBackend for MockDataStore {
         server_id: &str,
         minutes: u32,
     ) -> Result<u64, String> {
-        let current_minute = self.get_current_minute().await; // 使用注入的时间
-        println!(
-            "[Mock] get_server_minutes_bandwidth_direct: server={}, minutes={}, current_minute={}",
-            server_id, minutes, current_minute
-        );
-
-        let ring_key = format!("server_bw_ring:{}", server_id);
-
-        // 获取环形缓冲区元数据
-        let meta_storage = self.ring_meta.read().await;
-        let meta = match meta_storage.get(&ring_key) {
-            Some(m) => {
-                println!(
-                    "[Mock] 找到环形缓冲区元数据: start_minute={}, head_index={}, ring_size={}",
-                    m.start_minute, m.head_index, m.ring_size
-                );
-                m.clone()
-            }
-            None => {
-                println!("[Mock] 未找到环形缓冲区元数据: server={}", server_id);
-                return Ok(0); // 没有数据
-            }
+        let minutes = minutes.min(BANDWIDTH_MINUTE_RING_SIZE);
+        let current_minute = self.get_current_minute().await;
+        let minute_data = self.minute_bandwidth.read().await;
+        let Some(data) = minute_data.get(server_id) else {
+            return Ok(0);
         };
 
         let mut total_bytes = 0u64;
-        let minute_data = self.minute_bandwidth.read().await;
-        let server_data = minute_data.get(server_id);
-
-        if let Some(data) = server_data {
-            println!("[Mock] 找到服务器数据，包含 {} 个物理索引", data.len());
-            // 计算需要查询的物理索引
-            for i in 0..minutes {
-                let target_minute = current_minute.saturating_sub(i as u64);
-                if let Some(physical_index) = meta.get_physical_index(target_minute) {
-                    if let Some(&bytes) = data.get(&physical_index) {
-                        println!(
-                            "[Mock] 查询命中: target_minute={}, physical_index={}, bytes={}",
-                            target_minute, physical_index, bytes
-                        );
-                        total_bytes += bytes;
-                    } else {
-                        println!(
-                            "[Mock] 查询未命中: target_minute={}, physical_index={}, 无数据",
-                            target_minute, physical_index
-                        );
-                    }
-                } else {
-                    println!("[Mock] 物理索引计算失败: target_minute={}", target_minute);
-                }
+        for i in 0..minutes {
+            let target_minute = current_minute.saturating_sub(i as u64);
+            if let Some(&bytes) = data.get(&target_minute) {
+                total_bytes = total_bytes.saturating_add(bytes);
             }
-        } else {
-            println!("[Mock] 未找到服务器数据: server={}", server_id);
         }
-
-        println!(
-            "[Mock] 查询结果: server={}, total_bytes={}",
-            server_id, total_bytes
-        );
         Ok(total_bytes)
-    }
-
-    async fn get_ring_meta(&self, ring_key: &str) -> Result<Option<RingBufferMeta>, String> {
-        let meta_storage = self.ring_meta.read().await;
-        Ok(meta_storage.get(ring_key).cloned())
-    }
-
-    async fn hmget(&self, key: &str, fields: &[String]) -> Result<Vec<Option<String>>, String> {
-        // Mock实现：简化为从minute_bandwidth中获取数据
-        if key.starts_with("server_bw_ring:") {
-            let server_id = key.strip_prefix("server_bw_ring:").unwrap_or("");
-            let minute_data = self.minute_bandwidth.read().await;
-
-            if let Some(server_data) = minute_data.get(server_id) {
-                let mut results = Vec::new();
-                for field in fields {
-                    if let Ok(index) = field.parse::<u32>() {
-                        let bytes = server_data.get(&index).copied().unwrap_or(0);
-                        results.push(Some(bytes.to_string()));
-                    } else {
-                        results.push(None);
-                    }
-                }
-                return Ok(results);
-            }
-        }
-
-        // 默认返回空值
-        Ok(vec![None; fields.len()])
     }
 }
 
@@ -847,6 +735,7 @@ pub fn create_default_test_config() -> AppConfig {
         servers: HashMap::new(),
         resources: HashMap::new(),
         plugins: HashMap::new(),
+        flows: HashMap::new(),
         debug_mode: true,
         challenge: ChallengeConfig::default(),
         plugin_code: HashMap::new(),
@@ -935,6 +824,7 @@ pub fn create_default_test_config() -> AppConfig {
         tries: vec![],
         server: vec![], // 已废弃，使用flow
         flow: vec![crate::modules::flow::config::FlowItem {
+            insert: None,
             rules: vec![],
             mode: crate::modules::flow::config::FlowMode::AND,
             r#use: vec![crate::modules::flow::config::FlowUse::Server {
@@ -974,6 +864,7 @@ pub fn create_default_test_config() -> AppConfig {
         tries: vec![],
         server: vec![], // 已废弃，使用flow
         flow: vec![crate::modules::flow::config::FlowItem {
+            insert: None,
             rules: vec![],
             mode: crate::modules::flow::config::FlowMode::AND,
             r#use: vec![crate::modules::flow::config::FlowUse::Server {
@@ -1013,6 +904,7 @@ pub fn create_default_test_config() -> AppConfig {
         tries: vec![],
         server: vec![],
         flow: vec![crate::modules::flow::config::FlowItem {
+            insert: None,
             rules: vec![],
             mode: crate::modules::flow::config::FlowMode::AND,
             r#use: vec![
@@ -1055,6 +947,7 @@ pub fn create_default_test_config() -> AppConfig {
         tries: vec![],
         server: vec![],
         flow: vec![crate::modules::flow::config::FlowItem {
+            insert: None,
             rules: vec![],
             mode: crate::modules::flow::config::FlowMode::AND,
             r#use: vec![crate::modules::flow::config::FlowUse::Server {
@@ -1092,6 +985,7 @@ pub fn create_default_test_config() -> AppConfig {
         tries: vec![],
         server: vec![], // 已废弃，使用flow
         flow: vec![crate::modules::flow::config::FlowItem {
+            insert: None,
             rules: vec![],
             mode: crate::modules::flow::config::FlowMode::AND,
             r#use: vec![crate::modules::flow::config::FlowUse::Server {
@@ -1135,6 +1029,7 @@ pub fn create_default_test_config() -> AppConfig {
         tries: vec![],
         server: vec![], // 已废弃，使用flow
         flow: vec![crate::modules::flow::config::FlowItem {
+            insert: None,
             rules: vec![],
             mode: crate::modules::flow::config::FlowMode::AND,
             r#use: vec![crate::modules::flow::config::FlowUse::Server {
@@ -1178,6 +1073,7 @@ pub fn create_default_test_config() -> AppConfig {
         tries: vec![],
         server: vec![], // 已废弃，使用flow
         flow: vec![crate::modules::flow::config::FlowItem {
+            insert: None,
             rules: vec![],
             mode: crate::modules::flow::config::FlowMode::AND,
             r#use: vec![crate::modules::flow::config::FlowUse::Server {
@@ -1221,6 +1117,7 @@ pub fn create_default_test_config() -> AppConfig {
         tries: vec![],
         server: vec![], // 已废弃，使用flow
         flow: vec![crate::modules::flow::config::FlowItem {
+            insert: None,
             rules: vec![],
             mode: crate::modules::flow::config::FlowMode::AND,
             r#use: vec![crate::modules::flow::config::FlowUse::Server {

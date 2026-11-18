@@ -269,6 +269,12 @@ impl ConfigValidator {
             ));
         }
 
+        for (resource_id, server_id) in config.undefined_flow_cond_server_refs() {
+            report.add_warning(format!(
+                "资源 '{resource_id}' 的 flow 条件引用了未定义的服务器 '{server_id}'"
+            ));
+        }
+
         // 检查插件配置
         if !config.plugins.is_empty() {
             info!("找到 {} 个插件配置", config.plugins.len());
@@ -867,5 +873,39 @@ resources:
                 "validate must not write health:{id}:{path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn undefined_flow_condition_server_refs_report_warning_without_failing() {
+        let mut config = complete_config();
+        config.resources.get_mut("app").unwrap().flow = vec![crate::modules::flow::FlowItem {
+            insert: None,
+            mode: crate::modules::flow::FlowMode::AND,
+            rules: vec![
+                "speed * > 800Mbps".parse().unwrap(),
+                "speed ghost_speed > 80Mbps".parse().unwrap(),
+                "not server_bw_minutes ghost_bw 5 > 1GB".parse().unwrap(),
+            ],
+            r#use: vec![],
+            tier: 0,
+        }];
+
+        let mut report = ValidationReport::new();
+        ConfigValidator::validate_config_completeness(&config, &mut report).await;
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ghost_speed") && w.contains("flow 条件"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("ghost_bw") && w.contains("flow 条件"))
+        );
+        assert!(!report.warnings.iter().any(|w| w.contains("'*'")));
+        assert!(report.is_valid());
     }
 }

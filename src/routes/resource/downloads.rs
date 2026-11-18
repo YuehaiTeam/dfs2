@@ -442,20 +442,9 @@ pub async fn handle_download_request_unified(
     }
 
     // 缓存未命中，需要进行实际的服务器调度
-    // 从flow配置中提取服务器列表来获取文件大小（用于Size条件评估）
-    let servers_from_flow: Vec<String> = resource_config
-        .flow
-        .iter()
-        .flat_map(|flow_item| {
-            flow_item.r#use.iter().filter_map(|flow_use| {
-                if let crate::modules::flow::config::FlowUse::Server { id, .. } = flow_use {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-        })
-        .collect();
+    // 从资源配置与flow中提取候选服务器列表来获取文件大小（用于Size条件评估与统计兜底）
+    let servers_from_flow =
+        crate::services::resource_service::collect_resource_server_ids(resource_config);
 
     debug!(
         "Starting file size detection for path: {}, servers from flow: {:?}",
@@ -464,11 +453,19 @@ pub async fn handle_download_request_unified(
     let file_size = {
         let mut size_candidate = None;
         for server_id in &servers_from_flow {
+            let server_path = ctx
+                .resource_service
+                .get_version_path(&resid, &version, Some(server_id), sub_path.as_deref())
+                .unwrap_or_else(|| path.clone());
             debug!(
                 "Checking health info for server: {}, path: {}",
-                server_id, path
+                server_id, server_path
             );
-            match ctx.data_store.get_health_info(server_id, &path).await {
+            match ctx
+                .data_store
+                .get_health_info(server_id, &server_path)
+                .await
+            {
                 Ok(Some(health_info)) => {
                     debug!(
                         "Health info found for server {}: file_size={:?}, is_alive={}",
@@ -783,10 +780,19 @@ pub async fn handle_download_request_unified(
 
     // 更新流量统计（在成功生成下载URL后）
     if let Some(server_id) = &flow_result.selected_server_id {
-        // 尝试从健康检查缓存获取文件大小
-        if let Ok(Some(health_info)) = ctx.data_store.get_health_info(server_id, &path).await
-            && let Some(full_file_size) = health_info.file_size
+        let server_path = ctx
+            .resource_service
+            .get_version_path(&resid, &version, Some(server_id), sub_path.as_deref())
+            .unwrap_or_else(|| path.clone());
+        let detected_size = match ctx
+            .data_store
+            .get_health_info(server_id, &server_path)
+            .await
         {
+            Ok(Some(health_info)) => health_info.file_size.or(file_size),
+            _ => file_size,
+        };
+        if let Some(full_file_size) = detected_size {
             // 根据range计算实际传输字节数
             let actual_bytes = calculate_actual_bytes_from_range(range.as_deref(), full_file_size);
 

@@ -7,10 +7,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::modules::auth::challenge::ChallengeType;
-use crate::modules::{
-    flow::{FlowItem, FlowUse},
-    server::ServerImpl,
-};
+use crate::modules::{flow::FlowItem, server::ServerImpl};
 
 /// Challenge configuration for individual resources or global settings
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -621,6 +618,9 @@ pub struct AppConfig {
     pub servers: HashMap<String, ServerConfig>,
     pub resources: HashMap<String, ResourceConfig>,
     pub plugins: HashMap<String, serde_json::Value>,
+    /// 供多资源通过 `insert` 单层复用的命名 `FlowItem` 列表片段。
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub flows: HashMap<String, Vec<FlowItem>>,
     #[serde(default)]
     pub debug_mode: bool,
     /// Global challenge configuration (can be overridden per resource)
@@ -688,7 +688,62 @@ impl AppConfig {
         (all_errors, all_warnings)
     }
 
-    /// flow 中指向 `servers` 未定义节点的引用，元素为 `(资源 id, 节点 id)`。
+    /// 展开所有资源 `flow` 中的 `insert` 片段引用（严格单层，禁止嵌套或与 `rules`/`use`/`mode` 混用）。
+    pub fn expand_flow_inserts(&mut self) -> Result<(), String> {
+        let mut snippet_names: Vec<&String> = self.flows.keys().collect();
+        snippet_names.sort_unstable();
+        for snippet_name in snippet_names {
+            let items = &self.flows[snippet_name];
+            for item in items {
+                if item.insert.is_some() {
+                    return Err(format!(
+                        "flows.{snippet_name}: nested 'insert' inside a shared flow snippet is not allowed"
+                    ));
+                }
+            }
+        }
+
+        let mut resource_ids: Vec<String> = self.resources.keys().cloned().collect();
+        resource_ids.sort_unstable();
+        for resource_id in resource_ids {
+            let Some(resource) = self.resources.get_mut(&resource_id) else {
+                continue;
+            };
+            if !resource.flow.iter().any(|item| item.insert.is_some()) {
+                continue;
+            }
+
+            let mut expanded = Vec::with_capacity(resource.flow.len());
+            for item in std::mem::take(&mut resource.flow) {
+                if let Some(ref target_name) = item.insert {
+                    if !item.rules.is_empty()
+                        || !item.r#use.is_empty()
+                        || item.mode != crate::modules::flow::FlowMode::default()
+                    {
+                        return Err(format!(
+                            "resources.{resource_id}.flow: 'insert' ('{target_name}') cannot be combined with 'rules', 'use', or 'mode'"
+                        ));
+                    }
+                    let Some(snippet) = self.flows.get(target_name) else {
+                        return Err(format!(
+                            "resources.{resource_id}.flow: unknown flow snippet '{target_name}' in 'insert'"
+                        ));
+                    };
+                    for mut cloned in snippet.iter().cloned() {
+                        cloned.tier = cloned.tier.saturating_add(item.tier);
+                        expanded.push(cloned);
+                    }
+                } else {
+                    expanded.push(item);
+                }
+            }
+            resource.flow = expanded;
+        }
+
+        Ok(())
+    }
+
+    /// flow 中 `use` 指向 `servers` 未定义节点的引用，元素为 `(资源 id, 节点 id)`。
     ///
     /// 结果排序去重，使校验报告的顺序不随 `resources` 的哈希遍历顺序变化。
     fn undefined_flow_server_refs(&self) -> Vec<(String, String)> {
@@ -697,14 +752,37 @@ impl AppConfig {
             .iter()
             .flat_map(|(resource_id, resource)| {
                 resource.flow.iter().flat_map(move |item| {
-                    item.r#use
-                        .iter()
-                        .filter_map(move |operation| match operation {
-                            FlowUse::Server { id, .. } if !self.servers.contains_key(id) => {
-                                Some((resource_id.clone(), id.clone()))
-                            }
-                            _ => None,
-                        })
+                    item.r#use.iter().filter_map(move |operation| {
+                        let id = operation.server_id()?;
+                        if !self.servers.contains_key(id) {
+                            Some((resource_id.clone(), id.to_string()))
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+            .collect();
+        refs.sort_unstable();
+        refs.dedup();
+        refs
+    }
+
+    /// flow 条件（`speed`、`server_bw_daily`、`server_bw_minutes`）中指向未定义节点的引用。
+    pub fn undefined_flow_cond_server_refs(&self) -> Vec<(String, String)> {
+        let mut refs: Vec<(String, String)> = self
+            .resources
+            .iter()
+            .flat_map(|(resource_id, resource)| {
+                resource.flow.iter().flat_map(move |item| {
+                    item.rules.iter().filter_map(move |cond| {
+                        let id = cond.referenced_server_id()?;
+                        if !self.servers.contains_key(id) {
+                            Some((resource_id.clone(), id.to_string()))
+                        } else {
+                            None
+                        }
+                    })
                 })
             })
             .collect();
@@ -729,9 +807,10 @@ impl AppConfig {
             .collect();
         for resource in self.resources.values_mut() {
             for item in &mut resource.flow {
-                item.r#use.retain(|operation| match operation {
-                    FlowUse::Server { id, .. } => !undefined.contains(id.as_str()),
-                    _ => true,
+                item.r#use.retain(|operation| {
+                    operation
+                        .server_id()
+                        .is_none_or(|id| !undefined.contains(id))
                 });
             }
         }
@@ -744,6 +823,7 @@ impl AppConfig {
         let plugin_path = std::env::var("PLUGIN_PATH").unwrap_or_else(|_| "plugins/".to_string());
         let content = tokio::fs::read_to_string(path).await?;
         let mut config: AppConfig = serde_yaml::from_str(&content)?;
+        config.expand_flow_inserts().map_err(anyhow::Error::msg)?;
         // loop through the plugin directory and load all .js files
         let mut plugin_code = HashMap::new();
         let mut paths = tokio::fs::read_dir(plugin_path).await?;
@@ -866,6 +946,7 @@ impl SharedConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modules::flow::FlowUse;
 
     /// 只有 `real` 一个节点有定义，`flow` 由调用方给出，用来观察摘除对 `use` 列表的影响。
     fn config_with_flow(flow: &str) -> AppConfig {
@@ -1300,6 +1381,7 @@ cert_hash: "trust"
             servers,
             resources: HashMap::new(),
             plugins: HashMap::new(),
+            flows: HashMap::new(),
             debug_mode: false,
             challenge: ChallengeConfig::default(),
             plugin_code: HashMap::new(),
@@ -1413,6 +1495,7 @@ cert_hash: "trust"
             servers: HashMap::new(),
             resources,
             plugins: HashMap::new(),
+            flows: HashMap::new(),
             debug_mode: false,
             challenge: global_challenge,
             plugin_code: HashMap::new(),
@@ -1439,5 +1522,125 @@ cert_hash: "trust"
         assert_eq!(fallback_config.challenge_type, "md5");
         assert_eq!(fallback_config.sha256_difficulty, 2);
         assert_eq!(fallback_config.web_plugin, "global_plugin");
+    }
+
+    #[test]
+    fn flow_inserts_expand_single_level_and_inherit_nonzero_tier() {
+        let yaml = r#"
+servers:
+  real:
+    id: real
+    url: "https://real.example.com/"
+    type: direct
+plugins: {}
+flows:
+  cn_nodes:
+    - rules: ["cnip true"]
+      use:
+        - "server real 8"
+        - "server ghost +5"
+  cn_nodes_limit:
+    - rules: ["speed real > 80Mbps"]
+      use:
+        - "server real 0"
+    - tier: 3
+      rules: ["speed * > 800Mbps"]
+      use:
+        - "server real -2"
+resources:
+  app:
+    latest: "1.0.0"
+    versions:
+      default:
+        default: "path/${version}"
+    tries: []
+    server: []
+    flow:
+      - insert: cn_nodes
+        tier: 1
+      - insert: cn_nodes_limit
+        tier: 1
+"#;
+        let mut config: AppConfig = serde_yaml::from_str(yaml).unwrap();
+        config.expand_flow_inserts().unwrap();
+
+        let flow = &config.resources["app"].flow;
+        assert_eq!(flow.len(), 3);
+        assert!(flow.iter().all(|item| item.insert.is_none()));
+        assert_eq!(flow[0].tier, 1);
+        assert_eq!(flow[1].tier, 1);
+        assert_eq!(flow[2].tier, 4);
+
+        let pruned = config.prune_undefined_flow_server_refs();
+        assert_eq!(pruned, vec![("app".to_string(), "ghost".to_string())]);
+        assert_eq!(
+            flow_uses(&config, 0),
+            vec![FlowUse::Server {
+                id: "real".to_string(),
+                weight: 8,
+            }]
+        );
+    }
+
+    fn flow_uses(config: &AppConfig, idx: usize) -> Vec<FlowUse> {
+        config.resources["app"].flow[idx].r#use.clone()
+    }
+
+    #[test]
+    fn flow_inserts_reject_nesting_unknown_names_and_mixed_fields() {
+        let nested_yaml = r#"
+servers: {}
+plugins: {}
+flows:
+  a:
+    - insert: b
+  b:
+    - use: ["clear"]
+resources: {}
+"#;
+        let mut nested: AppConfig = serde_yaml::from_str(nested_yaml).unwrap();
+        assert!(nested.expand_flow_inserts().unwrap_err().contains("nested"));
+
+        let unknown_yaml = r#"
+servers: {}
+plugins: {}
+resources:
+  app:
+    versions: {}
+    tries: []
+    server: []
+    flow:
+      - insert: missing_snippet
+"#;
+        let mut unknown: AppConfig = serde_yaml::from_str(unknown_yaml).unwrap();
+        assert!(
+            unknown
+                .expand_flow_inserts()
+                .unwrap_err()
+                .contains("missing_snippet")
+        );
+
+        let mixed_yaml = r#"
+servers: {}
+plugins: {}
+flows:
+  base:
+    - use: ["clear"]
+resources:
+  app:
+    versions: {}
+    tries: []
+    server: []
+    flow:
+      - insert: base
+        use: ["break"]
+"#;
+        let mut mixed: AppConfig = serde_yaml::from_str(mixed_yaml).unwrap();
+        assert!(
+            mixed
+                .expand_flow_inserts()
+                .unwrap_err()
+                .contains("cannot be combined")
+        );
     }
 }

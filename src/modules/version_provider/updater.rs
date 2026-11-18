@@ -301,7 +301,6 @@ async fn keep_cached_version(version_cache: &VersionCache, resource_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modules::storage::data_store::DataStoreBackend;
     use crate::modules::version_provider::VersionInfo;
     use crate::tests::common::TestEnvironment;
     use std::time::Duration;

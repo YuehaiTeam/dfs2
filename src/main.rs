@@ -426,10 +426,10 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
     info!("Starting HTTP server on {}", bind_addr);
 
     // 启动服务器
-    if bind_addr.starts_with("unix:") {
+    if let Some(socket_path) = bind_addr.strip_prefix("unix:") {
         #[cfg(unix)]
         {
-            let listener = tokio::net::UnixListener::bind(&bind_addr[5..])
+            let listener = tokio::net::UnixListener::bind(socket_path)
                 .map_err(|e| DfsError::io_error("bind_socket", e.to_string()))?;
             match axum::serve(listener, app.into_make_service()).await {
                 Ok(_) => {
@@ -444,6 +444,7 @@ async fn start_server(app_container: AppContainer) -> DfsResult<()> {
         }
         #[cfg(not(unix))]
         {
+            let _ = socket_path;
             Err(DfsError::invalid_input(
                 "BIND_ADDRESS",
                 "Unix domain sockets are not supported on this platform".to_string(),
