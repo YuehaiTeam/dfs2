@@ -82,6 +82,12 @@ pub async fn get_cdn(
                         format!("Invalid range format in part: {range_part}"),
                     )
                 })?;
+                if start > end {
+                    return Err(DfsError::invalid_input(
+                        "range",
+                        format!("Invalid range bounds in part: {range_part}"),
+                    ));
+                }
                 parsed_ranges.push((start, end));
             } else {
                 return Err(DfsError::invalid_input(
@@ -103,6 +109,9 @@ pub async fn get_cdn(
             let end = end_str
                 .parse::<u32>()
                 .map_err(|_| DfsError::invalid_input("range", "Invalid range format"))?;
+            if start > end {
+                return Err(DfsError::invalid_input("range", "Invalid range bounds"));
+            }
             vec![(start, end)]
         } else {
             return Err(DfsError::invalid_input("range", "Invalid range format"));

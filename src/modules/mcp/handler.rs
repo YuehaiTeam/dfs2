@@ -932,7 +932,7 @@ impl DfsMcp {
                 Err(e) => return Self::tool_err(e.to_string()),
             },
         };
-        let Some(path) = version_path_for_resource(
+        let Some(raw_path) = version_path_for_resource(
             &resource,
             &version,
             Some(&args.server_id),
@@ -940,6 +940,11 @@ impl DfsMcp {
         )
         .or_else(|| version_base_path_for_resource(&resource, &version, Some(&args.server_id))) else {
             return Self::tool_err("no path for this resource on that server");
+        };
+        let path = match crate::modules::extent_map::parse_map_path(&raw_path) {
+            Some(Ok(spec)) => spec.manifest_path,
+            Some(Err(e)) => return Self::tool_err(format!("invalid map path: {e}")),
+            None => raw_path,
         };
         let health_path = server.health_check_path.clone();
         let file_size = match health_path.as_deref() {

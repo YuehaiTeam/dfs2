@@ -193,9 +193,12 @@ pub fn version_file_path_for_resource(
     server_id: Option<&str>,
     version_file: &str,
 ) -> Option<String> {
-    let base_path = version_base_path_for_resource(resource, version, server_id)?;
+    let raw_base = version_base_path_for_resource(resource, version, server_id)?;
+    let base_path = raw_base
+        .strip_prefix(crate::modules::extent_map::MAP_PATH_PREFIX)
+        .unwrap_or(&raw_base);
     let prefix = if resource.resource_type == "prefix" {
-        base_path
+        base_path.to_string()
     } else if let Some((parent, _)) = base_path.rsplit_once('/') {
         if parent.is_empty() {
             "/".to_string()
@@ -203,7 +206,7 @@ pub fn version_file_path_for_resource(
             parent.to_string()
         }
     } else {
-        base_path
+        base_path.to_string()
     };
     Some(combine_prefix_path(&prefix, version_file))
 }

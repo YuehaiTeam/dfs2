@@ -100,6 +100,10 @@ pub enum DfsError {
     #[error("Invalid input: {field} - {reason}")]
     InvalidInput { field: String, reason: String },
 
+    /// 请求字节范围无法在单个物理对象内满足（HTTP 416，固定以 `ERR_RANGE_NOT_SATISFIABLE:` 开头）
+    #[error("{message}")]
+    RangeNotSatisfiable { message: String },
+
     /// 无效配置错误
     #[error("Invalid configuration:  {reason}")]
     InvalidConfig { reason: String },
@@ -217,6 +221,17 @@ impl DfsError {
         }
     }
 
+    /// 创建不可满足范围错误（HTTP 416）
+    pub fn range_not_satisfiable<S: Into<String>>(message: S) -> Self {
+        let msg = message.into();
+        let message = if msg.starts_with("ERR_RANGE_NOT_SATISFIABLE:") {
+            msg
+        } else {
+            format!("ERR_RANGE_NOT_SATISFIABLE: {msg}")
+        };
+        Self::RangeNotSatisfiable { message }
+    }
+
     /// 创建无效配置错误
     pub fn invalid_config<S: Into<String>>(reason: S) -> Self {
         Self::InvalidConfig {
@@ -261,6 +276,8 @@ impl DfsError {
 
             Self::InvalidInput { .. } => 400,
             Self::InvalidConfig { .. } => 400,
+
+            Self::RangeNotSatisfiable { .. } => 416,
 
             Self::ChallengeVerificationFailed { .. } => 402,
 
@@ -324,7 +341,7 @@ impl DfsError {
 
             Self::DownloadNotAllowed { .. } => "download",
 
-            Self::InvalidInput { .. } => "input",
+            Self::InvalidInput { .. } | Self::RangeNotSatisfiable { .. } => "input",
 
             Self::InvalidConfig { .. } => "config",
 

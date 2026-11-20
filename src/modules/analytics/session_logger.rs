@@ -267,9 +267,9 @@ impl SessionLogger {
             || Self::extract_base_url(insight_url) == Self::extract_base_url(cdn_url)
     }
 
-    /// 提取URL的基础部分（去除查询参数）
+    /// 提取URL的基础部分（去除查询参数与fragment）
     fn extract_base_url(url: &str) -> &str {
-        if let Some(pos) = url.find('?') {
+        if let Some(pos) = url.find(['?', '#']) {
             &url[..pos]
         } else {
             url
@@ -654,5 +654,55 @@ mod tests {
         let log = assemble(&stats, None);
         assert_eq!(log.ver, "9.9.9-rc");
         assert_eq!(chunk(&log, "0-").att, 0);
+    }
+
+    #[test]
+    fn fragment_only_range_and_sftp_urls_match_sanitized_insights() {
+        let stats = stats(
+            "0.68.0",
+            vec!["4042-9999", "0-999"],
+            HashMap::from([("4042-9999".into(), 1), ("0-999".into(), 1)]),
+            HashMap::from([
+                (
+                    "4042-9999".into(),
+                    vec![record(
+                        "https://cdn.example.com/bgi/cas/big_asset#range=0-",
+                        "direct_cdn",
+                    )],
+                ),
+                (
+                    "0-999".into(),
+                    vec![record(
+                        "sftp://sftp.example.com:22/data/bgi/cas/pack_head#user=u&pass=p&fingerprint=f&range=0-999",
+                        "sftp_node",
+                    )],
+                ),
+            ]),
+        );
+        let insights = InsightData {
+            servers: vec![
+                insight(
+                    "https://cdn.example.com/bgi/cas/big_asset",
+                    vec![(4042, 9999)],
+                    5958,
+                ),
+                insight(
+                    "sftp://sftp.example.com:22/data/bgi/cas/pack_head",
+                    vec![(0, 999)],
+                    1000,
+                ),
+            ],
+        };
+        let log = assemble(&stats, Some(insights));
+        assert_eq!(
+            chunk(&log, "4042-9999").cdns[0].srv.as_deref(),
+            Some("direct_cdn")
+        );
+        assert_eq!(chunk(&log, "4042-9999").cdns[0].size, Some(5958));
+        assert_eq!(
+            chunk(&log, "0-999").cdns[0].srv.as_deref(),
+            Some("sftp_node")
+        );
+        assert_eq!(chunk(&log, "0-999").cdns[0].size, Some(1000));
     }
 }

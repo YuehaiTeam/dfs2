@@ -203,20 +203,25 @@ pub async fn fetch_file_range(
         .await?;
     let cdn_url = flow_result.url;
 
-    // 构建 Range 头部
-    let range_header = if let Some(ranges) = &ranges {
-        if ranges.len() == 1 {
-            format!("bytes={}-{}", ranges[0].0, ranges[0].1)
-        } else {
-            let range_parts: Vec<String> = ranges
-                .iter()
-                .map(|(start, end)| format!("{start}-{end}"))
-                .collect();
-            format!("bytes={}", range_parts.join(","))
+    // 构建 Range 头部（若 map: 下发了 #range= 则按物理区间或整文件请求）
+    let range_header = match crate::modules::extent_map::extract_range_fragment(&cdn_url) {
+        Some("0-") => String::new(),
+        Some(phys_range) => format!("bytes={phys_range}"),
+        None => {
+            if let Some(ranges) = &ranges {
+                if ranges.len() == 1 {
+                    format!("bytes={}-{}", ranges[0].0, ranges[0].1)
+                } else {
+                    let range_parts: Vec<String> = ranges
+                        .iter()
+                        .map(|(start, end)| format!("{start}-{end}"))
+                        .collect();
+                    format!("bytes={}", range_parts.join(","))
+                }
+            } else {
+                String::new()
+            }
         }
-    } else {
-        // 如果没有指定范围，则获取整个文件
-        "".to_string()
     };
 
     // 使用全局 HTTP 客户端下载文件
@@ -235,7 +240,6 @@ pub async fn fetch_file_range(
 
     if !response.status().is_success()
         && response.status() != axum::http::StatusCode::PARTIAL_CONTENT
-        && response.status() != axum::http::StatusCode::RANGE_NOT_SATISFIABLE
     {
         return Err(DfsError::NetworkError {
             reason: format!("{}: {}", E_READ_RESPONSE_FAILED, response.status()),
@@ -375,10 +379,14 @@ pub fn parse_index_data(index_data: &[u8], index_start: u32) -> Value {
                     ]);
                     idx_offset += 4;
 
+                    let abs_offset = index_start.saturating_add(file_offset);
+                    let header_size = 10u32.saturating_add(file_name.len() as u32);
+                    let raw_offset = abs_offset.saturating_sub(header_size);
+
                     index_map[&file_name] = json!({
                         "name": file_name,
-                        "offset": index_start + file_offset,
-                        "raw_offset": 0,
+                        "offset": abs_offset,
+                        "raw_offset": raw_offset,
                         "size": file_size
                     });
                 }
@@ -393,6 +401,24 @@ pub fn parse_index_data(index_data: &[u8], index_start: u32) -> Value {
     segments
 }
 
+#[derive(serde::Deserialize)]
+struct RootKachinaProjection {
+    index: serde_json::Map<String, Value>,
+    metadata: serde_json::Map<String, Value>,
+    installer_end: u32,
+}
+
+/// Projects `{ index, metadata, installer_end }` directly from a root JSON document,
+/// ignoring any unrelated top-level keys that coexist in the same JSON object.
+pub fn try_project_kachina_metadata(json_bytes: &[u8]) -> Option<KachinaMetadata> {
+    let projected: RootKachinaProjection = serde_json::from_slice(json_bytes).ok()?;
+    Some(KachinaMetadata {
+        index: Value::Object(projected.index),
+        metadata: Value::Object(projected.metadata),
+        installer_end: projected.installer_end,
+    })
+}
+
 /// 解析 KachinaInstaller 文件的元数据
 ///
 /// # Arguments
@@ -402,7 +428,7 @@ pub fn parse_index_data(index_data: &[u8], index_start: u32) -> Value {
 /// * `version` - 版本（可选，默认使用latest）
 ///
 /// # Returns
-/// 返回 Result<Option<KachinaMetadata>, String>，成功时返回解析结果，None表示不是KachinaInstaller文件
+/// 返回 `Result<Option<KachinaMetadata>, DfsError>`，成功时返回解析结果，`None` 表示不是 KachinaInstaller 文件
 pub async fn parse_kachina_metadata(
     shared_config: &SharedConfig,
     flow_service: &FlowService,
@@ -410,6 +436,15 @@ pub async fn parse_kachina_metadata(
     version: &str,
     sub_path: Option<String>,
 ) -> DfsResult<Option<KachinaMetadata>> {
+    if sub_path.is_none()
+        && let Some(manifest_bytes) = flow_service
+            .try_fetch_mapped_manifest_bytes(resid, version, None)
+            .await
+        && let Some(projected) = try_project_kachina_metadata(&manifest_bytes)
+    {
+        return Ok(Some(projected));
+    }
+
     // 获取文件的前256字节
     let header_bytes = fetch_file_range(
         shared_config,
@@ -449,7 +484,18 @@ pub async fn parse_kachina_metadata(
         .as_u64()
         .ok_or_else(|| "Missing or invalid metadata_size in header".to_string())?
         as u32;
-    let data_end = index_start + index_sz + config_sz + theme_sz + metadata_sz;
+    let data_end = index_start
+        .checked_add(index_sz)
+        .and_then(|sum| sum.checked_add(config_sz))
+        .and_then(|sum| sum.checked_add(theme_sz))
+        .and_then(|sum| sum.checked_add(metadata_sz))
+        .ok_or_else(|| "Integer overflow when calculating data_end".to_string())?;
+
+    if data_end <= index_start {
+        return Ok(None);
+    }
+
+    let expected_index_len = (data_end - index_start) as usize;
 
     // 下载索引数据
     let index_data = fetch_file_range(
@@ -462,8 +508,30 @@ pub async fn parse_kachina_metadata(
     )
     .await?;
 
+    if index_data.len() < expected_index_len {
+        return Err(DfsError::NetworkError {
+            reason: format!(
+                "Truncated Kachina index range: expected {expected_index_len} bytes, got {}",
+                index_data.len()
+            ),
+        });
+    }
+
     // 解析索引数据
-    let segments = parse_index_data(&index_data, index_start);
+    let segments = parse_index_data(&index_data[..expected_index_len], index_start);
+
+    if index_sz > 0 && segments.get("index").is_none() {
+        return Err(DfsError::SerializationError {
+            reason: "Kachina header declared non-empty index, but \\0INDEX segment is missing"
+                .to_string(),
+        });
+    }
+    if metadata_sz > 0 && segments.get("metadata").is_none() {
+        return Err(DfsError::SerializationError {
+            reason: "Kachina header declared non-empty metadata, but \\0META segment is missing"
+                .to_string(),
+        });
+    }
 
     Ok(Some(KachinaMetadata {
         index: segments.get("index").cloned().unwrap_or_else(|| json!({})),
@@ -473,4 +541,366 @@ pub async fn parse_kachina_metadata(
             .unwrap_or_else(|| json!({})),
         installer_end: index_start + config_sz + theme_sz,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::mocks::TestEnvironment;
+    use axum::{
+        Router,
+        extract::State,
+        http::{HeaderMap, StatusCode, header},
+        response::IntoResponse,
+        routing::get,
+    };
+    use std::sync::Arc;
+
+    fn build_tlv(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"!IN\0");
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn build_synthetic_pack() -> (Vec<u8>, u32) {
+        let config_tlv = build_tlv("\0CONFIG", br#"{"appName":"Demo"}"#);
+        let meta_tlv = build_tlv(
+            "\0META",
+            br#"{"tag_name":"0.68.0","hashed":[],"data_split_hint":[[0,128]]}"#,
+        );
+
+        // Build \0INDEX with one entry `abc` located right after \0META
+        let entry_name = b"abc";
+        let entry_header_len = 10 + entry_name.len() as u32;
+        let pre_index_offset = (config_tlv.len() + meta_tlv.len()) as u32 + entry_header_len;
+        let index_entry_len = 1 + entry_name.len() + 8;
+        let index_tlv_len = (10 + "\0INDEX".len() + index_entry_len) as u32;
+        let final_rel_offset = pre_index_offset + index_tlv_len;
+
+        let mut index_payload = Vec::new();
+        index_payload.push(entry_name.len() as u8);
+        index_payload.extend_from_slice(entry_name);
+        index_payload.extend_from_slice(&64u32.to_be_bytes());
+        index_payload.extend_from_slice(&final_rel_offset.to_be_bytes());
+        let index_tlv = build_tlv("\0INDEX", &index_payload);
+
+        let base_end = 256u32;
+        let mut base = vec![0u8; base_end as usize];
+        let mut marker = b"!KachinaInstaller!".to_vec();
+        marker.extend_from_slice(&base_end.to_be_bytes());
+        marker.extend_from_slice(&(config_tlv.len() as u32).to_be_bytes());
+        marker.extend_from_slice(&0u32.to_be_bytes());
+        marker.extend_from_slice(&(index_tlv.len() as u32).to_be_bytes());
+        marker.extend_from_slice(&(meta_tlv.len() as u32).to_be_bytes());
+        base[64..64 + marker.len()].copy_from_slice(&marker);
+
+        let mut pack = base;
+        pack.extend_from_slice(&config_tlv);
+        pack.extend_from_slice(&index_tlv);
+        pack.extend_from_slice(&meta_tlv);
+        pack.extend_from_slice(&build_tlv("abc", &[7u8; 64]));
+
+        let expected_abs_offset = base_end + final_rel_offset;
+        (pack, expected_abs_offset)
+    }
+
+    fn serve_range(headers: HeaderMap, data: &[u8]) -> axum::response::Response {
+        if let Some(range_val) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
+            && let Some(spec) = range_val.strip_prefix("bytes=")
+            && let Some((s, e)) = spec.split_once('-')
+            && let (Ok(start), Ok(end)) = (s.parse::<usize>(), e.parse::<usize>())
+        {
+            if start <= end && end < data.len() {
+                let slice = data[start..=end].to_vec();
+                return (
+                    StatusCode::PARTIAL_CONTENT,
+                    [(
+                        header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{}", data.len()),
+                    )],
+                    slice,
+                )
+                    .into_response();
+            }
+            return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+        }
+        (StatusCode::OK, data.to_vec()).into_response()
+    }
+
+    #[tokio::test]
+    async fn parse_kachina_metadata_reads_split_cas_pack_via_map_and_computes_raw_offset() {
+        let (pack_bytes, expected_offset) = build_synthetic_pack();
+        // Non-zero phys_offset=32 exercises physical Range header translation on internal fetches.
+        let mut padded_blob = vec![0xEEu8; 32];
+        padded_blob.extend_from_slice(&pack_bytes);
+        let manifest = serde_json::json!({
+            "size": pack_bytes.len() + 4096,
+            "extents": [
+                {
+                    "offset": 0,
+                    "len": pack_bytes.len(),
+                    "phys_offset": 32,
+                    "path": "cas/pack_blob"
+                }
+            ]
+        })
+        .to_string();
+
+        let state = Arc::new((padded_blob, manifest));
+        let app = Router::new()
+            .route(
+                "/bgi/app.json",
+                get(|State(st): State<Arc<(Vec<u8>, String)>>| async move {
+                    (StatusCode::OK, st.1.clone())
+                }),
+            )
+            .route(
+                "/bgi/cas/pack_blob",
+                get(
+                    |headers: HeaderMap, State(st): State<Arc<(Vec<u8>, String)>>| async move {
+                        serve_range(headers, &st.0)
+                    },
+                ),
+            )
+            .with_state(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let yaml = format!(
+            r#"
+servers:
+  map_srv:
+    id: map_srv
+    url: "http://{addr}"
+    type: direct
+plugins: {{}}
+resources:
+  bgi_split:
+    latest: "0.68.0"
+    resource_type: "file"
+    download: "disabled"
+    legacy_client_support: false
+    legacy_client_full_range: false
+    versions:
+      default:
+        default: "map:/bgi/app.json"
+    tries: []
+    server: ["map_srv"]
+    flow:
+      - use: ["server map_srv 10"]
+"#
+        );
+        let mut config: crate::config::AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        for (id, scfg) in &config.servers {
+            config.server_impl.insert(
+                id.clone(),
+                crate::modules::server::ServerImpl::new(scfg).unwrap(),
+            );
+        }
+        let env = TestEnvironment::with_config(config).await;
+
+        let parsed = parse_kachina_metadata(
+            &env.shared_config,
+            &env.services.flow_service,
+            "bgi_split",
+            "0.68.0",
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("kachina metadata parsed");
+
+        assert_eq!(parsed.metadata["tag_name"], json!("0.68.0"));
+        assert_eq!(parsed.metadata["data_split_hint"], json!([[0, 128]]));
+        assert_eq!(parsed.index["abc"]["offset"], json!(expected_offset));
+        assert_eq!(
+            parsed.index["abc"]["raw_offset"],
+            json!(expected_offset - 13)
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_kachina_metadata_errors_on_416_instead_of_returning_none() {
+        let app = Router::new().route(
+            "/broken.exe",
+            get(|| async { StatusCode::RANGE_NOT_SATISFIABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let yaml = format!(
+            r#"
+servers:
+  srv:
+    id: srv
+    url: "http://{addr}"
+    type: direct
+plugins: {{}}
+resources:
+  broken:
+    latest: "1.0.0"
+    versions:
+      default:
+        default: "/broken.exe"
+    tries: []
+    server: ["srv"]
+    flow:
+      - use: ["server srv 10"]
+"#
+        );
+        let mut config: crate::config::AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        for (id, scfg) in &config.servers {
+            config.server_impl.insert(
+                id.clone(),
+                crate::modules::server::ServerImpl::new(scfg).unwrap(),
+            );
+        }
+        let env = TestEnvironment::with_config(config).await;
+        env.data_store
+            .set_health_info(
+                "srv",
+                "/broken.exe",
+                &crate::modules::server::HealthInfo {
+                    is_alive: true,
+                    file_size: Some(1024),
+                    last_check: chrono::Utc::now().timestamp() as u64,
+                    observed_cert_hash: None,
+                    content_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let res = parse_kachina_metadata(
+            &env.shared_config,
+            &env.services.flow_service,
+            "broken",
+            "1.0.0",
+            None,
+        )
+        .await;
+        assert!(res.is_err(), "416 must return Err rather than Ok(None)");
+    }
+
+    #[tokio::test]
+    async fn parse_kachina_metadata_projects_root_fields_without_cas_range_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let manifest_hits = Arc::new(AtomicUsize::new(0));
+        let cas_hits = Arc::new(AtomicUsize::new(0));
+        let manifest = json!({
+            "size": 557344724u64,
+            "extents": [
+                { "offset": 0, "len": 1048576, "phys_offset": 0, "path": "cas/pack_head" }
+            ],
+            "installer_end": 9906541u32,
+            "index": {
+                "\u{0000}META": { "name": "\u{0000}META", "offset": 9906557, "raw_offset": 9906541, "size": 318302 },
+                "Main.exe": { "name": "Main.exe", "offset": 10224881, "raw_offset": 10224859, "size": 65536 }
+            },
+            "metadata": {
+                "repo_name": "BetterGI",
+                "tag_name": "0.68.0",
+                "data_split_hint": [[0, 60943141]]
+            }
+        })
+        .to_string();
+
+        let mh = Arc::clone(&manifest_hits);
+        let ch = Arc::clone(&cas_hits);
+        let app = Router::new()
+            .route(
+                "/bgi/0.68.0.json",
+                get(move || {
+                    let mh = Arc::clone(&mh);
+                    let m = manifest.clone();
+                    async move {
+                        mh.fetch_add(1, Ordering::SeqCst);
+                        (StatusCode::OK, m)
+                    }
+                }),
+            )
+            .route(
+                "/bgi/cas/pack_head",
+                get(move || {
+                    let ch = Arc::clone(&ch);
+                    async move {
+                        ch.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let yaml = format!(
+            r#"
+servers:
+  map_srv:
+    id: map_srv
+    url: "http://{addr}"
+    type: direct
+plugins: {{}}
+resources:
+  bgi_split:
+    latest: "0.68.0"
+    resource_type: "file"
+    download: "disabled"
+    legacy_client_support: false
+    legacy_client_full_range: false
+    versions:
+      default:
+        default: "map:/bgi/0.68.0.json"
+    tries: []
+    server: ["map_srv"]
+    flow:
+      - use: ["server map_srv 10"]
+"#
+        );
+        let mut config: crate::config::AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        for (id, scfg) in &config.servers {
+            config.server_impl.insert(
+                id.clone(),
+                crate::modules::server::ServerImpl::new(scfg).unwrap(),
+            );
+        }
+        let env = TestEnvironment::with_config(config).await;
+
+        let parsed = parse_kachina_metadata(
+            &env.shared_config,
+            &env.services.flow_service,
+            "bgi_split",
+            "0.68.0",
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("projected metadata from root JSON");
+
+        assert_eq!(parsed.installer_end, 9906541);
+        assert_eq!(parsed.metadata["tag_name"], json!("0.68.0"));
+        assert_eq!(parsed.metadata["data_split_hint"], json!([[0, 60943141]]));
+        assert_eq!(parsed.index["Main.exe"]["raw_offset"], json!(10224859));
+        assert_eq!(manifest_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cas_hits.load(Ordering::SeqCst),
+            0,
+            "root-projected metadata must skip all CAS byte-range fetches"
+        );
+    }
 }

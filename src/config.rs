@@ -563,6 +563,98 @@ pub struct ResourceConfig {
     #[serde(default = "default_version_file_split_ttl")]
     pub version_file_split_ttl: u32,
 }
+
+impl ResourceConfig {
+    /// Returns true if any version path template on this resource uses the `map:` prefix.
+    pub fn has_map_paths(&self) -> bool {
+        self.versions.values().any(|server_map| {
+            server_map
+                .values()
+                .any(|tpl| crate::modules::extent_map::is_map_path(tpl))
+        })
+    }
+
+    /// If `version` (falling back to `"default"`) resolves to at least one `map:` path,
+    /// returns the first valid `base_dir` among those `map:` paths.
+    pub fn map_base_dir_for_version(&self, version: &str) -> Option<String> {
+        let mut candidate_maps = Vec::new();
+        if let Some(vmap) = self.versions.get(version) {
+            candidate_maps.push(vmap);
+        }
+        if let Some(dmap) = self.versions.get("default") {
+            candidate_maps.push(dmap);
+        }
+
+        let mut found_any_map = false;
+        let mut first_base_dir = None;
+        for server_map in candidate_maps {
+            for tpl in server_map.values() {
+                let rendered = tpl.replace("${version}", version);
+                if let Some(res) = crate::modules::extent_map::parse_map_path(&rendered) {
+                    found_any_map = true;
+                    if first_base_dir.is_none()
+                        && let Ok(spec) = res
+                    {
+                        first_base_dir = Some(spec.base_dir);
+                    }
+                }
+            }
+        }
+        if found_any_map {
+            first_base_dir.or_else(|| Some("/".to_string()))
+        } else {
+            None
+        }
+    }
+
+    /// Validates configuration invariants required when a resource uses `map:` paths.
+    pub fn validate_map_constraints(&self, resource_id: &str) -> Vec<String> {
+        if !self.has_map_paths() {
+            return Vec::new();
+        }
+
+        let mut errors = Vec::new();
+        if self.download != DownloadPolicy::Disabled {
+            errors.push(format!(
+                "资源 '{resource_id}' 包含 'map:' 路径，'download' 必须为 'disabled'"
+            ));
+        }
+        if self.legacy_client_support {
+            errors.push(format!(
+                "资源 '{resource_id}' 包含 'map:' 路径，'legacy_client_support' 必须为 false"
+            ));
+        }
+        if self.legacy_client_full_range {
+            errors.push(format!(
+                "资源 '{resource_id}' 包含 'map:' 路径，'legacy_client_full_range' 必须为 false"
+            ));
+        }
+        if self.resource_type != "file" {
+            errors.push(format!(
+                "资源 '{resource_id}' 包含 'map:' 路径，'resource_type' 必须为 'file'"
+            ));
+        }
+
+        let mut version_keys: Vec<&String> = self.versions.keys().collect();
+        version_keys.sort_unstable();
+        for ver_key in version_keys {
+            let server_map = &self.versions[ver_key];
+            let mut srv_keys: Vec<&String> = server_map.keys().collect();
+            srv_keys.sort_unstable();
+            for srv_key in srv_keys {
+                let tpl = &server_map[srv_key];
+                let sample = tpl.replace("${version}", "0.0.0");
+                if let Some(Err(reason)) = crate::modules::extent_map::parse_map_path(&sample) {
+                    errors.push(format!(
+                        "资源 '{resource_id}' 版本 '{ver_key}' 节点 '{srv_key}' 的 map 路径 '{tpl}' 非法: {reason}"
+                    ));
+                }
+            }
+        }
+
+        errors
+    }
+}
 impl<'js> IntoJs<'js> for ResourceConfig {
     fn into_js(self, ctx: &rquickjs::Ctx<'js>) -> rquickjs::Result<rquickjs::Value<'js>> {
         let obj = rquickjs::Object::new(ctx.clone())?;
@@ -686,6 +778,19 @@ impl AppConfig {
             all_warnings.extend(warnings);
         }
         (all_errors, all_warnings)
+    }
+
+    /// Validates `map:` path constraints across all resources in deterministic order.
+    pub fn validate_resources_map(&self) -> Vec<String> {
+        let mut resource_ids: Vec<&String> = self.resources.keys().collect();
+        resource_ids.sort_unstable();
+        let mut errors = Vec::new();
+        for resource_id in resource_ids {
+            if let Some(resource) = self.resources.get(resource_id) {
+                errors.extend(resource.validate_map_constraints(resource_id));
+            }
+        }
+        errors
     }
 
     /// 展开所有资源 `flow` 中的 `insert` 片段引用（严格单层，禁止嵌套或与 `rules`/`use`/`mode` 混用）。
@@ -873,6 +978,17 @@ impl AppConfig {
             return Err(anyhow::anyhow!(
                 "Server transport validation failed:\n{}",
                 h3_errors.join("\n")
+            ));
+        }
+
+        let map_errors = config.validate_resources_map();
+        if !map_errors.is_empty() {
+            for e in &map_errors {
+                error!("{}", e);
+            }
+            return Err(anyhow::anyhow!(
+                "Resource map configuration validation failed:\n{}",
+                map_errors.join("\n")
             ));
         }
 
@@ -1641,6 +1757,89 @@ resources:
                 .expand_flow_inserts()
                 .unwrap_err()
                 .contains("cannot be combined")
+        );
+    }
+
+    #[test]
+    fn map_resource_enforces_disabled_download_no_legacy_and_file_type() {
+        let valid_yaml = r#"
+servers:
+  node1:
+    id: node1
+    url: "https://node1.example.com"
+    type: direct
+  cnb:
+    id: cnb
+    url: "https://cnb.example.com"
+    type: direct
+plugins: {}
+resources:
+  bgi_split:
+    latest: "0.68.0"
+    resource_type: "file"
+    download: "disabled"
+    legacy_client_support: false
+    legacy_client_full_range: false
+    versions:
+      default:
+        default: "map:/bgi/BetterGI.Install.${version}.json"
+        cnb: "/bettergi/BetterGI.Install.${version}.exe"
+    tries: ["cnb"]
+    server: ["node1"]
+    flow: []
+"#;
+        let mut config: AppConfig = serde_yaml::from_str(valid_yaml).unwrap();
+        assert!(config.validate_resources_map().is_empty());
+
+        config.resources.get_mut("bgi_split").unwrap().download = DownloadPolicy::Enabled;
+        assert!(
+            config
+                .validate_resources_map()
+                .iter()
+                .any(|e| e.contains("'download' 必须为 'disabled'"))
+        );
+        config.resources.get_mut("bgi_split").unwrap().download = DownloadPolicy::Disabled;
+
+        config
+            .resources
+            .get_mut("bgi_split")
+            .unwrap()
+            .legacy_client_support = true;
+        assert!(
+            config
+                .validate_resources_map()
+                .iter()
+                .any(|e| e.contains("'legacy_client_support' 必须为 false"))
+        );
+        config
+            .resources
+            .get_mut("bgi_split")
+            .unwrap()
+            .legacy_client_support = false;
+
+        config
+            .resources
+            .get_mut("bgi_split")
+            .unwrap()
+            .legacy_client_full_range = true;
+        assert!(
+            config
+                .validate_resources_map()
+                .iter()
+                .any(|e| e.contains("'legacy_client_full_range' 必须为 false"))
+        );
+        config
+            .resources
+            .get_mut("bgi_split")
+            .unwrap()
+            .legacy_client_full_range = false;
+
+        config.resources.get_mut("bgi_split").unwrap().resource_type = "prefix".to_string();
+        assert!(
+            config
+                .validate_resources_map()
+                .iter()
+                .any(|e| e.contains("'resource_type' 必须为 'file'"))
         );
     }
 }

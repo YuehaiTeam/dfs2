@@ -74,12 +74,38 @@ async fn handle_metadata_request_unified(
     }
 
     // 以下是 kachina metadata 处理逻辑
-    let path = match ctx.resource_service.get_version_path(
-        &validated_resid,
-        &effective_version,
-        None,
-        sub_path.as_deref(),
-    ) {
+    let path = match ctx
+        .resource_service
+        .get_version_path(
+            &validated_resid,
+            &effective_version,
+            None,
+            sub_path.as_deref(),
+        )
+        .or_else(|| {
+            let res = config_guard.get_resource(&validated_resid)?;
+            let mut candidate_servers =
+                crate::services::resource_service::collect_resource_server_ids(res);
+            for vkey in [effective_version.as_str(), "default"] {
+                if let Some(vmap) = res.versions.get(vkey) {
+                    let mut extra: Vec<String> = vmap.keys().cloned().collect();
+                    extra.sort_unstable();
+                    for srv in extra {
+                        if !candidate_servers.contains(&srv) {
+                            candidate_servers.push(srv);
+                        }
+                    }
+                }
+            }
+            candidate_servers.into_iter().find_map(|srv_id| {
+                crate::services::resource_service::version_path_for_resource(
+                    res,
+                    &effective_version,
+                    Some(&srv_id),
+                    sub_path.as_deref(),
+                )
+            })
+        }) {
         Some(p) => p,
         None => {
             let resource_path = if let Some(ref sub_path_val) = sub_path {

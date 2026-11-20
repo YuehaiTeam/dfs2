@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod auth;
+pub mod extent_map;
 pub mod external;
 pub mod flow;
 pub mod mcp;

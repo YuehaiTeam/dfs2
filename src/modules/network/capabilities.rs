@@ -400,6 +400,9 @@ fn rewrite_to_ssh(url: &str, server_config: &ServerConfig) -> DfsResult<String> 
     if let Some(ip) = server_config.ssh_internal_port {
         fragment.push_str(&format!("&internal_port={}", ip));
     }
+    if let Some(range_val) = crate::modules::extent_map::extract_range_fragment(url) {
+        fragment.push_str(&format!("&range={range_val}"));
+    }
 
     Ok(format!(
         "ssh+http://{host}:{port}{path_and_query}#{fragment}",
@@ -477,10 +480,13 @@ fn rewrite_to_scheme_with_cert(
     };
 
     let rewritten = format!("{scheme}://{}", &without_fragment["https://".len()..]);
+    let existing_range = crate::modules::extent_map::extract_range_fragment(original_url);
 
-    match fragment {
-        Some(frag) => Ok(format!("{rewritten}#{frag}")),
-        None => Ok(rewritten),
+    match (fragment, existing_range) {
+        (Some(frag), Some(r)) => Ok(format!("{rewritten}#{frag}&range={r}")),
+        (Some(frag), None) => Ok(format!("{rewritten}#{frag}")),
+        (None, Some(r)) => Ok(format!("{rewritten}#range={r}")),
+        (None, None) => Ok(rewritten),
     }
 }
 

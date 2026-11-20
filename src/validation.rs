@@ -207,6 +207,11 @@ impl ConfigValidator {
             report.add_warning(w.clone());
         }
 
+        for e in config.validate_resources_map() {
+            report.add_error(e);
+            report.config_valid = false;
+        }
+
         // 检查是否有资源定义
         if config.resources.is_empty() {
             report.add_warning("配置文件中未定义任何资源".to_string());

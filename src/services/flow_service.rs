@@ -71,6 +71,7 @@ pub struct FlowService {
     bandwidth_cache: crate::services::BandwidthCacheService,
     resource_service: crate::services::ResourceService,
     version_file_service: VersionFileService,
+    extent_map_cache: crate::modules::extent_map::ExtentMapCache,
     metrics: Option<Arc<Metrics>>,
 }
 
@@ -97,6 +98,7 @@ impl FlowService {
             bandwidth_cache,
             resource_service,
             version_file_service,
+            extent_map_cache: crate::modules::extent_map::ExtentMapCache::new(),
             metrics,
         }
     }
@@ -134,6 +136,8 @@ impl FlowService {
         penalties: FlowPenalties,
         session: Option<&crate::models::Session>,
     ) -> DfsResult<FlowResult> {
+        self.validate_map_target_upfront(target, options).await?;
+
         if !context.internal
             && let Some(binding) = schedule_override::lookup_override(
                 &self.data_store,
@@ -1038,6 +1042,39 @@ impl FlowService {
                 }
             }
 
+            if let Some(Ok(spec)) = crate::modules::extent_map::parse_map_path(&resource_path) {
+                let maybe_map = self
+                    .extent_map_cache
+                    .get_or_probe_server_map(
+                        &self.data_store,
+                        &validated_resource_id,
+                        &effective_version,
+                        &server.0,
+                        server_config,
+                        server_impl,
+                        &resource_path,
+                        &spec,
+                    )
+                    .await
+                    .map_err(DfsError::internal_error)?;
+
+                let Some(extent_map) = maybe_map else {
+                    return Ok(false);
+                };
+
+                extent_map
+                    .resolve_target_ranges(target.ranges.as_deref(), false)
+                    .map_err(|e| DfsError::range_not_satisfiable(e.to_string()))?;
+
+                return Ok(true);
+            } else if let Some(Err(reason)) =
+                crate::modules::extent_map::parse_map_path(&resource_path)
+            {
+                return Err(DfsError::invalid_config(format!(
+                    "Invalid map path '{resource_path}': {reason}"
+                )));
+            }
+
             Ok(server_impl
                 .is_alive(
                     &server.0,
@@ -1051,6 +1088,87 @@ impl FlowService {
         }
     }
 
+    async fn validate_map_target_upfront(
+        &self,
+        target: &FlowTarget,
+        options: &FlowOptions,
+    ) -> DfsResult<()> {
+        let has_any_map = {
+            let config = self.shared_config.load();
+            config
+                .get_resource(&target.resource_id)
+                .is_some_and(|r| r.has_map_paths())
+        };
+        if !has_any_map {
+            return Ok(());
+        }
+
+        let effective_version = if target.version.is_empty() {
+            self.resource_service
+                .get_effective_version(&target.resource_id)
+                .await?
+        } else {
+            target.version.clone()
+        };
+
+        let sample_base_dir = {
+            let config = self.shared_config.load();
+            config
+                .get_resource(&target.resource_id)
+                .and_then(|res| res.map_base_dir_for_version(&effective_version))
+        };
+        let Some(base_dir) = sample_base_dir else {
+            return Ok(());
+        };
+
+        if options.cdn_full_range {
+            return Err(DfsError::range_not_satisfiable(
+                crate::modules::extent_map::UnmergeableError::EmptyOrOpenRange.to_string(),
+            ));
+        }
+        let Some(ranges) = target.ranges.as_deref() else {
+            return Err(DfsError::range_not_satisfiable(
+                crate::modules::extent_map::UnmergeableError::EmptyOrOpenRange.to_string(),
+            ));
+        };
+        if ranges.is_empty() {
+            return Err(DfsError::range_not_satisfiable(
+                crate::modules::extent_map::UnmergeableError::EmptyOrOpenRange.to_string(),
+            ));
+        }
+        if ranges.len() > 1 {
+            return Err(DfsError::range_not_satisfiable(
+                crate::modules::extent_map::UnmergeableError::MultipartRange.to_string(),
+            ));
+        }
+        if ranges[0].0 > ranges[0].1 {
+            return Err(DfsError::range_not_satisfiable(
+                crate::modules::extent_map::UnmergeableError::InvalidBounds {
+                    start: u64::from(ranges[0].0),
+                    end: u64::from(ranges[0].1),
+                }
+                .to_string(),
+            ));
+        }
+
+        if let Some(known_map) = self
+            .extent_map_cache
+            .get_known_version_map(
+                &self.data_store,
+                &target.resource_id,
+                &effective_version,
+                &base_dir,
+            )
+            .await
+        {
+            known_map
+                .resolve_target_ranges(Some(ranges), options.cdn_full_range)
+                .map_err(|e| DfsError::range_not_satisfiable(e.to_string()))?;
+        }
+
+        Ok(())
+    }
+
     /// 生成服务器URL
     async fn generate_server_url(
         &self,
@@ -1059,48 +1177,85 @@ impl FlowService {
         context: &FlowContext,
         options: &FlowOptions,
     ) -> DfsResult<String> {
+        let effective_version = if target.version.is_empty() {
+            self.resource_service
+                .get_effective_version(&target.resource_id)
+                .await?
+        } else {
+            target.version.clone()
+        };
+
         let config = self.shared_config.load();
         if let Some(server_impl) = config.get_server(&server.0) {
-            // 简化版路径获取，直接访问配置
             let resource = config
                 .get_resource(&target.resource_id)
                 .ok_or_else(|| DfsError::resource_not_found(&target.resource_id))?;
 
-            // 获取版本路径
-            let path = if let Some(version_map) = resource.versions.get(&target.version) {
-                version_map
+            let url_path = crate::services::resource_service::version_path_for_resource(
+                resource,
+                &effective_version,
+                Some(&server.0),
+                target.sub_path.as_deref(),
+            )
+            .ok_or_else(|| DfsError::path_not_found(&target.resource_id, &effective_version))?;
+
+            if let Some(spec_res) = crate::modules::extent_map::parse_map_path(&url_path) {
+                let spec = spec_res.map_err(|reason| {
+                    DfsError::invalid_config(format!("Invalid map path '{url_path}': {reason}"))
+                })?;
+                let server_config = config
+                    .servers
                     .get(&server.0)
-                    .or_else(|| version_map.get("default"))
-            } else {
-                resource
-                    .versions
-                    .get("default")
-                    .and_then(|default_template| {
-                        default_template
-                            .get(&server.0)
-                            .or_else(|| default_template.get("default"))
-                    })
-            };
+                    .ok_or_else(|| DfsError::server_unavailable(&server.0))?;
 
-            let base_path = path
-                .map(|p| p.replace("${version}", &target.version))
-                .ok_or_else(|| DfsError::path_not_found(&target.resource_id, &target.version))?;
-
-            // 处理前缀路径
-            let url_path = match (resource.resource_type.as_str(), &target.sub_path) {
-                ("prefix", Some(sub)) => {
-                    let normalized_sub = normalize_path_simple(sub);
-                    let clean_prefix = base_path.trim_end_matches('/');
-                    format!("{clean_prefix}{normalized_sub}")
-                }
-                ("prefix", None) => {
-                    return Err(DfsError::path_not_found(
+                let extent_map = self
+                    .extent_map_cache
+                    .get_or_probe_server_map(
+                        &self.data_store,
                         &target.resource_id,
-                        &target.version,
-                    ));
-                }
-                (_, _) => base_path,
-            };
+                        &effective_version,
+                        &server.0,
+                        server_config,
+                        server_impl,
+                        &url_path,
+                        &spec,
+                    )
+                    .await
+                    .map_err(DfsError::internal_error)?
+                    .ok_or_else(|| DfsError::server_unavailable(&server.0))?;
+
+                let resolved = extent_map
+                    .resolve_target_ranges(target.ranges.as_deref(), options.cdn_full_range)
+                    .map_err(|e| DfsError::range_not_satisfiable(e.to_string()))?;
+
+                let sign_ranges = resolved.sign_range.map(|r| vec![r]);
+                let url = server_impl
+                    .url(
+                        &resolved.phys_path,
+                        sign_ranges,
+                        context.session_id.as_deref(),
+                        Some(&self.data_store),
+                    )
+                    .await
+                    .map_err(|e| DfsError::internal_error(format!("URL generation failed: {e}")))?;
+
+                let health_info = self
+                    .data_store
+                    .get_health_info(&server.0, &url_path)
+                    .await
+                    .ok()
+                    .flatten();
+                let rewritten = capabilities::rewrite_url(
+                    &url,
+                    server_config,
+                    health_info.as_ref(),
+                    &context.capabilities,
+                )?;
+                return Ok(crate::modules::extent_map::append_range_fragment(
+                    &rewritten,
+                    &resolved.fragment_range,
+                ));
+            }
 
             let url_ranges = if options.cdn_full_range {
                 None
@@ -1120,7 +1275,12 @@ impl FlowService {
 
             // Apply transport URL rewrite if applicable
             if let Some(server_config) = config.servers.get(&server.0) {
-                let health_info = self.get_health_info_for_server(&server.0, target).await;
+                let health_info = self
+                    .data_store
+                    .get_health_info(&server.0, &url_path)
+                    .await
+                    .ok()
+                    .flatten();
                 return capabilities::rewrite_url(
                     &url,
                     server_config,
@@ -1141,9 +1301,17 @@ impl FlowService {
         server_id: &str,
         target: &FlowTarget,
     ) -> Option<HealthInfo> {
+        let effective_version = if target.version.is_empty() {
+            self.resource_service
+                .get_effective_version(&target.resource_id)
+                .await
+                .ok()?
+        } else {
+            target.version.clone()
+        };
         let path = self.resource_service.get_version_path(
             &target.resource_id,
-            &target.version,
+            &effective_version,
             Some(server_id),
             target.sub_path.as_deref(),
         );
@@ -1157,21 +1325,192 @@ impl FlowService {
             None
         }
     }
-}
 
-/// 简化版路径标准化函数（用于FlowService内部）
-fn normalize_path_simple(path: &str) -> String {
-    // 防止目录遍历攻击
-    let cleaned = path
-        .replace("../", "")
-        .replace("..\\", "")
-        .replace("\\", "/");
+    /// Probes the highest-priority healthy server for `(resid, version)` under internal flow
+    /// evaluation and, if that server uses a `map:` manifest, returns the raw manifest JSON bytes.
+    pub async fn try_fetch_mapped_manifest_bytes(
+        &self,
+        resid: &str,
+        version: &str,
+        sub_path: Option<&str>,
+    ) -> Option<bytes::Bytes> {
+        if sub_path.is_some() {
+            return None;
+        }
 
-    // 确保以斜杠开头
-    if !cleaned.starts_with('/') {
-        format!("/{cleaned}")
-    } else {
-        cleaned
+        let effective_version = if version.is_empty() {
+            self.resource_service
+                .get_effective_version(resid)
+                .await
+                .ok()?
+        } else {
+            version.to_string()
+        };
+
+        let (flow_items, egress_ip, has_map) = {
+            let config = self.shared_config.load();
+            let resource = config.get_resource(resid)?;
+            (
+                resource.flow.clone(),
+                config.internal.egress_ip(),
+                resource.has_map_paths(),
+            )
+        };
+        if !has_map {
+            return None;
+        }
+
+        if let Some(raw) = self
+            .extent_map_cache
+            .get_cached_raw_version_bytes(resid, &effective_version)
+        {
+            return Some(raw);
+        }
+
+        let target = FlowTarget {
+            resource_id: resid.to_string(),
+            version: effective_version.clone(),
+            sub_path: None,
+            file_size: None,
+            ranges: None,
+        };
+        let context = FlowContext::internal(egress_ip);
+        let penalties = FlowPenalties::default();
+
+        let mut pool: Vec<(String, u32)> = Vec::new();
+        let mut tier_mapping: HashMap<String, u32> = HashMap::new();
+        let mut ended_tiers: HashSet<u32> = HashSet::new();
+
+        for item in &flow_items {
+            if ended_tiers.contains(&item.tier) || item.r#use.is_empty() {
+                continue;
+            }
+            let should_exec = if item.rules.is_empty() {
+                true
+            } else {
+                self.evaluate_flow_rules(&item.rules, &item.mode, &target, &context)
+                    .await
+                    .unwrap_or(false)
+            };
+            if !should_exec {
+                continue;
+            }
+            let mut end_flow = false;
+            for op in &item.r#use {
+                match op {
+                    FlowUse::Break => {
+                        end_flow = true;
+                        break;
+                    }
+                    FlowUse::Continue => {
+                        ended_tiers.insert(item.tier);
+                        break;
+                    }
+                    FlowUse::Clear => {
+                        pool.clear();
+                        tier_mapping.clear();
+                    }
+                    FlowUse::Server { id, weight } => {
+                        self.apply_server_op(
+                            &mut pool,
+                            &mut tier_mapping,
+                            id,
+                            ServerOp::Set(*weight),
+                            item.tier,
+                            &penalties,
+                            &context,
+                        );
+                    }
+                    FlowUse::ServerDelta { id, delta } => {
+                        let sop = match *delta {
+                            WeightDelta::Add(n) => ServerOp::Add(n),
+                            WeightDelta::Sub(n) => ServerOp::Sub(n),
+                        };
+                        self.apply_server_op(
+                            &mut pool,
+                            &mut tier_mapping,
+                            id,
+                            sop,
+                            item.tier,
+                            &penalties,
+                            &context,
+                        );
+                    }
+                    FlowUse::Plugin { .. } | FlowUse::Poolize => {}
+                }
+            }
+            if end_flow {
+                break;
+            }
+        }
+
+        let mut tiers: Vec<u32> = pool
+            .iter()
+            .map(|(name, _)| Self::pool_entry_tier(name, &tier_mapping))
+            .collect();
+        tiers.sort_unstable();
+        tiers.dedup();
+
+        for tier in tiers {
+            let mut tier_pool: Vec<(String, u32)> = pool
+                .iter()
+                .filter(|(name, _)| Self::pool_entry_tier(name, &tier_mapping) == tier)
+                .cloned()
+                .collect();
+
+            while !tier_pool.is_empty() {
+                let Ok((server_id, _)) = self.weighted_random_selection(&tier_pool) else {
+                    break;
+                };
+                tier_pool.retain(|(id, _)| id != &server_id);
+
+                let (server_cfg, server_impl, url_path) = {
+                    let config = self.shared_config.load();
+                    let Some(scfg) = config.servers.get(&server_id).cloned() else {
+                        continue;
+                    };
+                    let Some(simpl) = config.get_server(&server_id).cloned() else {
+                        continue;
+                    };
+                    let res = config.get_resource(resid)?;
+                    let Some(upath) = crate::services::resource_service::version_path_for_resource(
+                        res,
+                        &effective_version,
+                        Some(&server_id),
+                        None,
+                    ) else {
+                        continue;
+                    };
+                    (scfg, simpl, upath)
+                };
+
+                if let Some(Ok(spec)) = crate::modules::extent_map::parse_map_path(&url_path) {
+                    if let Ok(Some(bytes)) = self
+                        .extent_map_cache
+                        .probe_server_manifest_bytes(
+                            &self.data_store,
+                            resid,
+                            &effective_version,
+                            &server_id,
+                            &server_cfg,
+                            &server_impl,
+                            &url_path,
+                            &spec,
+                        )
+                        .await
+                    {
+                        return Some(bytes);
+                    }
+                } else if server_impl
+                    .is_alive(&server_id, &server_cfg, &url_path, Some(&self.data_store))
+                    .await
+                {
+                    return None;
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -4605,5 +4944,399 @@ mod tests {
                 "a zero-weight server in demoted must stay disabled"
             );
         }
+    }
+
+    async fn seed_map_manifest(
+        env: &TestEnvironment,
+        server_id: &str,
+        resource_id: &str,
+        version: &str,
+        resource_path: &str,
+        manifest_json: &str,
+        observed_cert_hash: Option<String>,
+    ) {
+        let spec = crate::modules::extent_map::parse_map_path(resource_path)
+            .unwrap()
+            .unwrap();
+        let parsed = crate::modules::extent_map::ExtentMap::parse_and_validate(
+            manifest_json.as_bytes(),
+            &spec.base_dir,
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp() as u64;
+        env.data_store
+            .set_health_info(
+                server_id,
+                resource_path,
+                &HealthInfo {
+                    is_alive: true,
+                    file_size: Some(parsed.size),
+                    last_check: now,
+                    observed_cert_hash,
+                    content_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        env.data_store
+            .set_string(
+                &crate::modules::extent_map::extent_map_storage_key(server_id, resource_path),
+                manifest_json,
+                Some(300),
+            )
+            .await
+            .unwrap();
+        env.data_store
+            .set_string(
+                &crate::modules::extent_map::resource_extent_map_storage_key(resource_id, version),
+                manifest_json,
+                Some(3600),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn map_flow_emits_whole_file_and_subrange_fragments_across_transports_and_rejects_unmergeable()
+     {
+        let fp = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+        let cert_hex = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let yaml = format!(
+            r#"
+servers:
+  dfs_map:
+    id: dfs_map
+    url: "https://u:tok123@node.example.com"
+    type: dfs_node
+  h3_map:
+    id: h3_map
+    url: "https://u:tok123@h3.example.com"
+    type: dfs_node
+    h3_only: true
+    cert_hash: trust
+  ssh_map:
+    id: ssh_map
+    url: "http://u:tok123@ssh.example.com:2222"
+    type: dfs_node
+    ssh_only: true
+    ssh_fingerprint: "{fp}"
+  sftp_map:
+    id: sftp_map
+    url: "sftp://u:tok123@sftp.example.com:22/storage"
+    type: dfs_sftp
+    ssh_fingerprint: "{fp}"
+  cnb:
+    id: cnb
+    url: "https://cnb.example.com"
+    type: direct
+plugins: {{}}
+resources:
+  bgi_split:
+    latest: "0.68.0"
+    resource_type: "file"
+    download: "disabled"
+    legacy_client_support: false
+    legacy_client_full_range: false
+    versions:
+      default:
+        default: "map:/bgi/BetterGI.Install.${{version}}.json"
+        cnb: "/bettergi/BetterGI.Install.${{version}}.exe"
+    tries: ["cnb"]
+    server: ["dfs_map"]
+    flow: []
+"#
+        );
+        let mut config: AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert!(config.validate_resources_map().is_empty());
+        for (id, scfg) in &config.servers {
+            config.server_impl.insert(
+                id.clone(),
+                crate::modules::server::ServerImpl::new(scfg).unwrap(),
+            );
+        }
+
+        let env = TestEnvironment::with_config(config).await;
+        let manifest = serde_json::json!({
+            "size": 10000,
+            "extents": [
+                { "offset": 0, "len": 4000, "path": "cas/pack_head" },
+                { "offset": 4042, "len": 5958, "path": "cas/big_asset" }
+            ]
+        })
+        .to_string();
+        let map_path = "map:/bgi/BetterGI.Install.0.68.0.json";
+        for srv in ["dfs_map", "ssh_map", "sftp_map"] {
+            seed_map_manifest(&env, srv, "bgi_split", "0.68.0", map_path, &manifest, None).await;
+        }
+        seed_map_manifest(
+            &env,
+            "h3_map",
+            "bgi_split",
+            "0.68.0",
+            map_path,
+            &manifest,
+            Some(cert_hex.to_string()),
+        )
+        .await;
+        env.data_store
+            .set_health_info(
+                "cnb",
+                "/bettergi/BetterGI.Install.0.68.0.exe",
+                &HealthInfo {
+                    is_alive: true,
+                    file_size: Some(10000),
+                    last_check: chrono::Utc::now().timestamp() as u64,
+                    observed_cert_hash: None,
+                    content_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let service = env.services.flow_service.clone();
+        let mut context = FlowContext {
+            client_ip: Some("192.168.1.1".parse().unwrap()),
+            session_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            extras: json!({}),
+            capabilities: ClientCapabilities {
+                h3: true,
+                wrtc: true,
+                wt: true,
+                ssh: true,
+                sftp: true,
+            },
+            internal: false,
+        };
+        let options = FlowOptions {
+            cdn_full_range: false,
+        };
+
+        // 1. Whole standalone CAS object (4042..=9999 -> len 5958) signs WITHOUT range hex and appends `#range=0-`
+        let whole_target = FlowTarget {
+            resource_id: "bgi_split".to_string(),
+            version: "0.68.0".to_string(),
+            sub_path: None,
+            file_size: Some(5958),
+            ranges: Some(vec![(4042, 9999)]),
+        };
+        let dfs_item = vec![FlowItem {
+            insert: None,
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec!["server dfs_map 10".parse().unwrap()],
+            tier: 0,
+        }];
+        let whole_res = service
+            .execute_flow(
+                &whole_target,
+                &context,
+                &options,
+                &dfs_item,
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            whole_res
+                .url
+                .starts_with("https://node.example.com/bgi/cas/big_asset?$=")
+        );
+        assert!(
+            whole_res.url.ends_with("#range=0-"),
+            "got {}",
+            whole_res.url
+        );
+        let sig_part = whole_res
+            .url
+            .split("?$=")
+            .nth(1)
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap();
+        // 32 uuid + 8 expire + 64 hmac = 104 hex chars when signed without ranges
+        assert_eq!(
+            sig_part.len(),
+            104,
+            "whole-object signature must omit range suffix"
+        );
+
+        // 2. Partial slice (4142..=5141 -> phys 100..=1099) across H3, SSH, and SFTP preserves transport fragments + `&range=`
+        let slice_target = FlowTarget {
+            resource_id: "bgi_split".to_string(),
+            version: "0.68.0".to_string(),
+            sub_path: None,
+            file_size: Some(1000),
+            ranges: Some(vec![(4142, 5141)]),
+        };
+        let h3_frag = format!("cert={cert_hex}&range=100-1099");
+        for (srv, expected_prefix, expected_frag) in [
+            (
+                "h3_map",
+                "http3://h3.example.com/bgi/cas/big_asset?$=",
+                h3_frag.as_str(),
+            ),
+            (
+                "ssh_map",
+                "ssh+http://ssh.example.com:2222/bgi/cas/big_asset?$=",
+                "range=100-1099",
+            ),
+            (
+                "sftp_map",
+                "sftp://sftp.example.com:22/storage/bgi/cas/big_asset#",
+                "range=100-1099",
+            ),
+        ] {
+            let items = vec![FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![format!("server {srv} 10").parse().unwrap()],
+                tier: 0,
+            }];
+            let res = service
+                .execute_flow(
+                    &slice_target,
+                    &context,
+                    &options,
+                    &items,
+                    FlowPenalties::default(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(
+                res.url.starts_with(expected_prefix),
+                "srv={srv} url={}",
+                res.url
+            );
+            assert!(
+                res.url.ends_with(expected_frag),
+                "srv={srv} url={}",
+                res.url
+            );
+        }
+
+        // 3. Non-map server (`cnb`) in same resource returns full-package URL without `#range=`
+        let cnb_items = vec![FlowItem {
+            insert: None,
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec!["server cnb 10".parse().unwrap()],
+            tier: 0,
+        }];
+        let cnb_res = service
+            .execute_flow(
+                &slice_target,
+                &context,
+                &options,
+                &cnb_items,
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            cnb_res.url,
+            "https://cnb.example.com/bettergi/BetterGI.Install.0.68.0.exe"
+        );
+
+        // 4. Cross-extent or TLV-gap range is rejected directly with 416 ERR_RANGE_NOT_SATISFIABLE, never falling back to `cnb`
+        let mixed_items = vec![
+            FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec!["server dfs_map 10".parse().unwrap()],
+                tier: 0,
+            },
+            FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec!["server cnb 10".parse().unwrap()],
+                tier: 1,
+            },
+        ];
+        for bad_range in [(3900, 4100), (4000, 4041)] {
+            let bad_target = FlowTarget {
+                resource_id: "bgi_split".to_string(),
+                version: "0.68.0".to_string(),
+                sub_path: None,
+                file_size: Some(u64::from(bad_range.1 - bad_range.0 + 1)),
+                ranges: Some(vec![bad_range]),
+            };
+            let err = service
+                .execute_flow(
+                    &bad_target,
+                    &context,
+                    &options,
+                    &mixed_items,
+                    FlowPenalties::default(),
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().starts_with("ERR_RANGE_NOT_SATISFIABLE:"),
+                "expected ERR_RANGE_NOT_SATISFIABLE: prefix, got {err}"
+            );
+            assert_eq!(err.http_status_code(), 416);
+        }
+
+        // 5. During initial sync window before ANY map node has uploaded `{ver}.json`, valid requests fall back to `cnb`
+        let unsynced_target = FlowTarget {
+            resource_id: "bgi_split".to_string(),
+            version: "0.69.0".to_string(),
+            sub_path: None,
+            file_size: Some(256),
+            ranges: Some(vec![(0, 255)]),
+        };
+        env.data_store
+            .set_health_info(
+                "dfs_map",
+                "map:/bgi/BetterGI.Install.0.69.0.json",
+                &HealthInfo {
+                    is_alive: false,
+                    file_size: None,
+                    last_check: chrono::Utc::now().timestamp() as u64,
+                    observed_cert_hash: None,
+                    content_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        env.data_store
+            .set_health_info(
+                "cnb",
+                "/bettergi/BetterGI.Install.0.69.0.exe",
+                &HealthInfo {
+                    is_alive: true,
+                    file_size: Some(10000),
+                    last_check: chrono::Utc::now().timestamp() as u64,
+                    observed_cert_hash: None,
+                    content_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        context.capabilities = ClientCapabilities::default();
+        let fallback_res = service
+            .execute_flow(
+                &unsynced_target,
+                &context,
+                &options,
+                &mixed_items,
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fallback_res.selected_server_id.as_deref(), Some("cnb"));
+        assert_eq!(
+            fallback_res.url,
+            "https://cnb.example.com/bettergi/BetterGI.Install.0.69.0.exe"
+        );
     }
 }
