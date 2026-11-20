@@ -454,7 +454,7 @@ fn parse_and_validate_ranges(range_str: &str) -> crate::error::DfsResult<Vec<(u3
 fn calculate_file_size_from_ranges(ranges: &[(u32, u32)]) -> u64 {
     ranges
         .iter()
-        .map(|(start, end)| (end - start + 1) as u64)
+        .map(|(start, end)| u64::from(*end) - u64::from(*start) + 1)
         .sum()
 }
 
@@ -852,5 +852,21 @@ mod tests {
         println!("     * 成功的chunk: 0-1023, 1024-2047 (有url字段)");
         println!("     * 失败的chunk: 9999-10000, invalid-format (有error字段)");
         println!("   - 修复验证：不再使用虚假的'error_chunk'或'unknown_chunk'作为key");
+    }
+
+    #[test]
+    fn full_u32_span_range_computes_4gib_without_overflow() {
+        assert_eq!(
+            calculate_file_size_from_ranges(&[(0, u32::MAX)]),
+            4_294_967_296u64
+        );
+        assert_eq!(
+            crate::routes::resource::calculate_actual_bytes_from_range(
+                Some("0-4294967295"),
+                4_294_967_296
+            ),
+            4_294_967_296u64
+        );
+        assert!(crate::routes::resource::parse_range_for_flow("200-100").is_none());
     }
 }

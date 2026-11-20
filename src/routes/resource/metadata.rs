@@ -121,12 +121,12 @@ async fn handle_metadata_request_unified(
 
     let cache_key = if let Ok(prefix) = std::env::var("REDIS_PREFIX") {
         if !prefix.is_empty() {
-            format!("{prefix}:kachina_meta:{path}")
+            format!("{prefix}:kachina_meta:{validated_resid}:{effective_version}:{path}")
         } else {
-            format!("kachina_meta:{path}")
+            format!("kachina_meta:{validated_resid}:{effective_version}:{path}")
         }
     } else {
-        format!("kachina_meta:{path}")
+        format!("kachina_meta:{validated_resid}:{effective_version}:{path}")
     };
 
     drop(config_guard); // 释放配置锁

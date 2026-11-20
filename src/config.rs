@@ -588,7 +588,10 @@ impl ResourceConfig {
         let mut found_any_map = false;
         let mut first_base_dir = None;
         for server_map in candidate_maps {
-            for tpl in server_map.values() {
+            let mut keys: Vec<&String> = server_map.keys().collect();
+            keys.sort_unstable();
+            for key in keys {
+                let tpl = &server_map[key];
                 let rendered = tpl.replace("${version}", version);
                 if let Some(res) = crate::modules::extent_map::parse_map_path(&rendered) {
                     found_any_map = true;

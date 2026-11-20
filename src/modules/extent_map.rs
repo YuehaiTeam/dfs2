@@ -18,8 +18,10 @@ pub const EXTENT_MAP_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const EXTENT_MAP_TTL_SECONDS: u32 = 300;
 pub const EXTENT_MAP_VERSION_TTL_SECONDS: u32 = 3600;
 pub const EXTENT_MAP_NEGATIVE_TTL_SECONDS: u64 = 60;
+pub const MAX_ADDRESSABLE_EXTENT_BYTES: u64 = (u32::MAX as u64) + 1;
 const RAW_MANIFEST_L1_TTL_SECONDS: u64 = 60;
-const RAW_MANIFEST_L1_MAX_ENTRIES: usize = 32;
+const RAW_MANIFEST_L1_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const EXTENT_MAP_L1_PRUNE_THRESHOLD: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapPathSpec {
@@ -49,7 +51,7 @@ fn parse_manifest_path(raw: &str) -> Result<MapPathSpec, String> {
     }
     if raw
         .bytes()
-        .any(|b| b == b'\\' || b == b'?' || b == b'#' || b.is_ascii_control())
+        .any(|b| b == b'\\' || b == b'?' || b == b'#' || b == b'%' || b.is_ascii_control())
     {
         return Err(format!("map: path '{raw}' contains forbidden characters"));
     }
@@ -78,7 +80,7 @@ fn parse_manifest_path(raw: &str) -> Result<MapPathSpec, String> {
 }
 
 /// Resolves a relative object path inside an extent manifest against `base_dir`,
-/// rejecting absolute paths, directory traversal, empty segments, and query/fragment delimiters.
+/// rejecting absolute paths, directory traversal, empty segments, percent-encoding, and query/fragment delimiters.
 pub fn resolve_extent_object_path(base_dir: &str, rel_path: &str) -> Result<String, String> {
     if rel_path.is_empty() {
         return Err("extent path must not be empty".to_string());
@@ -90,7 +92,7 @@ pub fn resolve_extent_object_path(base_dir: &str, rel_path: &str) -> Result<Stri
     }
     if rel_path
         .bytes()
-        .any(|b| b == b'\\' || b == b'?' || b == b'#' || b.is_ascii_control())
+        .any(|b| b == b'\\' || b == b'?' || b == b'#' || b == b'%' || b.is_ascii_control())
     {
         return Err(format!(
             "extent path '{rel_path}' contains forbidden characters"
@@ -257,6 +259,12 @@ impl ExtentMap {
         if raw.size == 0 {
             return Err("extent map virtual size must be positive".to_string());
         }
+        if raw.size > MAX_ADDRESSABLE_EXTENT_BYTES {
+            return Err(format!(
+                "extent map virtual size {} exceeds 32-bit addressable limit {}",
+                raw.size, MAX_ADDRESSABLE_EXTENT_BYTES
+            ));
+        }
         if raw.extents.is_empty() {
             return Err("extent map must contain at least one extent".to_string());
         }
@@ -291,6 +299,12 @@ impl ExtentMap {
                 .phys_offset
                 .checked_add(item.len)
                 .ok_or_else(|| format!("physical extent overflow for '{}'", item.path))?;
+            if phys_end > MAX_ADDRESSABLE_EXTENT_BYTES {
+                return Err(format!(
+                    "physical extent [{}..{phys_end}) for '{}' exceeds 32-bit addressable limit {}",
+                    item.phys_offset, item.path, MAX_ADDRESSABLE_EXTENT_BYTES
+                ));
+            }
             let resolved_path = resolve_extent_object_path(base_dir, &item.path)?;
 
             max_phys_end_by_path
@@ -436,8 +450,16 @@ impl ExtentMap {
 }
 
 pub fn append_range_fragment(url: &str, fragment_range: &str) -> String {
-    if url.contains('#') {
-        format!("{url}&range={fragment_range}")
+    if let Some((base, frag)) = url.split_once('#') {
+        let kept: Vec<&str> = frag
+            .split('&')
+            .filter(|pair| !pair.is_empty() && !pair.starts_with("range="))
+            .collect();
+        if kept.is_empty() {
+            format!("{base}#range={fragment_range}")
+        } else {
+            format!("{base}#{}&range={fragment_range}", kept.join("&"))
+        }
     } else {
         format!("{url}#range={fragment_range}")
     }
@@ -471,7 +493,8 @@ fn with_redis_prefix(raw: &str) -> String {
 }
 
 type ServerExtentKey = (String, String);
-type ServerExtentEntry = (u64, Arc<ExtentMap>);
+type ServerHealthStamp = (u64, Option<u64>, Option<String>);
+type ServerExtentEntry = (ServerHealthStamp, Instant, Arc<ExtentMap>);
 type VersionExtentKey = (String, String);
 type VersionExtentEntry = (Instant, Arc<ExtentMap>);
 type RawManifestEntry = (Instant, Bytes);
@@ -490,6 +513,45 @@ impl ExtentMapCache {
         Self::default()
     }
 
+    fn cleanup_idle_inflight(&self, key: &ServerExtentKey) {
+        self.inflight
+            .remove_if(key, |_, lock| Arc::strong_count(lock) == 1);
+    }
+
+    fn insert_l1_server_entry(
+        &self,
+        key: ServerExtentKey,
+        stamp: ServerHealthStamp,
+        map: Arc<ExtentMap>,
+    ) {
+        let now = Instant::now();
+        if self.l1_by_server.len() >= EXTENT_MAP_L1_PRUNE_THRESHOLD {
+            self.l1_by_server.retain(|_, (_, exp, _)| now < *exp);
+        }
+        self.l1_by_server.insert(
+            key,
+            (
+                stamp,
+                now + Duration::from_secs(u64::from(EXTENT_MAP_TTL_SECONDS)),
+                map,
+            ),
+        );
+    }
+
+    fn insert_l1_version_entry(&self, key: VersionExtentKey, map: Arc<ExtentMap>) {
+        let now = Instant::now();
+        if self.l1_by_version.len() >= EXTENT_MAP_L1_PRUNE_THRESHOLD {
+            self.l1_by_version.retain(|_, (exp, _)| now < *exp);
+        }
+        self.l1_by_version.insert(
+            key,
+            (
+                now + Duration::from_secs(u64::from(EXTENT_MAP_TTL_SECONDS)),
+                map,
+            ),
+        );
+    }
+
     /// Returns cached raw manifest bytes for `(resource_id, version)` if still fresh in memory.
     pub fn get_cached_raw_version_bytes(&self, resource_id: &str, version: &str) -> Option<Bytes> {
         let key = (resource_id.to_string(), version.to_string());
@@ -504,15 +566,39 @@ impl ExtentMapCache {
     }
 
     fn store_raw_version_bytes(&self, resource_id: &str, version: &str, raw_bytes: Bytes) {
+        if raw_bytes.len() > RAW_MANIFEST_L1_MAX_TOTAL_BYTES {
+            return;
+        }
         let now = Instant::now();
-        if self.l1_raw_by_version.len() >= RAW_MANIFEST_L1_MAX_ENTRIES {
-            self.l1_raw_by_version.retain(|_, (exp, _)| now < *exp);
-            if self.l1_raw_by_version.len() >= RAW_MANIFEST_L1_MAX_ENTRIES {
-                self.l1_raw_by_version.clear();
+        self.l1_raw_by_version.retain(|_, (exp, _)| now < *exp);
+
+        let key = (resource_id.to_string(), version.to_string());
+        self.l1_raw_by_version.remove(&key);
+
+        let mut total_bytes: usize = self
+            .l1_raw_by_version
+            .iter()
+            .map(|entry| entry.value().1.len())
+            .sum();
+
+        while total_bytes.saturating_add(raw_bytes.len()) > RAW_MANIFEST_L1_MAX_TOTAL_BYTES {
+            let oldest_key = self
+                .l1_raw_by_version
+                .iter()
+                .min_by_key(|entry| entry.value().0)
+                .map(|entry| entry.key().clone());
+            let Some(evict_key) = oldest_key else {
+                break;
+            };
+            if let Some((_, (_, evicted))) = self.l1_raw_by_version.remove(&evict_key) {
+                total_bytes = total_bytes.saturating_sub(evicted.len());
+            } else {
+                break;
             }
         }
+
         self.l1_raw_by_version.insert(
-            (resource_id.to_string(), version.to_string()),
+            key,
             (
                 now + Duration::from_secs(RAW_MANIFEST_L1_TTL_SECONDS),
                 raw_bytes,
@@ -540,13 +626,7 @@ impl ExtentMapCache {
         let storage_key = resource_extent_map_storage_key(resource_id, version);
         let raw = data_store.get_string(&storage_key).await.ok().flatten()?;
         let parsed = Arc::new(ExtentMap::parse_and_validate(raw.as_bytes(), base_dir).ok()?);
-        self.l1_by_version.insert(
-            ver_key,
-            (
-                Instant::now() + Duration::from_secs(u64::from(EXTENT_MAP_TTL_SECONDS)),
-                Arc::clone(&parsed),
-            ),
-        );
+        self.insert_l1_version_entry(ver_key, Arc::clone(&parsed));
         Some(parsed)
     }
 
@@ -589,31 +669,37 @@ impl ExtentMapCache {
         let lock_key = (server_id.to_string(), resource_path.to_string());
         let mutex = self
             .inflight
-            .entry(lock_key)
+            .entry(lock_key.clone())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
-        let _guard = mutex.lock().await;
+        let out = {
+            let _guard = mutex.lock().await;
 
-        if let Some(raw) = self.get_cached_raw_version_bytes(resource_id, version) {
-            return Ok(Some(raw));
-        }
-
-        let probe = server_impl
-            .fetch_small_file(
-                server_config,
-                &spec.manifest_path,
-                Some(data_store),
-                EXTENT_MAP_MAX_BYTES,
-            )
-            .await;
-        if probe.is_alive
-            && let Some(body) = probe.body
-        {
-            let raw_bytes = Bytes::from(body);
-            self.store_raw_version_bytes(resource_id, version, raw_bytes.clone());
-            return Ok(Some(raw_bytes));
-        }
-        Ok(None)
+            if let Some(raw) = self.get_cached_raw_version_bytes(resource_id, version) {
+                Ok(Some(raw))
+            } else {
+                let probe = server_impl
+                    .fetch_small_file(
+                        server_config,
+                        &spec.manifest_path,
+                        Some(data_store),
+                        EXTENT_MAP_MAX_BYTES,
+                    )
+                    .await;
+                if probe.is_alive
+                    && let Some(body) = probe.body
+                {
+                    let raw_bytes = Bytes::from(body);
+                    self.store_raw_version_bytes(resource_id, version, raw_bytes.clone());
+                    Ok(Some(raw_bytes))
+                } else {
+                    Ok(None)
+                }
+            }
+        };
+        drop(mutex);
+        self.cleanup_idle_inflight(&lock_key);
+        out
     }
 
     /// Loads or singleflight-probes the `ExtentMap` for `(server_id, resource_path)`.
@@ -653,104 +739,116 @@ impl ExtentMapCache {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
 
-        let _guard = mutex.lock().await;
+        let out = {
+            let _guard = mutex.lock().await;
 
-        if let Some(cached) = self
-            .try_read_cached_server_map(
-                data_store,
-                resource_id,
-                version,
-                server_id,
-                server_config,
-                resource_path,
-                &spec.base_dir,
-            )
-            .await
-        {
-            return Ok(cached);
-        }
+            if let Some(cached) = self
+                .try_read_cached_server_map(
+                    data_store,
+                    resource_id,
+                    version,
+                    server_id,
+                    server_config,
+                    resource_path,
+                    &spec.base_dir,
+                )
+                .await
+            {
+                Ok(cached)
+            } else {
+                let probe = server_impl
+                    .fetch_small_file(
+                        server_config,
+                        &spec.manifest_path,
+                        Some(data_store),
+                        EXTENT_MAP_MAX_BYTES,
+                    )
+                    .await;
 
-        let probe = server_impl
-            .fetch_small_file(
-                server_config,
-                &spec.manifest_path,
-                Some(data_store),
-                EXTENT_MAP_MAX_BYTES,
-            )
-            .await;
+                let now = chrono::Utc::now().timestamp() as u64;
 
-        let now = chrono::Utc::now().timestamp() as u64;
+                let mut parsed_out = None;
+                if probe.is_alive
+                    && let Some(body) = probe.body
+                {
+                    match std::str::from_utf8(&body)
+                        .map_err(|e| format!("manifest is not UTF-8: {e}"))
+                        .and_then(|raw_str| {
+                            ExtentMap::parse_and_validate_with_compact(
+                                raw_str.as_bytes(),
+                                &spec.base_dir,
+                            )
+                        }) {
+                        Ok((parsed_map, compact_json)) => {
+                            let content_hash = Some(hash_content(&body));
+                            let health = HealthInfo {
+                                is_alive: true,
+                                file_size: Some(parsed_map.size),
+                                last_check: now,
+                                observed_cert_hash: probe.observed_cert_hash.clone(),
+                                content_hash: content_hash.clone(),
+                            };
+                            let _ = data_store
+                                .set_health_info(server_id, resource_path, &health)
+                                .await;
+                            let _ = data_store
+                                .set_string(
+                                    &extent_map_storage_key(server_id, resource_path),
+                                    &compact_json,
+                                    Some(EXTENT_MAP_TTL_SECONDS),
+                                )
+                                .await;
+                            let _ = data_store
+                                .set_string(
+                                    &resource_extent_map_storage_key(resource_id, version),
+                                    &compact_json,
+                                    Some(EXTENT_MAP_VERSION_TTL_SECONDS),
+                                )
+                                .await;
 
-        if probe.is_alive
-            && let Some(body) = probe.body
-        {
-            match std::str::from_utf8(&body)
-                .map_err(|e| format!("manifest is not UTF-8: {e}"))
-                .and_then(|raw_str| {
-                    ExtentMap::parse_and_validate_with_compact(raw_str.as_bytes(), &spec.base_dir)
-                }) {
-                Ok((parsed_map, compact_json)) => {
-                    let health = HealthInfo {
-                        is_alive: true,
-                        file_size: Some(parsed_map.size),
+                            self.store_raw_version_bytes(resource_id, version, Bytes::from(body));
+
+                            let arc_map = Arc::new(parsed_map);
+                            self.insert_l1_server_entry(
+                                lock_key.clone(),
+                                (now, Some(arc_map.size), content_hash),
+                                Arc::clone(&arc_map),
+                            );
+                            self.insert_l1_version_entry(
+                                (resource_id.to_string(), version.to_string()),
+                                Arc::clone(&arc_map),
+                            );
+                            parsed_out = Some(arc_map);
+                        }
+                        Err(reason) => {
+                            warn!(
+                                server = %server_id,
+                                path = %spec.manifest_path,
+                                "Invalid extent map manifest: {reason}"
+                            );
+                        }
+                    }
+                }
+
+                if parsed_out.is_none() {
+                    let dead_health = HealthInfo {
+                        is_alive: false,
+                        file_size: None,
                         last_check: now,
                         observed_cert_hash: probe.observed_cert_hash,
-                        content_hash: Some(hash_content(&body)),
+                        content_hash: None,
                     };
                     let _ = data_store
-                        .set_health_info(server_id, resource_path, &health)
+                        .set_health_info(server_id, resource_path, &dead_health)
                         .await;
-                    let _ = data_store
-                        .set_string(
-                            &extent_map_storage_key(server_id, resource_path),
-                            &compact_json,
-                            Some(EXTENT_MAP_TTL_SECONDS),
-                        )
-                        .await;
-                    let _ = data_store
-                        .set_string(
-                            &resource_extent_map_storage_key(resource_id, version),
-                            &compact_json,
-                            Some(EXTENT_MAP_VERSION_TTL_SECONDS),
-                        )
-                        .await;
-
-                    self.store_raw_version_bytes(resource_id, version, Bytes::from(body));
-
-                    let arc_map = Arc::new(parsed_map);
-                    self.l1_by_server
-                        .insert(lock_key, (now, Arc::clone(&arc_map)));
-                    self.l1_by_version.insert(
-                        (resource_id.to_string(), version.to_string()),
-                        (
-                            Instant::now() + Duration::from_secs(u64::from(EXTENT_MAP_TTL_SECONDS)),
-                            Arc::clone(&arc_map),
-                        ),
-                    );
-                    return Ok(Some(arc_map));
+                    self.l1_by_server.remove(&lock_key);
                 }
-                Err(reason) => {
-                    warn!(
-                        server = %server_id,
-                        path = %spec.manifest_path,
-                        "Invalid extent map manifest: {reason}"
-                    );
-                }
+                Ok(parsed_out)
             }
-        }
-
-        let dead_health = HealthInfo {
-            is_alive: false,
-            file_size: None,
-            last_check: now,
-            observed_cert_hash: probe.observed_cert_hash,
-            content_hash: None,
         };
-        let _ = data_store
-            .set_health_info(server_id, resource_path, &dead_health)
-            .await;
-        self.l1_by_server.remove(&lock_key);
-        Ok(None)
+        drop(mutex);
+        self.cleanup_idle_inflight(&lock_key);
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -764,11 +862,24 @@ impl ExtentMapCache {
         resource_path: &str,
         base_dir: &str,
     ) -> Option<Option<Arc<ExtentMap>>> {
-        let cached_health = data_store
-            .get_health_info(server_id, resource_path)
-            .await
-            .ok()
-            .flatten()?;
+        let server_key = (server_id.to_string(), resource_path.to_string());
+        let cached_health = match data_store.get_health_info(server_id, resource_path).await {
+            Ok(Some(info)) => info,
+            Ok(None) => return None,
+            Err(err) => {
+                if let Some(entry) = self.l1_by_server.get(&server_key)
+                    && Instant::now() < entry.1
+                {
+                    warn!(
+                        server = %server_id,
+                        path = %resource_path,
+                        "Health store read failed ({err}); serving ExtentMap from local L1"
+                    );
+                    return Some(Some(Arc::clone(&entry.2)));
+                }
+                return None;
+            }
+        };
 
         if server_config.h3_only {
             let policy = server_config
@@ -790,11 +901,15 @@ impl ExtentMapCache {
             return None;
         }
 
-        let server_key = (server_id.to_string(), resource_path.to_string());
+        let health_stamp: ServerHealthStamp = (
+            cached_health.last_check,
+            cached_health.file_size,
+            cached_health.content_hash,
+        );
         if let Some(entry) = self.l1_by_server.get(&server_key)
-            && entry.0 == cached_health.last_check
+            && entry.0 == health_stamp
         {
-            return Some(Some(Arc::clone(&entry.1)));
+            return Some(Some(Arc::clone(&entry.2)));
         }
 
         let raw = data_store
@@ -803,14 +918,10 @@ impl ExtentMapCache {
             .ok()
             .flatten()?;
         let parsed = Arc::new(ExtentMap::parse_and_validate(raw.as_bytes(), base_dir).ok()?);
-        self.l1_by_server
-            .insert(server_key, (cached_health.last_check, Arc::clone(&parsed)));
-        self.l1_by_version.insert(
+        self.insert_l1_server_entry(server_key, health_stamp, Arc::clone(&parsed));
+        self.insert_l1_version_entry(
             (resource_id.to_string(), version.to_string()),
-            (
-                Instant::now() + Duration::from_secs(u64::from(EXTENT_MAP_TTL_SECONDS)),
-                Arc::clone(&parsed),
-            ),
+            Arc::clone(&parsed),
         );
         Some(Some(parsed))
     }
@@ -841,6 +952,11 @@ mod tests {
         assert!(parse_map_path("map:").unwrap().is_err());
         assert!(parse_map_path("map:/bgi/").unwrap().is_err());
         assert!(parse_map_path("map:/bgi/../secret.json").unwrap().is_err());
+        assert!(
+            parse_map_path("map:/bgi/%2e%2e/secret.json")
+                .unwrap()
+                .is_err()
+        );
         assert!(parse_map_path("map:/bgi/a?x=1").unwrap().is_err());
         assert!(parse_map_path("map:/bgi/a#frag").unwrap().is_err());
     }
@@ -861,6 +977,7 @@ mod tests {
             "cas/9a8b/",
             "../cas/9a8b",
             "cas/../9a8b",
+            "cas/%2e%2e/9a8b",
             "cas/./9a8b",
             "cas//9a8b",
             "cas\\9a8b",
@@ -1120,5 +1237,40 @@ mod tests {
             .get_cached_raw_version_bytes("pkg_res", "1.0.0")
             .expect("raw bytes retained in L1 for version");
         assert_eq!(cached_raw.len(), root_json.len());
+        assert_eq!(
+            cache.inflight.len(),
+            0,
+            "idle inflight mutexes must be pruned after completion"
+        );
+    }
+
+    #[test]
+    fn extent_map_enforces_32bit_limits_and_fragment_replacement_hygiene() {
+        let exact_4g = serde_json::json!({
+            "size": MAX_ADDRESSABLE_EXTENT_BYTES,
+            "extents": [{ "offset": 0, "len": MAX_ADDRESSABLE_EXTENT_BYTES, "path": "cas/full4g" }]
+        });
+        assert!(ExtentMap::parse_and_validate(exact_4g.to_string().as_bytes(), "/bgi").is_ok());
+
+        let over_size = serde_json::json!({
+            "size": MAX_ADDRESSABLE_EXTENT_BYTES + 1,
+            "extents": [{ "offset": 0, "len": 1024, "path": "cas/head" }]
+        });
+        assert!(ExtentMap::parse_and_validate(over_size.to_string().as_bytes(), "/bgi").is_err());
+
+        let over_phys = serde_json::json!({
+            "size": 4096,
+            "extents": [{ "offset": 0, "len": 4096, "phys_offset": MAX_ADDRESSABLE_EXTENT_BYTES - 2048, "path": "cas/head" }]
+        });
+        assert!(ExtentMap::parse_and_validate(over_phys.to_string().as_bytes(), "/bgi").is_err());
+
+        assert_eq!(
+            append_range_fragment("sftp://host:22/dir/cas/x#", "10-20"),
+            "sftp://host:22/dir/cas/x#range=10-20"
+        );
+        assert_eq!(
+            append_range_fragment("http3://host/cas/x#cert=aa&range=0-9", "10-20"),
+            "http3://host/cas/x#cert=aa&range=10-20"
+        );
     }
 }

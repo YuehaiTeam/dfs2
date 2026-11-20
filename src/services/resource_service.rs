@@ -52,6 +52,24 @@ impl ResourceService {
             version.to_string()
         };
 
+        if effective_version == "."
+            || effective_version == ".."
+            || effective_version.contains("..")
+            || effective_version.bytes().any(|b| {
+                b == b'/'
+                    || b == b'\\'
+                    || b == b'?'
+                    || b == b'#'
+                    || b == b'%'
+                    || b.is_ascii_control()
+            })
+        {
+            return Err(DfsError::invalid_input(
+                "version",
+                "Invalid version characters",
+            ));
+        }
+
         // 验证版本存在性
         if !resource_config.versions.contains_key(&effective_version)
             && !resource_config.versions.contains_key("default")

@@ -30,6 +30,10 @@ pub fn parse_range_for_flow(range_str: &str) -> Option<Vec<(u32, u32)>> {
         parts[1].parse::<u32>().ok()?
     };
 
+    if start > end {
+        return None;
+    }
+
     Some(vec![(start, end)])
 }
 

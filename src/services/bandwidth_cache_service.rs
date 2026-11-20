@@ -48,6 +48,9 @@ pub struct BandwidthCacheService {
     /// 串行化后台定时刷盘与测试手动刷盘，保证 `fetch_sub` 回扣不会并发重入
     flush_lock: Arc<tokio::sync::Mutex<()>>,
 
+    /// 协调刷盘（写锁）与缓存未命中回源读取（读锁），消除 `HINCRBY` 与 `fetch_sub` 之间的双计窗口
+    sync_lock: Arc<RwLock<()>>,
+
     /// 测试时钟覆盖（秒级 Unix 时间戳；`u64::MAX` 表示未启用覆盖）
     #[cfg(test)]
     mock_unix_secs: Arc<AtomicU64>,
@@ -63,6 +66,7 @@ impl BandwidthCacheService {
             cache_ttl: Duration::from_secs(5),
             flush_interval: Duration::from_secs(1),
             flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+            sync_lock: Arc::new(RwLock::new(())),
             #[cfg(test)]
             mock_unix_secs: Arc::new(AtomicU64::new(u64::MAX)),
         };
@@ -101,24 +105,31 @@ impl BandwidthCacheService {
             return Ok(cached_result);
         }
 
-        // 2. 缓存未命中，从Redis查询
+        // 2. 缓存未命中：持读同步锁查询持久化层并原子收敛写缓冲区增量，避免刷盘双计与写回覆盖竞态
         debug!(
             "Cache miss for server {} ({} minutes), querying Redis",
             server_id, minutes
         );
-        let redis_result = self
-            .query_from_redis(server_id, minutes, query_minute)
+        let clamped_minutes = minutes.min(BANDWIDTH_MINUTE_RING_SIZE);
+        let _sync_guard = self.sync_lock.read().await;
+        let persisted = self
+            .data_store
+            .get_server_minutes_bandwidth_direct(server_id, clamped_minutes)
             .await?;
 
-        // 3. 更新缓存
-        self.update_cache(server_id, minutes, redis_result, query_minute)
-            .await;
+        let total_bytes = {
+            let mut cache = self.read_cache.write().await;
+            let pending = self.sum_pending_bytes(server_id, clamped_minutes, query_minute);
+            let total = persisted.saturating_add(pending);
+            Self::insert_cache_entry_locked(&mut cache, server_id, minutes, total, query_minute);
+            total
+        };
 
         debug!(
             "Redis query result for server {} ({} minutes): {} bytes",
-            server_id, minutes, redis_result
+            server_id, minutes, total_bytes
         );
-        Ok(redis_result)
+        Ok(total_bytes)
     }
 
     /// 查询用于速率判定的采样总字节与真实覆盖秒数。
@@ -169,13 +180,12 @@ impl BandwidthCacheService {
             bytes, target_id, minute_timestamp
         );
 
+        let mut cache = self.read_cache.write().await;
         self.write_buffer
             .entry(key)
             .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(bytes, Ordering::Relaxed);
-
-        self.increment_local_cache(target_id, bytes, minute_timestamp)
-            .await;
+            .fetch_add(bytes, Ordering::AcqRel);
+        Self::increment_local_cache_locked(&mut cache, target_id, bytes, minute_timestamp);
     }
 
     /// 从缓存获取数据；跨整分后旧分钟快照失效，避免漏计新分钟写入并残留过期分钟。
@@ -198,18 +208,7 @@ impl BandwidthCacheService {
         None
     }
 
-    /// 从存储查询数据，并叠加写缓冲区中尚未刷盘的窗口内增量。
-    async fn query_from_redis(
-        &self,
-        server_id: &str,
-        minutes: u32,
-        current_minute: u64,
-    ) -> Result<u64, String> {
-        let minutes = minutes.min(BANDWIDTH_MINUTE_RING_SIZE);
-        let persisted = self
-            .data_store
-            .get_server_minutes_bandwidth_direct(server_id, minutes)
-            .await?;
+    fn sum_pending_bytes(&self, server_id: &str, minutes: u32, current_minute: u64) -> u64 {
         let mut pending = 0u64;
         for i in 0..minutes {
             let target_minute = current_minute.saturating_sub(i as u64);
@@ -220,21 +219,18 @@ impl BandwidthCacheService {
                 pending = pending.saturating_add(counter.load(Ordering::Acquire));
             }
         }
-        Ok(persisted.saturating_add(pending))
+        pending
     }
 
-    /// 更新本地缓存
-    async fn update_cache(
-        &self,
+    /// 更新本地缓存（调用方已持有 `read_cache` 写锁）
+    fn insert_cache_entry_locked(
+        cache: &mut HashMap<String, HashMap<u32, CachedBandwidthData>>,
         server_id: &str,
         minutes: u32,
         total_bytes: u64,
         sync_minute: u64,
     ) {
-        let mut cache = self.read_cache.write().await;
-        let server_cache = cache
-            .entry(server_id.to_string())
-            .or_insert_with(HashMap::new);
+        let server_cache = cache.entry(server_id.to_string()).or_default();
 
         server_cache.insert(
             minutes,
@@ -248,23 +244,24 @@ impl BandwidthCacheService {
 
         // 清理过期缓存（简单LRU策略）
         if server_cache.len() > 10 {
-            // 找到最旧的缓存项
             let window_to_remove = server_cache
                 .iter()
                 .min_by_key(|(_, data)| data.cached_at)
                 .map(|(window, _)| *window);
 
-            // 移除最旧的缓存项
             if let Some(window) = window_to_remove {
                 server_cache.remove(&window);
             }
         }
     }
 
-    /// 立即更新本地缓存（用于保证一致性）
-    async fn increment_local_cache(&self, server_id: &str, bytes: u64, minute_timestamp: u64) {
-        let mut cache = self.read_cache.write().await;
-
+    /// 立即更新本地缓存（调用方已持有 `read_cache` 写锁）
+    fn increment_local_cache_locked(
+        cache: &mut HashMap<String, HashMap<u32, CachedBandwidthData>>,
+        server_id: &str,
+        bytes: u64,
+        minute_timestamp: u64,
+    ) {
         if let Some(server_cache) = cache.get_mut(server_id) {
             for cached_data in server_cache.values_mut() {
                 if cached_data.window_minutes == 0 {
@@ -312,13 +309,15 @@ impl BandwidthCacheService {
         });
     }
 
-    /// 将写缓冲区中的增量刷入存储，单条写入成功后再从对应原子计数器回扣已刷字节数，
-    /// 避免整表清空丢失并发写入或在网络写入期间出现读取空窗。
+    /// 将写缓冲区中的增量刷入存储，并在 `sync_lock` 写锁保护下完成持久化与 `fetch_sub` 回扣，
+    /// 消除回源读取时重复计入同一批增量的竞态窗口。
     async fn flush_pending_entries(&self) -> Result<(), String> {
         let _guard = self.flush_lock.lock().await;
         if self.write_buffer.is_empty() {
             return Ok(());
         }
+
+        let _sync_guard = self.sync_lock.write().await;
 
         let mut server_data: HashMap<String, Vec<(u64, u64)>> = HashMap::new();
         for entry in self.write_buffer.iter() {

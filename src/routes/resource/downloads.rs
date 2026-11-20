@@ -563,7 +563,7 @@ pub async fn handle_download_request_unified(
         let range_size = Some(
             ranges
                 .iter()
-                .map(|(start, end)| (end - start + 1) as u64)
+                .map(|(start, end)| u64::from(*end).saturating_sub(u64::from(*start)) + 1)
                 .sum(),
         );
         debug!(

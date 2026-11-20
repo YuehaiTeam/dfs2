@@ -103,6 +103,10 @@ impl FlowService {
         }
     }
 
+    pub fn extent_map_cache(&self) -> &crate::modules::extent_map::ExtentMapCache {
+        &self.extent_map_cache
+    }
+
     /// 客户端选点返回 `NO_RES_AVAILABLE` 时按资源计数。
     ///
     /// prefix 资源的一次下载会按文件各走一次选点，计入后计数被文件数放大。
@@ -317,6 +321,7 @@ impl FlowService {
                         pool.clear();
                         tier_mapping.clear();
                         plugin_server_mapping.clear();
+                        *selection = None;
                     }
                     FlowUse::Server { id, weight } => {
                         self.apply_server_op(
@@ -417,6 +422,8 @@ impl FlowService {
         tiers.sort_unstable();
         tiers.dedup();
 
+        let mut first_range_unsatisfiable: Option<DfsError> = None;
+
         for tier in &tiers {
             let mut tier_pool: Vec<(String, u32)> = pool
                 .iter()
@@ -424,18 +431,37 @@ impl FlowService {
                 .cloned()
                 .collect();
 
-            if let Some((server_id, weight)) = self
+            if first_range_unsatisfiable.is_some() {
+                tier_pool.retain(|(name, _)| {
+                    let server_id = Self::pool_entry_server_id(name, plugin_server_mapping);
+                    self.server_uses_map_for_target(server_id, target)
+                });
+                if tier_pool.is_empty() {
+                    continue;
+                }
+            }
+
+            match self
                 .select_healthy_from_pool(&mut tier_pool, target, context, options)
-                .await?
+                .await
             {
-                debug!(server = %server_id, tier, "Selected server from tier");
-                // tier_pool 此时只剩最终 URL，由它替换整个池子
-                *pool = tier_pool;
-                return Ok(Some(Poolized {
-                    server_id,
-                    weight,
-                    tier: *tier,
-                }));
+                Ok(Some((server_id, weight))) => {
+                    debug!(server = %server_id, tier, "Selected server from tier");
+                    // tier_pool 此时只剩最终 URL，由它替换整个池子
+                    *pool = tier_pool;
+                    return Ok(Some(Poolized {
+                        server_id,
+                        weight,
+                        tier: *tier,
+                    }));
+                }
+                Ok(None) => {}
+                Err(err @ DfsError::RangeNotSatisfiable { .. }) => {
+                    if first_range_unsatisfiable.is_none() {
+                        first_range_unsatisfiable = Some(err);
+                    }
+                }
+                Err(err) => return Err(err),
             }
 
             // 降级本身值得注意：它意味着一整层当前没有可用节点
@@ -443,6 +469,11 @@ impl FlowService {
                 "Tier {} has no usable server; falling through (tiers in pool: {:?})",
                 tier, tiers
             );
+        }
+
+        if let Some(err) = first_range_unsatisfiable {
+            pool.clear();
+            return Err(err);
         }
 
         // 调用方以空池判定 NO_RES_AVAILABLE，池里若留着未解析的节点名会被当成 URL 返回
@@ -460,6 +491,8 @@ impl FlowService {
         context: &FlowContext,
         options: &FlowOptions,
     ) -> DfsResult<Option<(String, u32)>> {
+        let mut first_range_unsatisfiable: Option<DfsError> = None;
+
         while !pool.is_empty() {
             let selected_server = match self.weighted_random_selection(pool) {
                 Ok(selected) => selected,
@@ -467,20 +500,44 @@ impl FlowService {
                     // 权重全零属于配置意图（整层禁用），不是错误
                     debug!("No selectable server in this tier: {}", e);
                     pool.clear();
+                    if let Some(err) = first_range_unsatisfiable {
+                        return Err(err);
+                    }
                     return Ok(None);
                 }
             };
 
-            if self.is_server_healthy(&selected_server, target).await? {
-                let url = self
-                    .generate_server_url(&selected_server, target, context, options)
-                    .await?;
-                pool.clear();
-                pool.push((url, selected_server.1));
-                return Ok(Some(selected_server));
+            if first_range_unsatisfiable.is_some()
+                && !self.server_uses_map_for_target(&selected_server.0, target)
+            {
+                pool.retain(|x| x.0 != selected_server.0);
+                continue;
             }
 
-            pool.retain(|x| x.0 != selected_server.0);
+            match self.is_server_healthy(&selected_server, target).await {
+                Ok(true) => {
+                    let url = self
+                        .generate_server_url(&selected_server, target, context, options)
+                        .await?;
+                    pool.clear();
+                    pool.push((url, selected_server.1));
+                    return Ok(Some(selected_server));
+                }
+                Ok(false) => {
+                    pool.retain(|x| x.0 != selected_server.0);
+                }
+                Err(err @ DfsError::RangeNotSatisfiable { .. }) => {
+                    if first_range_unsatisfiable.is_none() {
+                        first_range_unsatisfiable = Some(err);
+                    }
+                    pool.retain(|x| x.0 != selected_server.0);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        if let Some(err) = first_range_unsatisfiable {
+            return Err(err);
         }
 
         Ok(None)
@@ -747,11 +804,21 @@ impl FlowService {
             }
             FlowCond::ServerBwMinutes(server_id, minutes, comp, limit) => {
                 // 服务器分钟级流量限制检查：使用缓存服务
-                let current_usage = self
+                let current_usage = match self
                     .bandwidth_cache
                     .get_server_minutes_bandwidth(server_id, *minutes)
                     .await
-                    .unwrap_or(0);
+                {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        warn!(
+                            server = %server_id,
+                            minutes,
+                            "Failed to read minute bandwidth for flow condition ({err}); defaulting to 0"
+                        );
+                        0
+                    }
+                };
 
                 let limit_bytes = limit.bytes() as u64;
                 Ok(comp.matches(current_usage, limit_bytes))
@@ -763,11 +830,21 @@ impl FlowService {
                     }
                     SpeedTarget::Server(server_id) => server_id.as_str(),
                 };
-                let (total_bytes, elapsed_secs) = self
+                let (total_bytes, elapsed_secs) = match self
                     .bandwidth_cache
                     .get_rate_window_stats(target_key, *minutes)
                     .await
-                    .unwrap_or((0, (*minutes as u64).max(1) * 60));
+                {
+                    Ok(stats) => stats,
+                    Err(err) => {
+                        warn!(
+                            target = %target_key,
+                            minutes,
+                            "Failed to read speed window stats for flow condition ({err}); defaulting to 0"
+                        );
+                        (0, (*minutes as u64).max(1) * 60)
+                    }
+                };
 
                 let actual_bits = (total_bytes as u128) * 8;
                 let threshold_bits = (rate.bits_per_sec() as u128) * (elapsed_secs as u128);
@@ -967,9 +1044,9 @@ impl FlowService {
         }
     }
 
-    /// 权重随机选择
+    /// 权重随机选择（以 `u64` 求和避免多个大权重或 `+N` 累加溢出 `u32`）
     fn weighted_random_selection(&self, pool: &[(String, u32)]) -> DfsResult<(String, u32)> {
-        let total_weight: u32 = pool.iter().map(|(_, weight)| *weight).sum();
+        let total_weight: u64 = pool.iter().map(|(_, weight)| u64::from(*weight)).sum();
         if total_weight == 0 {
             return Err(DfsError::internal_error(
                 "No valid servers with positive weight",
@@ -982,14 +1059,34 @@ impl FlowService {
         // 抽样区间是半开的 [0, total)，比较必须同为严格小于：写成 `<=` 会让每个条目多占一格，
         // 权重 0 的条目变得可选（`server x 0` 本意是禁用），且靠前的条目被系统性偏向。
         for (server_id, weight) in pool.iter() {
-            if random_weight < *weight {
+            let weight_u64 = u64::from(*weight);
+            if random_weight < weight_u64 {
                 return Ok((server_id.clone(), *weight));
             }
-            random_weight -= weight;
+            random_weight -= weight_u64;
         }
 
         // 不应该到达这里
         Err(DfsError::internal_error("Weighted selection failed"))
+    }
+
+    fn server_uses_map_for_target(&self, server_id: &str, target: &FlowTarget) -> bool {
+        let config = self.shared_config.load();
+        let Some(res) = config.get_resource(&target.resource_id) else {
+            return false;
+        };
+        let ver = if target.version.is_empty() {
+            res.latest.as_str()
+        } else {
+            target.version.as_str()
+        };
+        crate::services::resource_service::version_path_for_resource(
+            res,
+            ver,
+            Some(server_id),
+            target.sub_path.as_deref(),
+        )
+        .is_some_and(|p| crate::modules::extent_map::is_map_path(&p))
     }
 
     /// 检查服务器健康状态
@@ -1075,6 +1172,34 @@ impl FlowService {
                 )));
             }
 
+            let sample_map_base_dir = config
+                .get_resource(&validated_resource_id)
+                .and_then(|res| res.map_base_dir_for_version(&effective_version));
+            drop(config);
+
+            if let Some(base_dir) = sample_map_base_dir
+                && let Some(known_map) = self
+                    .extent_map_cache
+                    .get_known_version_map(
+                        &self.data_store,
+                        &validated_resource_id,
+                        &effective_version,
+                        &base_dir,
+                    )
+                    .await
+            {
+                known_map
+                    .resolve_target_ranges(target.ranges.as_deref(), false)
+                    .map_err(|e| DfsError::range_not_satisfiable(e.to_string()))?;
+            }
+
+            let config = self.shared_config.load();
+            let (Some(server_impl), Some(server_config)) =
+                (config.get_server(&server.0), config.servers.get(&server.0))
+            else {
+                return Ok(false);
+            };
+
             Ok(server_impl
                 .is_alive(
                     &server.0,
@@ -1111,15 +1236,16 @@ impl FlowService {
             target.version.clone()
         };
 
-        let sample_base_dir = {
+        let version_uses_map = {
             let config = self.shared_config.load();
             config
                 .get_resource(&target.resource_id)
                 .and_then(|res| res.map_base_dir_for_version(&effective_version))
+                .is_some()
         };
-        let Some(base_dir) = sample_base_dir else {
+        if !version_uses_map {
             return Ok(());
-        };
+        }
 
         if options.cdn_full_range {
             return Err(DfsError::range_not_satisfiable(
@@ -1149,21 +1275,6 @@ impl FlowService {
                 }
                 .to_string(),
             ));
-        }
-
-        if let Some(known_map) = self
-            .extent_map_cache
-            .get_known_version_map(
-                &self.data_store,
-                &target.resource_id,
-                &effective_version,
-                &base_dir,
-            )
-            .await
-        {
-            known_map
-                .resolve_target_ranges(Some(ranges), options.cdn_full_range)
-                .map_err(|e| DfsError::range_not_satisfiable(e.to_string()))?;
         }
 
         Ok(())
@@ -1379,7 +1490,11 @@ impl FlowService {
 
         let mut pool: Vec<(String, u32)> = Vec::new();
         let mut tier_mapping: HashMap<String, u32> = HashMap::new();
+        let mut plugin_server_mapping: HashMap<String, (Option<String>, bool)> = HashMap::new();
         let mut ended_tiers: HashSet<u32> = HashSet::new();
+        let options = FlowOptions {
+            cdn_full_range: false,
+        };
 
         for item in &flow_items {
             if ended_tiers.contains(&item.tier) || item.r#use.is_empty() {
@@ -1388,9 +1503,20 @@ impl FlowService {
             let should_exec = if item.rules.is_empty() {
                 true
             } else {
-                self.evaluate_flow_rules(&item.rules, &item.mode, &target, &context)
+                match self
+                    .evaluate_flow_rules(&item.rules, &item.mode, &target, &context)
                     .await
-                    .unwrap_or(false)
+                {
+                    Ok(matched) => matched,
+                    Err(err) => {
+                        warn!(
+                            resource = %resid,
+                            version = %effective_version,
+                            "Failed to evaluate flow rule during manifest probe ({err}); skipping item"
+                        );
+                        false
+                    }
+                }
             };
             if !should_exec {
                 continue;
@@ -1409,6 +1535,7 @@ impl FlowService {
                     FlowUse::Clear => {
                         pool.clear();
                         tier_mapping.clear();
+                        plugin_server_mapping.clear();
                     }
                     FlowUse::Server { id, weight } => {
                         self.apply_server_op(
@@ -1436,7 +1563,31 @@ impl FlowService {
                             &context,
                         );
                     }
-                    FlowUse::Plugin { .. } | FlowUse::Poolize => {}
+                    FlowUse::Plugin { id, indirect } => {
+                        let flow_context = FlowJsContext {
+                            target: target.clone(),
+                            context: context.clone(),
+                            options: options.clone(),
+                            session: None,
+                        };
+                        if let Ok(result) = self
+                            .execute_plugin(id, indirect, pool.clone(), &flow_context)
+                            .await
+                            && self
+                                .process_plugin_result(
+                                    result,
+                                    &mut pool,
+                                    &mut plugin_server_mapping,
+                                    &context.capabilities,
+                                )
+                                .is_ok()
+                        {
+                            for (name, _) in pool.iter() {
+                                Self::record_pool_entry_tier(&mut tier_mapping, name, item.tier);
+                            }
+                        }
+                    }
+                    FlowUse::Poolize => {}
                 }
             }
             if end_flow {
@@ -1459,24 +1610,25 @@ impl FlowService {
                 .collect();
 
             while !tier_pool.is_empty() {
-                let Ok((server_id, _)) = self.weighted_random_selection(&tier_pool) else {
+                let Ok((entry_name, _)) = self.weighted_random_selection(&tier_pool) else {
                     break;
                 };
-                tier_pool.retain(|(id, _)| id != &server_id);
+                tier_pool.retain(|(id, _)| id != &entry_name);
+                let server_id = Self::pool_entry_server_id(&entry_name, &plugin_server_mapping);
 
                 let (server_cfg, server_impl, url_path) = {
                     let config = self.shared_config.load();
-                    let Some(scfg) = config.servers.get(&server_id).cloned() else {
+                    let Some(scfg) = config.servers.get(server_id).cloned() else {
                         continue;
                     };
-                    let Some(simpl) = config.get_server(&server_id).cloned() else {
+                    let Some(simpl) = config.get_server(server_id).cloned() else {
                         continue;
                     };
                     let res = config.get_resource(resid)?;
                     let Some(upath) = crate::services::resource_service::version_path_for_resource(
                         res,
                         &effective_version,
-                        Some(&server_id),
+                        Some(server_id),
                         None,
                     ) else {
                         continue;
@@ -1491,7 +1643,7 @@ impl FlowService {
                             &self.data_store,
                             resid,
                             &effective_version,
-                            &server_id,
+                            server_id,
                             &server_cfg,
                             &server_impl,
                             &url_path,
@@ -1502,7 +1654,7 @@ impl FlowService {
                         return Some(bytes);
                     }
                 } else if server_impl
-                    .is_alive(&server_id, &server_cfg, &url_path, Some(&self.data_store))
+                    .is_alive(server_id, &server_cfg, &url_path, Some(&self.data_store))
                     .await
                 {
                     return None;
@@ -5338,5 +5490,74 @@ resources:
             fallback_res.url,
             "https://cnb.example.com/bettergi/BetterGI.Install.0.69.0.exe"
         );
+
+        // 6. u64 weight sum handles multiple u32::MAX weights without overflow panic
+        let huge_pool = vec![("a".to_string(), u32::MAX), ("b".to_string(), u32::MAX)];
+        let picked = service.weighted_random_selection(&huge_pool).unwrap();
+        assert!(picked.0 == "a" || picked.0 == "b");
+        assert_eq!(picked.1, u32::MAX);
+
+        // 7. Rolling manifest divergence: lagging map node (`dfs_map` size 10000) does not block
+        //    fresh map node (`ssh_map` size 12000) for range 10000..=11999, while truly cross-extent
+        //    ranges still return 416 without leaking to `cnb`.
+        let updated_manifest = serde_json::json!({
+            "size": 12000,
+            "extents": [
+                { "offset": 0, "len": 4000, "path": "cas/pack_head" },
+                { "offset": 4042, "len": 5958, "path": "cas/big_asset" },
+                { "offset": 10000, "len": 2000, "path": "cas/new_tail" }
+            ]
+        })
+        .to_string();
+        seed_map_manifest(
+            &env,
+            "ssh_map",
+            "bgi_split",
+            "0.68.0",
+            map_path,
+            &updated_manifest,
+            None,
+        )
+        .await;
+        context.capabilities.ssh = true;
+        let divergent_items = vec![
+            FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec![
+                    "server dfs_map 1000".parse().unwrap(),
+                    "server ssh_map 1".parse().unwrap(),
+                ],
+                tier: 0,
+            },
+            FlowItem {
+                insert: None,
+                rules: vec![],
+                mode: FlowMode::AND,
+                r#use: vec!["server cnb 10".parse().unwrap()],
+                tier: 1,
+            },
+        ];
+        let tail_target = FlowTarget {
+            resource_id: "bgi_split".to_string(),
+            version: "0.68.0".to_string(),
+            sub_path: None,
+            file_size: Some(2000),
+            ranges: Some(vec![(10000, 11999)]),
+        };
+        let div_res = service
+            .execute_flow(
+                &tail_target,
+                &context,
+                &options,
+                &divergent_items,
+                FlowPenalties::default(),
+                None,
+            )
+            .await
+            .expect("fresh map peer must satisfy range even when lagging peer fails");
+        assert_eq!(div_res.selected_server_id.as_deref(), Some("ssh_map"));
+        assert!(div_res.url.contains("/bgi/cas/new_tail"));
     }
 }

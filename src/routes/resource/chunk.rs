@@ -130,7 +130,7 @@ pub async fn get_cdn(
     let file_size = Some(
         ranges
             .iter()
-            .map(|(start, end)| (end - start + 1) as u64)
+            .map(|(start, end)| u64::from(*end) - u64::from(*start) + 1)
             .sum(),
     );
     let file_size_mb = file_size

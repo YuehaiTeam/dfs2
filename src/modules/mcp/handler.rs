@@ -941,39 +941,91 @@ impl DfsMcp {
         .or_else(|| version_base_path_for_resource(&resource, &version, Some(&args.server_id))) else {
             return Self::tool_err("no path for this resource on that server");
         };
-        let path = match crate::modules::extent_map::parse_map_path(&raw_path) {
-            Some(Ok(spec)) => spec.manifest_path,
-            Some(Err(e)) => return Self::tool_err(format!("invalid map path: {e}")),
-            None => raw_path,
-        };
-        let health_path = server.health_check_path.clone();
-        let file_size = match health_path.as_deref() {
-            Some(hp) => self
-                .state
-                .ctx
-                .data_store
-                .get_health_info(&args.server_id, hp)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|h| h.file_size),
-            None => None,
-        };
-        let cap = match file_size {
-            Some(0) => return Self::tool_err("object size is 0"),
-            Some(n) => n.min(max_bytes),
-            None => max_bytes,
-        };
-        if cap > u64::from(u32::MAX) + 1 {
-            return Self::tool_err("max_bytes exceeds a single Range (end must fit in 32 bits)");
-        }
-        let end = (cap - 1) as u32;
-        let range = format!("0-{end}");
+        let (path, phys_start, end, file_size) =
+            match crate::modules::extent_map::parse_map_path(&raw_path) {
+                Some(Ok(spec)) => {
+                    let maybe_map = match self
+                        .state
+                        .ctx
+                        .flow_service
+                        .extent_map_cache()
+                        .get_or_probe_server_map(
+                            &self.state.ctx.data_store,
+                            &args.resid,
+                            &version,
+                            &args.server_id,
+                            &server,
+                            &server_impl,
+                            &raw_path,
+                            &spec,
+                        )
+                        .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Self::tool_err(format!("failed to load map manifest: {e}"));
+                        }
+                    };
+                    let Some(extent_map) = maybe_map else {
+                        return Self::tool_err(
+                            "map manifest is unavailable or invalid on the specified server",
+                        );
+                    };
+                    let Some(first_extent) = extent_map.extents.first() else {
+                        return Self::tool_err("map manifest contains no extents");
+                    };
+                    let slice_cap = first_extent.len.min(max_bytes);
+                    if slice_cap == 0 {
+                        return Self::tool_err("extent length is 0");
+                    }
+                    let p_start = first_extent.phys_offset;
+                    let p_end = p_start.saturating_add(slice_cap - 1);
+                    let (Ok(s32), Ok(e32)) = (u32::try_from(p_start), u32::try_from(p_end)) else {
+                        return Self::tool_err(
+                            "physical extent range exceeds a single 32-bit Range limit",
+                        );
+                    };
+                    (
+                        first_extent.resolved_path.clone(),
+                        s32,
+                        e32,
+                        Some(extent_map.size),
+                    )
+                }
+                Some(Err(e)) => return Self::tool_err(format!("invalid map path: {e}")),
+                None => {
+                    let health_path = server.health_check_path.clone();
+                    let file_size = match health_path.as_deref() {
+                        Some(hp) => self
+                            .state
+                            .ctx
+                            .data_store
+                            .get_health_info(&args.server_id, hp)
+                            .await
+                            .ok()
+                            .flatten()
+                            .and_then(|h| h.file_size),
+                        None => None,
+                    };
+                    let cap = match file_size {
+                        Some(0) => return Self::tool_err("object size is 0"),
+                        Some(n) => n.min(max_bytes),
+                        None => max_bytes,
+                    };
+                    if cap > u64::from(u32::MAX) + 1 {
+                        return Self::tool_err(
+                            "max_bytes exceeds a single Range (end must fit in 32 bits)",
+                        );
+                    }
+                    (raw_path, 0u32, (cap - 1) as u32, file_size)
+                }
+            };
+        let range = format!("{phys_start}-{end}");
         let capped = range_is_signed(&server.r#type);
         let mut url = match server_impl
             .url_expiring(
                 &path,
-                Some(vec![(0, end)]),
+                Some(vec![(phys_start, end)]),
                 None,
                 Some(&self.state.ctx.data_store),
                 ttl,
@@ -2635,6 +2687,79 @@ resources:
         assert!(url.contains("X-Amz-SignedHeaders="), "{url}");
         assert!(url.to_ascii_lowercase().contains("range"), "{url}");
         assert_eq!(body["headers"]["Range"], "bytes=0-1023");
+    }
+
+    #[tokio::test]
+    async fn sign_url_map_resource_signs_resolved_cas_extent_instead_of_manifest() {
+        let mut config = create_default_test_config();
+        let res = config.resources.get_mut("test_resource").unwrap();
+        res.download = crate::config::DownloadPolicy::Disabled;
+        res.legacy_client_support = false;
+        res.legacy_client_full_range = false;
+        res.resource_type = "file".into();
+        res.versions.insert(
+            "1.0.0".into(),
+            HashMap::from([("default".into(), "map:/bgi/1.0.0.json".into())]),
+        );
+
+        let env = TestEnvironment::with_config(config).await;
+        let now = chrono::Utc::now().timestamp() as u64;
+        let map_path = "map:/bgi/1.0.0.json";
+        let compact = serde_json::json!({
+            "size": 8192,
+            "extents": [
+                { "offset": 0, "len": 4096, "phys_offset": 128, "path": "cas/first_blob" }
+            ]
+        })
+        .to_string();
+        env.data_store
+            .set_health_info(
+                "test_server_1",
+                map_path,
+                &crate::modules::server::HealthInfo {
+                    is_alive: true,
+                    file_size: Some(8192),
+                    last_check: now,
+                    observed_cert_hash: None,
+                    content_hash: None,
+                },
+            )
+            .await
+            .unwrap();
+        env.data_store
+            .set_string(
+                &crate::modules::extent_map::extent_map_storage_key("test_server_1", map_path),
+                &compact,
+                Some(300),
+            )
+            .await
+            .unwrap();
+
+        let mcp = DfsMcp::new(Arc::new(McpState {
+            settings: test_settings(vec!["t".into()], None, None, vec![]),
+            ctx: env.app_context.clone(),
+        }));
+        let body = tool_json(
+            &mcp.sign_url(Parameters(SignUrlArgs {
+                server_id: "test_server_1".into(),
+                resid: "test_resource".into(),
+                version: Some("1.0.0".into()),
+                sub_path: None,
+                max_bytes: Some(1000),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(body["path"], "/bgi/cas/first_blob");
+        assert_eq!(body["range"], "128-1127");
+        assert_eq!(body["headers"]["Range"], "bytes=128-1127");
+        assert_eq!(body["file_size"], 8192);
+        assert!(
+            body["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/bgi/cas/first_blob")
+        );
     }
 
     #[tokio::test]

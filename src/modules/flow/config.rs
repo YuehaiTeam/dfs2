@@ -326,6 +326,11 @@ impl FromStr for BandwidthRate {
         if s.is_empty() {
             return Err("empty bandwidth rate".to_string());
         }
+        if !s.is_ascii() {
+            return Err(format!(
+                "bandwidth rate '{s}' must contain only ASCII characters"
+            ));
+        }
 
         // 大写 `B/s` 结尾的字节率直接委托 `Size`（与 `size`、`bw_daily` 共享同一套字节单位语义）
         if let Some(size_part) = s.strip_suffix("/s").or_else(|| s.strip_suffix("/S"))
@@ -356,13 +361,18 @@ impl FromStr for BandwidthRate {
             ));
         }
 
-        let mag = if unit.len() >= 3 && unit[unit.len() - 3..].eq_ignore_ascii_case("bps") {
-            &unit[..unit.len() - 3]
+        let strip_ascii_suffix_ignore_case = |input: &str, suffix: &str| -> Option<String> {
+            let prefix_len = input.len().checked_sub(suffix.len())?;
+            let (head, tail) = input.split_at(prefix_len);
+            tail.eq_ignore_ascii_case(suffix).then(|| head.to_string())
+        };
+        let mag = if let Some(m) = strip_ascii_suffix_ignore_case(unit, "bps") {
+            m
         } else if let Some(head) = unit.strip_suffix("/s").or_else(|| unit.strip_suffix("/S")) {
-            if head.len() >= 3 && head[head.len() - 3..].eq_ignore_ascii_case("bit") {
-                &head[..head.len() - 3]
-            } else if let Some(m) = head.strip_suffix('b') {
+            if let Some(m) = strip_ascii_suffix_ignore_case(head, "bit") {
                 m
+            } else if let Some(m) = head.strip_suffix('b') {
+                m.to_string()
             } else {
                 return Err(format!("unsupported bandwidth rate unit '{unit}' in '{s}'"));
             }
@@ -927,6 +937,9 @@ mod tests {
             "speed cyrene > 10MBps",
             "speed cyrene > -10MB/s",
             "speed cyrene > 80 Mbps",
+            "speed * > 5兆b",
+            "speed cyrene > 100兆bps",
+            "speed cyrene > 10Мбит/s",
         ] {
             assert!(
                 serde_yaml::from_str::<FlowCond>(invalid).is_err(),

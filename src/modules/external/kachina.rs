@@ -204,12 +204,19 @@ pub async fn fetch_file_range(
     let cdn_url = flow_result.url;
 
     // 构建 Range 头部（若 map: 下发了 #range= 则按物理区间或整文件请求）
+    let mut expected_range_start: Option<u64> = None;
     let range_header = match crate::modules::extent_map::extract_range_fragment(&cdn_url) {
         Some("0-") => String::new(),
-        Some(phys_range) => format!("bytes={phys_range}"),
+        Some(phys_range) => {
+            expected_range_start = phys_range
+                .split_once('-')
+                .and_then(|(s, _)| s.parse::<u64>().ok());
+            format!("bytes={phys_range}")
+        }
         None => {
             if let Some(ranges) = &ranges {
                 if ranges.len() == 1 {
+                    expected_range_start = Some(u64::from(ranges[0].0));
                     format!("bytes={}-{}", ranges[0].0, ranges[0].1)
                 } else {
                     let range_parts: Vec<String> = ranges
@@ -238,11 +245,41 @@ pub async fn fetch_file_range(
         }),
     }?;
 
-    if !response.status().is_success()
-        && response.status() != axum::http::StatusCode::PARTIAL_CONTENT
-    {
+    let status = response.status();
+    if status == axum::http::StatusCode::RANGE_NOT_SATISFIABLE {
+        let is_initial_header_probe = matches!(ranges.as_deref(), Some([(0, 255)]));
+        if is_initial_header_probe
+            && let Some(total) = parse_unsatisfied_content_range_total(response.headers())
+            && total < 256
+        {
+            return Ok(Bytes::new());
+        }
         return Err(DfsError::NetworkError {
-            reason: format!("{}: {}", E_READ_RESPONSE_FAILED, response.status()),
+            reason: format!("{E_READ_RESPONSE_FAILED}: {status}"),
+        });
+    }
+
+    if !range_header.is_empty() {
+        if status != axum::http::StatusCode::PARTIAL_CONTENT {
+            return Err(DfsError::NetworkError {
+                reason: format!(
+                    "{E_READ_RESPONSE_FAILED}: expected 206 Partial Content for Range '{range_header}', got {status}"
+                ),
+            });
+        }
+        if let Some(expected_start) = expected_range_start
+            && let Some(actual_start) = parse_partial_content_range_start(response.headers())
+            && actual_start != expected_start
+        {
+            return Err(DfsError::NetworkError {
+                reason: format!(
+                    "{E_READ_RESPONSE_FAILED}: Content-Range start {actual_start} does not match requested start {expected_start}"
+                ),
+            });
+        }
+    } else if !status.is_success() {
+        return Err(DfsError::NetworkError {
+            reason: format!("{E_READ_RESPONSE_FAILED}: {status}"),
         });
     }
 
@@ -252,6 +289,29 @@ pub async fn fetch_file_range(
             reason: e.to_string(),
         }),
     }
+}
+
+fn parse_unsatisfied_content_range_total(headers: &axum::http::HeaderMap) -> Option<u64> {
+    let raw = headers
+        .get(axum::http::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim();
+    let rest = raw.strip_prefix("bytes")?.trim();
+    let total_str = rest.strip_prefix("*/")?.trim();
+    total_str.parse::<u64>().ok()
+}
+
+fn parse_partial_content_range_start(headers: &axum::http::HeaderMap) -> Option<u64> {
+    let raw = headers
+        .get(axum::http::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .trim();
+    let rest = raw.strip_prefix("bytes")?.trim();
+    let (span, _) = rest.split_once('/')?;
+    let (start_str, _) = span.trim().split_once('-')?;
+    start_str.trim().parse::<u64>().ok()
 }
 
 /// 解析 KachinaInstaller 索引数据
@@ -406,12 +466,22 @@ struct RootKachinaProjection {
     index: serde_json::Map<String, Value>,
     metadata: serde_json::Map<String, Value>,
     installer_end: u32,
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 /// Projects `{ index, metadata, installer_end }` directly from a root JSON document,
 /// ignoring any unrelated top-level keys that coexist in the same JSON object.
 pub fn try_project_kachina_metadata(json_bytes: &[u8]) -> Option<KachinaMetadata> {
     let projected: RootKachinaProjection = serde_json::from_slice(json_bytes).ok()?;
+    if projected.installer_end == 0 {
+        return None;
+    }
+    if let Some(size) = projected.size
+        && u64::from(projected.installer_end) > size
+    {
+        return None;
+    }
     Some(KachinaMetadata {
         index: Value::Object(projected.index),
         metadata: Value::Object(projected.metadata),
@@ -436,17 +506,20 @@ pub async fn parse_kachina_metadata(
     version: &str,
     sub_path: Option<String>,
 ) -> DfsResult<Option<KachinaMetadata>> {
+    let mut fetched_mapped_manifest = false;
     if sub_path.is_none()
         && let Some(manifest_bytes) = flow_service
             .try_fetch_mapped_manifest_bytes(resid, version, None)
             .await
-        && let Some(projected) = try_project_kachina_metadata(&manifest_bytes)
     {
-        return Ok(Some(projected));
+        fetched_mapped_manifest = true;
+        if let Some(projected) = try_project_kachina_metadata(&manifest_bytes) {
+            return Ok(Some(projected));
+        }
     }
 
     // 获取文件的前256字节
-    let header_bytes = fetch_file_range(
+    let header_bytes = match fetch_file_range(
         shared_config,
         flow_service,
         resid,
@@ -454,7 +527,22 @@ pub async fn parse_kachina_metadata(
         sub_path.clone(),
         Some(vec![(0, 255)]),
     )
-    .await?;
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(DfsError::RangeNotSatisfiable { message }) => {
+            if message.contains("exceeds virtual size") || fetched_mapped_manifest {
+                tracing::warn!(
+                    resid = %resid,
+                    version = %version,
+                    "Kachina header probe range 0-255 not satisfiable ({message}); returning null metadata"
+                );
+                return Ok(None);
+            }
+            return Err(DfsError::RangeNotSatisfiable { message });
+        }
+        Err(e) => return Err(e),
+    };
 
     // 解析文件头部信息
     let parsed_header = parse_file_header(&header_bytes)?;
@@ -490,6 +578,10 @@ pub async fn parse_kachina_metadata(
         .and_then(|sum| sum.checked_add(theme_sz))
         .and_then(|sum| sum.checked_add(metadata_sz))
         .ok_or_else(|| "Integer overflow when calculating data_end".to_string())?;
+    let installer_end = index_start
+        .checked_add(config_sz)
+        .and_then(|sum| sum.checked_add(theme_sz))
+        .ok_or_else(|| "Integer overflow when calculating installer_end".to_string())?;
 
     if data_end <= index_start {
         return Ok(None);
@@ -498,7 +590,7 @@ pub async fn parse_kachina_metadata(
     let expected_index_len = (data_end - index_start) as usize;
 
     // 下载索引数据
-    let index_data = fetch_file_range(
+    let index_data = match fetch_file_range(
         shared_config,
         flow_service,
         resid,
@@ -506,7 +598,20 @@ pub async fn parse_kachina_metadata(
         sub_path,
         Some(vec![(index_start, data_end - 1)]),
     )
-    .await?;
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(DfsError::RangeNotSatisfiable { message }) if fetched_mapped_manifest => {
+            tracing::warn!(
+                resid = %resid,
+                version = %version,
+                "Mapped manifest lacks root Kachina projection and byte-range fallback {index_start}..{} is not satisfiable ({message}); returning null metadata",
+                data_end - 1
+            );
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
 
     if index_data.len() < expected_index_len {
         return Err(DfsError::NetworkError {
@@ -539,7 +644,7 @@ pub async fn parse_kachina_metadata(
             .get("metadata")
             .cloned()
             .unwrap_or_else(|| json!({})),
-        installer_end: index_start + config_sz + theme_sz,
+        installer_end,
     }))
 }
 
@@ -806,8 +911,8 @@ resources:
             ],
             "installer_end": 9906541u32,
             "index": {
-                "\u{0000}META": { "name": "\u{0000}META", "offset": 9906557, "raw_offset": 9906541, "size": 318302 },
-                "Main.exe": { "name": "Main.exe", "offset": 10224881, "raw_offset": 10224859, "size": 65536 }
+                "\u{0000}META": { "name": "\u{0000}META", "offset": 9906556, "raw_offset": 9906541, "size": 318303 },
+                "Main.exe": { "name": "Main.exe", "offset": 10224877, "raw_offset": 10224859, "size": 65536 }
             },
             "metadata": {
                 "repo_name": "BetterGI",
@@ -901,6 +1006,142 @@ resources:
             cas_hits.load(Ordering::SeqCst),
             0,
             "root-projected metadata must skip all CAS byte-range fetches"
+        );
+
+        // Bounds check: installer_end == 0 or installer_end > size must be rejected
+        assert!(
+            try_project_kachina_metadata(
+                serde_json::json!({
+                    "size": 1000,
+                    "installer_end": 0,
+                    "index": {},
+                    "metadata": {}
+                })
+                .to_string()
+                .as_bytes()
+            )
+            .is_none()
+        );
+        assert!(
+            try_project_kachina_metadata(
+                serde_json::json!({
+                    "size": 1000,
+                    "installer_end": 1001,
+                    "index": {},
+                    "metadata": {}
+                })
+                .to_string()
+                .as_bytes()
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_kachina_metadata_handles_tiny_416_and_rejects_range_ignoring_200() {
+        let (pack_bytes, _) = build_synthetic_pack();
+        let pack_arc = Arc::new(pack_bytes);
+        let p_clone = Arc::clone(&pack_arc);
+        let app = Router::new()
+            .route(
+                "/tiny.txt",
+                get(|| async {
+                    (
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        [(header::CONTENT_RANGE, "bytes */42")],
+                    )
+                }),
+            )
+            .route(
+                "/ignore_range.exe",
+                get(move || {
+                    let b = (*p_clone).clone();
+                    async move { (StatusCode::OK, b) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let yaml = format!(
+            r#"
+servers:
+  srv:
+    id: srv
+    url: "http://{addr}"
+    type: direct
+plugins: {{}}
+resources:
+  tiny:
+    latest: "1.0.0"
+    versions:
+      default:
+        default: "/tiny.txt"
+    tries: []
+    server: ["srv"]
+    flow:
+      - use: ["server srv 10"]
+  ignore_range:
+    latest: "1.0.0"
+    versions:
+      default:
+        default: "/ignore_range.exe"
+    tries: []
+    server: ["srv"]
+    flow:
+      - use: ["server srv 10"]
+"#
+        );
+        let mut config: crate::config::AppConfig = serde_yaml::from_str(&yaml).unwrap();
+        for (id, scfg) in &config.servers {
+            config.server_impl.insert(
+                id.clone(),
+                crate::modules::server::ServerImpl::new(scfg).unwrap(),
+            );
+        }
+        let env = TestEnvironment::with_config(config).await;
+        let now = chrono::Utc::now().timestamp() as u64;
+        for (path, sz) in [("/tiny.txt", 42u64), ("/ignore_range.exe", 4096u64)] {
+            env.data_store
+                .set_health_info(
+                    "srv",
+                    path,
+                    &crate::modules::server::HealthInfo {
+                        is_alive: true,
+                        file_size: Some(sz),
+                        last_check: now,
+                        observed_cert_hash: None,
+                        content_hash: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let tiny_res = parse_kachina_metadata(
+            &env.shared_config,
+            &env.services.flow_service,
+            "tiny",
+            "1.0.0",
+            None,
+        )
+        .await
+        .expect("tiny <256B 416 with Content-Range must gracefully return Ok(None)");
+        assert!(tiny_res.is_none());
+
+        let ignore_res = parse_kachina_metadata(
+            &env.shared_config,
+            &env.services.flow_service,
+            "ignore_range",
+            "1.0.0",
+            None,
+        )
+        .await;
+        assert!(
+            ignore_res.is_err(),
+            "200 OK in response to Range header must be rejected instead of silently truncating from offset 0"
         );
     }
 }
