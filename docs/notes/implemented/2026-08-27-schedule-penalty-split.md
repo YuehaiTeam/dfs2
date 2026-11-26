@@ -10,7 +10,9 @@ Status: implemented
 
 ## Decision
 
-调度惩罚由 `FlowPenalties` 表达，分 `banned` 与 `demoted` 两档。`banned` 在加池时直接跳过；`demoted` 仍然进池，权重减半，下限 1。
+调度惩罚由 `FlowPenalties` 表达，分 `banned` 与 `demoted` 两档。`banned` 节点照常入池但最低优先：poolize 先把候选池分成非 banned 与 banned 两段，第一阶段只在非 banned 节点中按层选点，行为与硬剔除完全一致（确定性避开失败节点）；仅当非 banned 节点全部不可用时才进入第二阶段兜底，按层回退尝试 banned 节点。兜底仍须通过健康检查与传输能力校验，`first_range_unsatisfiable`（416）依旧不跨协议降级，重试总次数仍由 `MAX_CHUNK_DOWNLOADS` 封顶。`demoted` 仍然进池，权重减半，下限 1。
+
+兜底是本设计后来修正的一处失误：最初 `banned` 在加池时直接跳过，单节点或小节点池拓扑下重试会把全部候选剔空，调度直接报 `NO_RES_AVAILABLE`——而这些节点往往并没有真坏，只是被同一会话的并发 chunk 占用或刚被换过一次。入池门禁（`server_passes_admission_gates`）因此只保留传输能力校验，不再丢弃 banned 节点。
 
 分档依据是"这个节点是被换掉的，还是正在被使用的"。本次请求的 chunk 上签发过的节点全部进 `banned`——客户端就这个 chunk 又来要 URL，意味着上一个不好用。其它 chunk 上，除最近一次签发的节点外都进 `banned`（它们在那个 chunk 上已经被换掉了），最近一次签发的那个进 `demoted`（它正在服务，只是不该被再叠一份负载）。两个列表取交集时归入 `banned`，硬约束优先。
 
@@ -18,7 +20,7 @@ Status: implemented
 
 ## Alternatives considered
 
-**保持全部硬剔除。** 落选：正是并发多 chunk 场景清空候选池的原因。区分不了"节点失败"与"节点正在被同一客户端使用"这两件事。
+**保持全部硬剔除。** 落选：正是并发多 chunk 场景清空候选池的原因。区分不了"节点失败"与"节点正在被同一客户端使用"这两件事。初版实现仍采用了"入池即剔除"的硬剔除形式，单节点拓扑下重试直接无资源可用，后修正为池内分段兜底。
 
 **全部改为降权，不再硬剔除。** 落选：同一个 chunk 重试时仍有概率再选到刚失败的节点，客户端可能连续几次拿到同一个坏 URL。重试路径需要的是确定性排除，不是降低概率。
 
@@ -38,6 +40,10 @@ Status: implemented
 | 带 `skip_penalty` 的记录不参与惩罚计算 | PASS：`skip_penalty_records_are_ignored` |
 | 复用 sid 重新验证后惩罚记录保留 | PASS：`test_reuse_sid_reauths_and_keeps_penalty_records` |
 | 能力门控与惩罚叠加时行为正确 | PASS：`test_h3_only_with_penalty_interaction` |
+| 单节点被 banned 后兜底回退成功而非 NO_RES_AVAILABLE | PASS：`banned_single_server_falls_back_instead_of_emptying_pool` |
+| 全部节点被 banned 后兜底回退成功 | PASS：`banned_all_servers_fall_back` |
+| 存在健康非 banned 节点时仍确定性避开 banned | PASS：`non_banned_candidate_is_preferred_over_banned` |
+| 兜底阶段仍拒绝传输能力不满足的节点 | PASS：`fallback_still_rejects_transport_incompatible_servers` |
 | 全量测试无新增失败 | PASS：253 passed / 6 failed，6 个失败全部位于 `src/commands/analyze/stats/`，该目录本次未改动 |
 
 ## Consequences
