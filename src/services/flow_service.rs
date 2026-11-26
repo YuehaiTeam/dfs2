@@ -409,10 +409,72 @@ impl FlowService {
         penalties: &FlowPenalties,
         tier_mapping: &HashMap<String, u32>,
     ) -> DfsResult<Option<Poolized>> {
-        pool.retain(|(name, _)| {
+        let mut banned_entries: Vec<(String, u32)> = Vec::new();
+        pool.retain(|(name, weight)| {
             let server_id = Self::pool_entry_server_id(name, plugin_server_mapping);
-            !penalties.banned.iter().any(|banned| banned == server_id)
+            if penalties.banned.iter().any(|banned| banned == server_id) {
+                banned_entries.push((name.clone(), *weight));
+                false
+            } else {
+                true
+            }
         });
+
+        // phase 1: deterministic avoidance — select among non-banned candidates
+        // exactly as before; phase 2 (last resort): only when no non-banned
+        // server is usable do banned entries get a chance, so a single-server
+        // or fully banned pool degrades instead of failing NO_RES_AVAILABLE
+        if let Some(selected) = self
+            .select_within_pool(
+                pool,
+                target,
+                context,
+                options,
+                plugin_server_mapping,
+                penalties,
+                tier_mapping,
+            )
+            .await?
+        {
+            return Ok(Some(selected));
+        }
+        if pool.is_empty() && !banned_entries.is_empty() {
+            warn!(
+                "no usable non-banned server; falling back to {} banned candidate(s)",
+                banned_entries.len()
+            );
+            let mut fallback_pool = banned_entries;
+            // select_within_pool 把最终 URL 就地写进传入的池子，必须镜像回真实池，
+            // 否则兜底成功时调用方仍按空池判 NO_RES_AVAILABLE
+            let result = self
+                .select_within_pool(
+                    &mut fallback_pool,
+                    target,
+                    context,
+                    options,
+                    plugin_server_mapping,
+                    penalties,
+                    tier_mapping,
+                )
+                .await;
+            *pool = fallback_pool;
+            return result;
+        }
+        Ok(None)
+    }
+
+    /// 在非 banned/兜底候选组内按层选择服务器（poolize_from_pool 的层循环主体）
+    #[allow(clippy::too_many_arguments)]
+    async fn select_within_pool(
+        &self,
+        pool: &mut Vec<(String, u32)>,
+        target: &FlowTarget,
+        context: &FlowContext,
+        options: &FlowOptions,
+        plugin_server_mapping: &HashMap<String, (Option<String>, bool)>,
+        penalties: &FlowPenalties,
+        tier_mapping: &HashMap<String, u32>,
+    ) -> DfsResult<Option<Poolized>> {
         self.apply_penalty_to_pool(pool, &penalties.demoted, plugin_server_mapping);
 
         let mut tiers: Vec<u32> = pool
@@ -461,7 +523,9 @@ impl FlowService {
                         first_range_unsatisfiable = Some(err);
                     }
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    return Err(err);
+                }
             }
 
             // 降级本身值得注意：它意味着一整层当前没有可用节点
@@ -532,7 +596,9 @@ impl FlowService {
                     }
                     pool.retain(|x| x.0 != selected_server.0);
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    return Err(err);
+                }
             }
         }
 
@@ -562,10 +628,10 @@ impl FlowService {
         penalties: &FlowPenalties,
         context: &FlowContext,
     ) -> bool {
-        if penalties.banned.iter().any(|server_id| server_id == id) {
-            return false;
-        }
-
+        // banned nodes stay in the pool: poolize_from_pool prefers healthy
+        // non-banned candidates and only falls back to banned ones when nothing
+        // else is usable, so a small pool can still serve retries
+        let _ = penalties;
         let config = self.shared_config.load();
         if let Some(server_config) = config.servers.get(id)
             && !capabilities::server_transport_is_usable(server_config, &context.capabilities)
@@ -3376,10 +3442,15 @@ mod tests {
             .await
             .unwrap();
 
-        // h3_server should be skipped due to penalty (checked first),
-        // even though h3_capable is true
-        assert_eq!(pool.len(), 1, "Penalized h3_server should be skipped");
-        assert_eq!(pool[0].0, "normal_server");
+        // banned nodes are no longer dropped at admission: they stay in the
+        // pool so poolize can fall back to them when nothing else is usable
+        assert_eq!(
+            pool.len(),
+            2,
+            "banned h3_server stays in pool as last resort"
+        );
+        assert!(pool.iter().any(|(id, _)| id == "normal_server"));
+        assert!(pool.iter().any(|(id, _)| id == "h3_server"));
 
         println!("✅ h3_only + penalty interaction works correctly");
     }
@@ -5559,5 +5630,135 @@ resources:
             .expect("fresh map peer must satisfy range even when lagging peer fails");
         assert_eq!(div_res.selected_server_id.as_deref(), Some("ssh_map"));
         assert!(div_res.url.contains("/bgi/cas/new_tail"));
+    }
+
+    fn yaml_two_servers() -> Vec<FlowItem> {
+        vec![FlowItem {
+            insert: None,
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec![
+                FlowUse::Server {
+                    id: "test_server_1".to_string(),
+                    weight: 10,
+                },
+                FlowUse::Server {
+                    id: "test_server_2".to_string(),
+                    weight: 10,
+                },
+            ],
+            tier: 0,
+        }]
+    }
+
+    // a lone banned server degrades to last-resort fallback instead of
+    // emptying the pool into NO_RES_AVAILABLE
+    #[tokio::test]
+    async fn banned_single_server_falls_back_instead_of_emptying_pool() {
+        let env = TestEnvironment::new().await;
+        let (target, context, options) = create_test_context();
+        let result = env
+            .services
+            .flow_service
+            .execute_flow(
+                &target,
+                &context,
+                &options,
+                &yaml_only_server_one(),
+                FlowPenalties {
+                    banned: vec!["test_server_1".to_string()],
+                    demoted: vec![],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.selected_server_id.as_deref(), Some("test_server_1"));
+    }
+
+    // when every candidate is banned the pool still serves traffic
+    #[tokio::test]
+    async fn banned_all_servers_fall_back() {
+        let env = TestEnvironment::new().await;
+        let (target, context, options) = create_test_context();
+        let result = env
+            .services
+            .flow_service
+            .execute_flow(
+                &target,
+                &context,
+                &options,
+                &yaml_two_servers(),
+                FlowPenalties {
+                    banned: vec!["test_server_1".to_string(), "test_server_2".to_string()],
+                    demoted: vec![],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(result.selected_server_id.is_some());
+    }
+
+    // a healthy non-banned candidate is always preferred over banned ones
+    #[tokio::test]
+    async fn non_banned_candidate_is_preferred_over_banned() {
+        let env = TestEnvironment::new().await;
+        let (target, context, options) = create_test_context();
+        for _ in 0..5 {
+            let result = env
+                .services
+                .flow_service
+                .execute_flow(
+                    &target,
+                    &context,
+                    &options,
+                    &yaml_two_servers(),
+                    FlowPenalties {
+                        banned: vec!["test_server_1".to_string()],
+                        demoted: vec![],
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.selected_server_id.as_deref(), Some("test_server_2"));
+        }
+    }
+
+    // transport-incompatible servers stay rejected even in the fallback phase
+    #[tokio::test]
+    async fn fallback_still_rejects_transport_incompatible_servers() {
+        let service = create_h3_test_flow_service().await;
+        let (target, mut context, options) = create_test_context();
+        // client cannot speak h3; the only candidate is h3_only and banned
+        context.capabilities.h3 = false;
+        let item = vec![FlowItem {
+            insert: None,
+            rules: vec![],
+            mode: FlowMode::AND,
+            r#use: vec![FlowUse::Server {
+                id: "h3_server".to_string(),
+                weight: 10,
+            }],
+            tier: 0,
+        }];
+        let err = service
+            .execute_flow(
+                &target,
+                &context,
+                &options,
+                &item,
+                FlowPenalties {
+                    banned: vec!["h3_server".to_string()],
+                    demoted: vec![],
+                },
+                None,
+            )
+            .await;
+        assert!(
+            err.is_err(),
+            "h3-only server must stay unusable without h3 capability"
+        );
     }
 }
